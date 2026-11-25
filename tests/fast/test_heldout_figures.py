@@ -18,17 +18,22 @@ What the scan finds in a runner (a file of ``tests/e2e/``, any depth):
 
 The allowed constants (``EXPECTATION_CONSTANTS``) of a sealed runner's texts are read as the runner holds them, so each name that a text uses is held to one
 binding (``constant_findings``): exactly one binding at the top of the module, an assignment or an import; no second binding anywhere in the module (an
-assignment, an augmented assignment, a loop, an import, a ``global`` statement, a call of ``globals``, ``exec`` or ``eval``); and no function, class or
+assignment, an augmented assignment, a loop, an import, an assignment expression in any scope, a ``global`` statement, any use of ``globals``, ``locals``,
+``vars``, ``exec``, ``eval``, ``__import__``, ``builtins`` or ``__builtins__`` or an import from ``builtins``, a wildcard import); and no function, class or
 comprehension that writes a record binds the name itself (a variable, a parameter, a loop, ``with`` or comprehension target, an ``except`` or ``match`` name,
-an import or a nested definition). A literal binding is read from the source and any other from the imported runner. Rules: ``constant_unbound``,
-``constant_not_assigned``, ``constant_rebound`` and ``constant_shadowed``.
+an assignment expression, an import or a nested definition). An assignment expression binds in the nearest scope that is not a comprehension, and a default, a
+decorator, a class base and the first iterable of a comprehension run in the scope around it (``scope_parts``). A literal binding is read from the source and
+any other from the imported runner. Rules: ``constant_unbound``, ``constant_not_assigned``, ``constant_rebound`` and ``constant_shadowed``.
 
 Counts of development patients are allowed in a runner.
 
 Limits of this scan, stated as they are accepted:
 
-- A binding that the module makes by name at run time (``setattr`` of the module, a store through ``sys.modules``) is not seen: the scan reads the names of
-  the source, and ``globals``, ``exec`` and ``eval`` are the dynamic forms that it names.
+- A binding that the module makes by name at run time (``setattr`` of the module, a store through ``sys.modules``, an import by the name of a string
+  through ``importlib``) is not seen: the scan reads the names of the source, and the names of ``DYNAMIC_NAMES`` and the wildcard import are the dynamic forms
+  that it names. A runner that uses ``vars`` or ``locals`` for another purpose is refused too, as the scan cannot tell the purpose.
+- ``text_numbers``, which reads the numbers of a text for ``figure_derivable``, still takes a number that an underscore joins to a word (``rows_1234``) as no
+  word of its own: only ``figure_pattern`` finds the figure there.
 - A raw ``ast.parse`` of an ignored runner that does not parse, in some other test modules (``test_runner_checkout_seal.py``, ``test_runner_staging.py``,
   ``test_outcome_acceptance.py`` and the ``FlagNames`` test of ``test_runner_profile_flow.py``), can print the malformed source line in local test output. The
   ignored runners are on no hosted run.
@@ -40,9 +45,11 @@ import ast
 import contextlib
 import io
 import re
+import sys
 import tempfile
 import textwrap
 import traceback
+import types
 import unittest
 from collections.abc import Callable, Mapping
 from functools import partial
@@ -53,6 +60,7 @@ from unittest import mock
 from scripts.process import run_command
 from spark import split_table
 from spark.profile.counts import BY_NAME
+from tests.e2e.run_record import Record
 from tests.fast.outcome_accept import (
     EXPECTATION_CONSTANTS,
     OUTCOME_RUNNERS,
@@ -86,7 +94,7 @@ SEPARATORS = re.compile(r"[,_' \u00a0\u202f]")
 
 
 def text_numbers(text: str) -> set[int]:
-    """The whole numbers that a text writes as a word of its own: a number with leading zeros, a number with a decimal part of zeros (``1209.0`` is 1209; a
+    """The whole numbers that a text writes as a word of its own: a number with leading zeros, a number with a decimal part of zeros (``1234.0`` is 1234; a
     number with another decimal part is not a whole number), and for a number with thousands separators (a comma, an underscore, an apostrophe or a space) each
     group and the whole of it. A number inside a word or a hash is not one."""
     found: set[int] = set()
@@ -139,9 +147,10 @@ def figure_derivable(document: Any, figure: int = FIGURE) -> bool:
 
 def figure_pattern(figure: int) -> re.Pattern[str]:
     """The figure as a number, written with or without a thousands separator (a comma, an underscore, an apostrophe or a space), with leading zeros or with a
-    decimal part of zeros (``1209.0``), and not part of a longer number, a word, a hash or another decimal (``1209.5``, ``0.1209``)."""
+    decimal part of zeros (``1234.0``), and not part of a longer number (also one that an underscore joins: ``1234_567``), a word, a hash or another decimal
+    (``1234.5``, ``0.1234``). A name that joins the figure to a word by an underscore (``rows_1234``) holds it."""
     groups = f"{figure:,}".split(",")
-    return re.compile(r"(?<![0-9A-Za-z_.])0*" + "[,_' \u00a0\u202f]?".join(groups) + r"(?:\.0+)?(?![0-9A-Za-z_]|\.[0-9])")
+    return re.compile(r"(?<![0-9A-Za-z.])(?<![0-9]_)0*" + "[,_' \u00a0\u202f]?".join(groups) + r"(?:\.0+)?(?![0-9A-Za-z]|_[0-9]|\.[0-9])")
 
 
 def holds(value: Any, figure: int, pattern: re.Pattern[str]) -> bool:
@@ -378,8 +387,10 @@ def constant_uses(tree: ast.AST) -> dict[str, int]:
     return uses
 
 
-SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-DYNAMIC_CALLS = frozenset({"globals", "exec", "eval"})
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, *COMPREHENSIONS)
+# The names that let code bind any name at run time: the namespace functions, the code runners, the builtins in either form and the import by name.
+DYNAMIC_NAMES = frozenset({"globals", "locals", "vars", "exec", "eval", "builtins", "__builtins__", "__import__"})
 
 
 def names_bound_by(node: ast.AST) -> list[str]:
@@ -398,6 +409,37 @@ def names_bound_by(node: ast.AST) -> list[str]:
     if isinstance(node, ast.Nonlocal):
         return list(node.names)
     return []
+
+
+def scope_parts(node: ast.AST) -> tuple[list[ast.AST], list[ast.AST]]:
+    """The children of a scope that run in the scope around it (decorators, defaults, annotations, class bases and keywords, and the first iterable of a
+    comprehension) and the children that run in the scope itself (the parameters, the body, the target and the rest of a comprehension)."""
+    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+        arguments = node.args
+        every = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, *(item for item in (arguments.vararg, arguments.kwarg) if item is not None)]
+        outer: list[ast.AST] = [*arguments.defaults, *(item for item in arguments.kw_defaults if item is not None)]
+        outer += [item.annotation for item in every if item.annotation is not None]
+        if isinstance(node, ast.Lambda):
+            return outer, [*every, node.body]
+        outer += [*node.decorator_list, *([node.returns] if node.returns is not None else [])]
+        return outer, [*every, *node.type_params, *node.body]
+    if isinstance(node, ast.ClassDef):
+        return [*node.decorator_list, *node.bases, *node.keywords], [*node.type_params, *node.body]
+    if not isinstance(node, COMPREHENSIONS):
+        return [], []
+    first, rest = node.generators[0], node.generators[1:]
+    parts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+    return [first.iter], [first.target, *first.ifs, *rest, *parts]
+
+
+def is_dynamic(node: ast.AST) -> bool:
+    """Whether a node names a way to bind any name at run time: a name of ``DYNAMIC_NAMES`` (a call, an alias or an attribute of it), or an import of the
+    ``builtins`` module."""
+    if isinstance(node, ast.Name):
+        return node.id in DYNAMIC_NAMES
+    if isinstance(node, ast.Import):
+        return any(item.name.split(".")[0] == "builtins" for item in node.names)
+    return isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "builtins"
 
 
 def top_bindings(tree: ast.Module) -> dict[str, ast.stmt]:
@@ -420,13 +462,18 @@ def constant_findings(tree: ast.Module, uses: Mapping[str, int]) -> list[tuple[s
 
     - ``constant_unbound``: the module binds no such name, so its value is not the runner's;
     - ``constant_not_assigned``: the one binding is not an assignment or an import at the top of the module (a condition, a loop, an unpacking, a function);
-    - ``constant_rebound``: the module binds the name again (a second assignment, an augmented assignment, a loop or an import), a ``global`` statement
-      names it, or the module calls ``globals``, ``exec`` or ``eval``;
+    - ``constant_rebound``: the module binds the name again (a second assignment, an augmented assignment, a loop, an import or an assignment expression
+      of a comprehension, a default, a decorator or a class header, which bind in the scope around it), a ``global`` statement names it, the module names
+      ``globals``, ``locals``, ``vars``, ``exec``, ``eval``, ``__import__``, ``builtins`` or ``__builtins__`` in any use (an alias too) or imports from
+      ``builtins``, or it imports with ``*``, which can bind any name (a wildcard import is refused whether or not a text uses a constant);
     - ``constant_shadowed``: a function, a class or a comprehension that writes a record (one of its texts is inside it) binds the name as its own: a
-      variable, a parameter, a loop, ``with`` or comprehension target, an ``except`` or ``match`` name, an import or a nested definition, in it or in what it
-      holds."""
+      variable, a parameter, a loop, ``with`` or comprehension target, an ``except`` or ``match`` name, an assignment expression, an import or a nested
+      definition, in it or in what it holds."""
+    wildcards = [
+        ("constant_rebound", node.lineno) for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and any(item.name == "*" for item in node.names)
+    ]
     if not uses:
-        return []
+        return wildcards
     texts = {id(node) for node in text_nodes_of(tree)}
     writers: dict[int, bool] = {}
 
@@ -436,22 +483,33 @@ def constant_findings(tree: ast.Module, uses: Mapping[str, int]) -> list[tuple[s
         return writers[id(scope)]
 
     module: dict[str, list[int]] = {name: [] for name in uses}
-    found: list[tuple[str, int]] = []
+    found: list[tuple[str, int]] = list(wildcards)
     pending: list[tuple[ast.AST, tuple[ast.AST, ...]]] = [(tree, ())]
     while pending:
         node, scopes = pending.pop()
         line = getattr(node, "lineno", 0)
-        for name in (name for name in names_bound_by(node) if name in uses):
-            if not scopes:
+        bound = scopes
+        if isinstance(node, ast.NamedExpr):
+            # An assignment expression binds in the nearest scope that is not a comprehension (https://peps.python.org/pep-0572/#scope-of-the-target).
+            while bound and isinstance(bound[-1], COMPREHENSIONS):
+                bound = bound[:-1]
+        for name in (name for name in ([node.target.id] if isinstance(node, ast.NamedExpr) else names_bound_by(node)) if name in uses):
+            if not bound:
                 module[name].append(line)
-            elif any(writes(scope) for scope in scopes):
+            elif any(writes(scope) for scope in bound):
                 found.append(("constant_shadowed", line))
         if isinstance(node, ast.Global):
             found += [("constant_rebound", line) for name in node.names if name in uses]
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in DYNAMIC_CALLS:
+        if is_dynamic(node):
             found.append(("constant_rebound", line))
-        inner = (*scopes, node) if isinstance(node, SCOPES) else scopes
-        pending.extend((child, inner) for child in ast.iter_child_nodes(node))
+        if isinstance(node, SCOPES):
+            outer, inner = scope_parts(node)
+            pending.extend((child, scopes) for child in outer)
+            pending.extend((child, (*scopes, node)) for child in inner)
+        elif isinstance(node, ast.NamedExpr):
+            pending.append((node.value, scopes))
+        elif not isinstance(node, ast.arg):
+            pending.extend((child, scopes) for child in ast.iter_child_nodes(node))
     assigned = top_bindings(tree)
     for name, lines in module.items():
         ordered = sorted(lines)
@@ -1020,6 +1078,150 @@ class AllowedConstantsAreBoundOnce(unittest.TestCase):
         source = f"{self.HEAD}def finish(run, record):\n    JOB_SECONDS = {FIGURE}\n    {self.RECORD}"
         self.assertEqual([], expectation_findings(source, {"JOB_SECONDS": 1800}))
         self.assertEqual({"constant_shadowed"}, self.named(source))
+
+
+class ProtectedValueReachesTheRecord(unittest.TestCase):
+    """Each probe is a sealed runner source whose record text names an allowed constant that the one literal at the top binds to a clean value, and that
+    something else rebinds at run time to the held-out figure. A probe is run against the real ``Record``: its limit then holds the figure, so the scan must
+    name it. The probes are the forms that the binding check missed: an assignment expression (walrus) in a comprehension, in a default, in a decorator or in a
+    class header (each runs in the scope around it, https://peps.python.org/pep-0572/#scope-of-the-target); ``builtins`` and ``__builtins__`` calls; an alias
+    of ``globals``, ``exec``, ``eval``, ``vars`` or ``locals``; and a wildcard import."""
+
+    HEAD = AllowedConstantsAreBoundOnce.HEAD
+    RECORD = AllowedConstantsAreBoundOnce.RECORD
+    PATH = AllowedConstantsAreBoundOnce.PATH
+    KEEP = "def keep(*_):\n    return lambda function: function\n"
+
+    @classmethod
+    def probes(cls) -> tuple[tuple[str, str], ...]:
+        count, keep = FIGURE, cls.KEEP
+        return (
+            ("a walrus in a module-level comprehension", f"[(JOB_SECONDS := {count}) for _ in range(1)]\n"),
+            ("a walrus in a nested comprehension", f"[[(JOB_SECONDS := {count}) for _ in range(1)] for _ in range(1)]\n"),
+            ("a walrus in a generator that is consumed", f"list((JOB_SECONDS := {count}) for _ in range(1))\n"),
+            ("a walrus in a set comprehension", f"{{(JOB_SECONDS := {count}) for _ in range(1)}}\n"),
+            ("a walrus in a function default", f"def hold(value=(JOB_SECONDS := {count})):\n    return value\n"),
+            ("a walrus in a keyword-only default", f"def hold(*, value=(JOB_SECONDS := {count})):\n    return value\n"),
+            ("a walrus in a lambda default", f"(lambda value=(JOB_SECONDS := {count}): value)\n"),
+            ("a walrus in a decorator", f"{keep}@keep(JOB_SECONDS := {count})\ndef hold():\n    return 1\n"),
+            ("a walrus in a class decorator", f"{keep}@keep(JOB_SECONDS := {count})\nclass Held:\n    pass\n"),
+            ("a walrus in a class base", f"class Held((JOB_SECONDS := {count}) and object):\n    pass\n"),
+            ("an exec of the builtins module", f'import builtins\nbuiltins.exec("JOB_SECONDS = {count}")\n'),
+            ("an eval of the builtins module", f'import builtins\nbuiltins.eval("(JOB_SECONDS := {count})")\n'),
+            ("globals of the builtins module", f'import builtins\nbuiltins.globals()["JOB_SECONDS"] = {count}\n'),
+            ("the builtins module under another name", f'import builtins as shipped\nshipped.exec("JOB_SECONDS = {count}")\n'),
+            ("an exec by the builtins mapping", f'__builtins__["exec"]("JOB_SECONDS = {count}")\n'),
+            ("an import of globals under another name", f'from builtins import globals as names\nnames()["JOB_SECONDS"] = {count}\n'),
+            ("an alias of globals", f'names = globals\nnames()["JOB_SECONDS"] = {count}\n'),
+            ("an alias of exec", f'run = exec\nrun("JOB_SECONDS = {count}")\n'),
+            ("an alias of eval", f'run = eval\nrun("(JOB_SECONDS := {count})")\n'),
+            ("vars with no argument", f'vars()["JOB_SECONDS"] = {count}\n'),
+            ("locals", f'locals()["JOB_SECONDS"] = {count}\n'),
+            ("a wildcard import", "from plant_names import *\n"),
+        )
+
+    CONTROLS = (
+        ("a walrus in a function that writes no record", "def helper(run):\n    return (JOB_SECONDS := len(run))\n"),
+        ("a walrus in a comprehension of a function that writes no record", "def helper(run):\n    return [(JOB_SECONDS := item) for item in run]\n"),
+        ("a walrus in the body of a class that writes no record", "class Held:\n    (JOB_SECONDS := 5)\n"),
+        ("a walrus of another name in a default", "def hold(value=(OTHER := 5)):\n    return value\n"),
+        ("a walrus of another name in a comprehension", "[(OTHER := item) for item in range(3)]\n"),
+        ("names that only contain the words", "def execute(run):\n    return run\nevaluate = locals_ = vars_ = global_names = 1\n"),
+        ("an attribute with the name of a call", "record.exec = 1\nrecord.eval = 2\nrecord.globals = 3\n"),
+        ("an import of another module", "from collections import Counter\nimport json\n"),
+    )
+
+    def recorded(self, source: str) -> Record:
+        """The real ``Record`` after the source ran as a module whose ``record`` is that record."""
+        record = Record("probe", "probe", "none")
+        names = types.ModuleType("plant_names")
+        vars(names)["JOB_SECONDS"] = FIGURE
+        with mock.patch.dict(sys.modules, {"plant_names": names}):
+            exec(compile(source, "<probe>", "exec"), {"record": record})  # noqa: S102
+        return record
+
+    def named(self, source: str) -> set[str]:
+        return {name for name, _ in scanned("a plant", partial(sealed_findings, self.PATH), source)}
+
+    def test_each_probe_puts_the_protected_value_into_a_real_record(self) -> None:
+        for label, body in self.probes():
+            with self.subTest(probe=label):
+                record = self.recorded(f"{self.HEAD}{body}{self.RECORD}")
+                self.assertTrue(holds(record.limits, FIGURE, figure_pattern(FIGURE)), f"the probe {label} does not put the figure into the record")
+
+    def test_each_probe_is_named_as_a_rebinding(self) -> None:
+        for label, body in self.probes():
+            with self.subTest(probe=label):
+                self.assertEqual({"constant_rebound"}, self.named(f"{self.HEAD}{body}{self.RECORD}"), f"the probe {label} is not named by constant_rebound")
+
+    def test_each_control_is_quiet_and_leaves_the_clean_value_in_the_record(self) -> None:
+        for label, body in self.CONTROLS:
+            with self.subTest(control=label):
+                source = f"{self.HEAD}{body}{self.RECORD}"
+                self.assertEqual(set(), self.named(source), f"the control {label} is named")
+                self.assertFalse(holds(self.recorded(source).limits, FIGURE, figure_pattern(FIGURE)), f"the control {label} puts the figure into the record")
+
+    def test_a_wildcard_import_is_refused_in_a_runner_whose_texts_use_no_constant(self) -> None:
+        self.assertEqual({"constant_rebound"}, self.named("from plant_names import *\nrecord.limits.append('written text')\n"))
+
+    def test_a_probe_is_named_by_its_line_and_never_the_figure(self) -> None:
+        found = scanned("a plant", partial(sealed_findings, self.PATH), f"{self.HEAD}[(JOB_SECONDS := {FIGURE}) for _ in range(1)]\n{self.RECORD}")
+        self.assertEqual([("constant_rebound", 2)], found)
+        self.assertFalse(str(FIGURE) in repr(found), "a finding holds the figure")
+
+
+class FigurePatternBoundaries(unittest.TestCase):
+    """The figure is found beside an underscore and a word (a name such as ``rows_<figure>``), and not when the underscore joins it to more digits (a longer
+    number)."""
+
+    def found(self, text: str) -> bool:
+        return figure_pattern(FIGURE).search(text) is not None
+
+    def test_the_figure_beside_an_underscore_and_a_word_is_found(self) -> None:
+        for label, text in (
+            ("a name that ends in it", f"rows_{FIGURE}"),
+            ("a name that begins with it", f"{FIGURE}_rows"),
+            ("a name that holds it", f"set_{FIGURE}_rows"),
+            ("a name with two underscores", f"__{FIGURE}__"),
+        ):
+            with self.subTest(label):
+                self.assertTrue(self.found(text), f"{label} is not found")
+
+    def test_the_figure_inside_a_longer_number_is_not_found(self) -> None:
+        for label, text in (
+            ("more digits after an underscore", f"{FIGURE}_567"),
+            ("digits and an underscore before", f"91_{FIGURE}"),
+            ("digits after", f"{FIGURE}0"),
+            ("a letter after", f"{FIGURE}b"),
+            ("a letter before", f"a{FIGURE}"),
+            ("a decimal part", f"{FIGURE}.5"),
+        ):
+            with self.subTest(label):
+                self.assertFalse(self.found(text), f"{label} is found")
+
+
+def figures_written(source: str) -> list[str]:
+    """The label, the rule and the line of each place where a source writes a figure in any spelling of ``figure_findings``, never a figure."""
+    names = {FIGURE: "the test-set patient count", CASE_FIGURE: "the held-out case count"}
+    return [f"{names[figure]} ({rule}, line {line})" for figure in FIGURES for rule, line in figure_findings(source, figure)]
+
+
+class ThisFileWritesNoFigure(unittest.TestCase):
+    """The figure is taken from the rule module when the tests run, and this file's text holds neither the test-set figure nor the held-out case count in any
+    spelling of the scanner: the examples of its own docstrings are another number."""
+
+    def test_the_scanner_names_a_figure_that_a_source_writes_and_never_prints_it(self) -> None:
+        found = figures_written(f'"""holds {FIGURE:,}"""\nCOUNT = {CASE_FIGURE}\n')
+        expected = [
+            "the test-set patient count (figure_text, line 1)",
+            "the held-out case count (figure_number, line 2)",
+            "the held-out case count (figure_text, line 2)",
+        ]
+        self.assertEqual(expected, found)
+        self.assertFalse(any(str(figure) in text for figure in FIGURES for text in found), "a label holds a figure")
+
+    def test_this_file_writes_no_figure(self) -> None:
+        self.assertEqual([], figures_written(Path(__file__).read_text()), "the places where this file writes a figure")
 
 
 PASSED_ON = "def check(self, text):\n    self.record.expect('c', 'k', text, sealed_observed({'a': True}), ok is True)\n"
