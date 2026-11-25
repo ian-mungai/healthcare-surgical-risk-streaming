@@ -181,7 +181,7 @@ class HostCodeTest(IntakeCase):
             "unknown_name",
             "bad_form",
             "stored_bad_form",
-            "no_admin",
+            "no_login",
             "not_allowed",
             "no_answer",
             "mismatch",
@@ -191,6 +191,8 @@ class HostCodeTest(IntakeCase):
                 external_intake.run_intake(declared(), replying((3, f"{code}\n")), answering(VALUE), external_intake.write_line)
             self.assertIn(NAME, str(caught.exception))
             self.assertNotIn(VALUE, str(caught.exception))
+            for advice in ("reset", "volume", "recreate"):
+                self.assertNotIn(advice, str(caught.exception), "no message tells the owner to destroy the host's OpenBao or its data")
 
     def test_a_code_that_the_program_does_not_know_and_a_failed_ssh_are_refused(self) -> None:
         for reply in ((0, "surprise\n"), (255, ""), (1, "")):

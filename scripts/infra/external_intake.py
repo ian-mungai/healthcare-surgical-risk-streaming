@@ -62,10 +62,12 @@ MESSAGES = {
     "script_unknown_name": ("the host's copy of the list of external secrets does not declare {name}: the host playbook places the list, so run it first"),
     "script_bad_form": "the intake script on the host refused the value of external secret {name}: it is not in the form of its check",
     "script_stored_bad_form": "the value that the host's OpenBao holds for external secret {name} is not in the form of its check",
-    "script_no_admin": "the intake script on the host could not log in to its OpenBao to store external secret {name}",
+    "script_no_login": (
+        "the intake script on the host could not log in to its OpenBao to store external secret {name}: the host playbook makes the login, so run it first"
+    ),
     "script_not_allowed": (
-        "the admin policy of the host's OpenBao does not allow external secrets ({name}): the host was made before they existed, "
-        "so recreate it or reset OpenBao's data volume"
+        "the intake role of the host's OpenBao does not allow external secret {name}: the host playbook writes its policy from the list at every deploy, "
+        "so run it first"
     ),
     "script_no_answer": ("the host's OpenBao did not answer the intake script for external secret {name}; run the command again, which completes the write"),
     "script_mismatch": (

@@ -6,9 +6,9 @@ asks whether the path is empty. A text value is written when the path is empty. 
 Ansible task or module ever holds the value. It prints one code and nothing else. It exits 0 for the codes ``empty``, ``present``, ``written`` and
 ``unchanged`` and 3 for the others: ``oversized`` (input over 4 KiB), ``not_json``, ``bad_keys`` (not exactly ``name`` and ``value``),
 ``unknown_name``, ``bad_form`` (a value that is not text or fails the check of its name), ``stored_bad_form`` (the stored value fails the check),
-``no_admin`` (the admin login was refused or its secret ID file cannot be read), ``not_allowed`` (the admin policy forbids the call: the host's
-OpenBao was made before external secrets), ``no_answer`` (the server did not answer), ``mismatch`` (the read-back text did not equal the sent one: the
-stored version is removed) and ``cannot_write``.
+``no_login`` (the login of the intake role was refused or its secret ID file cannot be read), ``not_allowed`` (the policy of the intake role
+forbids the call: the host playbook writes that policy from the list at every deploy, so run it first), ``no_answer`` (the server did not
+answer), ``mismatch`` (the read-back text did not equal the sent one: the stored version is removed) and ``cannot_write``.
 
 The write is one check-and-set call, so it creates the value only while no value is stored, and it is read back and compared by SHA-256 with the sent
 value. A call that never arrived leaves the path empty and the next run writes. A call whose read-back was lost leaves the whole value (the form was
@@ -46,8 +46,8 @@ external = load_helper("external_secrets")
 DEFAULT_DIRECTORY = "/opt/platform/secrets"
 DEFAULT_LIST = "/opt/platform/compose/external_secrets.txt"
 DEFAULT_ADDRESS = "http://127.0.0.1:8200"
-ADMIN_FILE = Path("openbao") / "bootstrap.secret_id"
-ADMIN_ROLE = "bootstrap"
+ROLE = external.INTAKE_ROLE
+ROLE_FILE = Path("openbao") / f"{ROLE}.secret_id"
 MAX_INPUT_BYTES = 4096
 HTTP_SECONDS = 10
 TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
@@ -104,16 +104,17 @@ def parse_document(data: bytes) -> tuple[str, str | None]:
     return name, value
 
 
-def admin_token(server: Server, directory: Path) -> str:
+def login_token(server: Server, directory: Path) -> str:
+    """The token of the intake role, which the host playbook's reconcile step wrote from the list (its policy holds the declared paths and nothing else)."""
     try:
-        secret_id = (directory / ADMIN_FILE).read_text().rstrip("\n")
+        secret_id = (directory / ROLE_FILE).read_text().rstrip("\n")
     except OSError:
-        raise Refusal("no_admin") from None
-    status, document = server.call("POST", "auth/approle/login", body={"role_id": ADMIN_ROLE, "secret_id": secret_id})
+        raise Refusal("no_login") from None
+    status, document = server.call("POST", "auth/approle/login", body={"role_id": ROLE, "secret_id": secret_id})
     auth = document.get("auth")
     token = auth.get("client_token") if isinstance(auth, dict) else None
     if status != 200 or not isinstance(token, str) or TOKEN_FORM.fullmatch(token) is None:
-        raise Refusal("no_admin")
+        raise Refusal("no_login")
     return token
 
 
@@ -156,7 +157,7 @@ def run(name: str, value: str | None, directory: Path, list_path: Path, address:
     if value is not None and not external.form_ok(check, value):
         raise Refusal("bad_form")
     server = Server(address)
-    token = admin_token(server, directory)
+    token = login_token(server, directory)
     stored = stored_value(server, token, name)
     if stored is not None and not external.form_ok(check, stored):
         raise Refusal("stored_bad_form")

@@ -97,6 +97,16 @@ class FetchTest(StepCase):
         self.assertTrue(self.fetch(target)["changed"])
         self.assertEqual((0o400, VALUE), (stat.S_IMODE(target.stat().st_mode), target.read_text()))
 
+    def test_a_refused_login_names_the_role_and_the_status_and_gives_no_advice_to_reset_the_data(self) -> None:
+        (self.secrets / "openbao" / "deploy.secret_id").write_text("a-secret-id-that-the-server-does-not-know")
+        with self.assertRaises(bootstrap.BootstrapError) as caught:
+            self.fetch(self.folder / "token")
+        text = str(caught.exception)
+        self.assertIn("the login of role deploy was refused (HTTP 400)", text)
+        for advice in ("reset", "volume"):
+            self.assertNotIn(advice, text)
+        self.assertNotIn("a-secret-id-that-the-server-does-not-know", text)
+
     def test_a_secret_of_another_consumer_is_refused_before_any_call(self) -> None:
         self.server.versions[f"external/{NAME}"] = [VALUE]
         with self.assertRaises(bootstrap.BootstrapError) as caught:

@@ -1,6 +1,6 @@
 """The intake script on the host writes one external secret into OpenBao when its path is empty, and says so in one code.
 
-The script is run as the role installs it: beside its two helpers, in the host's interpreter in isolated mode. The server is the stand-in of
+The script is run as the role installs it: beside its helper, in the host's interpreter in isolated mode. The server is the stand-in of
 ``tests/fast/openbao_stand_in.py``. The values are synthetic markers in the form of the check, and each case looks for them in every output.
 """
 
@@ -23,20 +23,24 @@ from unittest import mock
 from scripts.process import run_command
 from scripts.project_config import ROOT
 from tests.fast.ansible_paths import SHARED_MODULE_UTILS
-from tests.fast.openbao_stand_in import ADMIN_ROLE, Role, StandIn
+from tests.fast.openbao_stand_in import Role, StandIn
 
 SCRIPT = ROOT / "ansible" / "roles" / "openbao" / "files" / "external_secret_intake.py"
 LIST = ROOT / "compose" / "external_secrets.txt"
 VALUE = "dckr_pat_" + "MarkerValueThatMustNotLeak01"
 OTHER = "dckr_pat_" + "AnotherMarkerThatMustNotLeak2"
 ADMIN_MARKER = "admin-secret-id-marker"
+INTAKE_ROLE = "external_intake"
+INTAKE_MARKER = "intake-secret-id-marker"
+INTAKE_FILE_NAME = "external_intake.secret_id"
 NAME = "dockerhub_read"
 PATH = f"secret/data/external/{NAME}"
-ADMIN_WRITES = ("secret/data/external/*",)
+INTAKE_WRITES = ("secret/data/external/*",)
 
 
-def admin_role() -> Role:
-    return Role(ADMIN_MARKER, "admin-token-marker", ADMIN_WRITES, ADMIN_WRITES)
+def intake_role() -> Role:
+    """The intake script's own role, which the reconcile step writes: it reads and writes the external paths and nothing else."""
+    return Role(INTAKE_MARKER, "intake-token-marker", INTAKE_WRITES, INTAKE_WRITES)
 
 
 class Case(unittest.TestCase):
@@ -45,16 +49,19 @@ class Case(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.folder, True)
         bin_folder = self.folder / "bin"
         bin_folder.mkdir()
-        for name in ("secret_files.py", "external_secrets.py"):
+        for name in ("external_secrets.py",):
             shutil.copy(SHARED_MODULE_UTILS / name, bin_folder / name)
         self.script = bin_folder / "external_secret_intake"
         shutil.copy(SCRIPT, self.script)
         self.script.chmod(0o700)
         (self.folder / "secrets" / "openbao").mkdir(parents=True)
-        (self.folder / "secrets" / "openbao" / "bootstrap.secret_id").write_text(ADMIN_MARKER)
-        self.server = StandIn({ADMIN_ROLE: admin_role()})
+        (self.folder / "secrets" / "openbao" / "external_intake.secret_id").write_text(INTAKE_MARKER)
+        self.server = self.make_server()
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
+
+    def make_server(self) -> StandIn:
+        return StandIn({INTAKE_ROLE: intake_role()})
 
     def run_script(self, document: object, *, raw: bytes | None = None, server: StandIn | None = None) -> tuple[int, str, str]:
         """Run the script's main in this process on the document as standard input, and return the exit code, the standard output and the standard error."""
@@ -163,11 +170,11 @@ class WriteTest(Case):
                 self.assertEqual((3, f"{expected[label]}\n", ""), self.run_script(None, raw=raw))
         self.assertEqual([], self.server.calls)
 
-    def test_an_admin_login_that_is_refused_and_a_policy_that_forbids_the_write_have_their_own_codes(self) -> None:
-        (self.folder / "secrets" / "openbao" / "bootstrap.secret_id").write_text("wrong")
-        self.assertEqual((3, "no_admin\n", ""), self.run_script({"name": NAME, "value": VALUE}))
-        (self.folder / "secrets" / "openbao" / "bootstrap.secret_id").write_text(ADMIN_MARKER)
-        self.server.roles[ADMIN_ROLE].writable = ()
+    def test_a_login_that_is_refused_and_a_policy_that_forbids_the_write_have_their_own_codes(self) -> None:
+        (self.folder / "secrets" / "openbao" / "external_intake.secret_id").write_text("wrong")
+        self.assertEqual((3, "no_login\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+        (self.folder / "secrets" / "openbao" / "external_intake.secret_id").write_text(INTAKE_MARKER)
+        self.server.roles[INTAKE_ROLE].writable = ()
         self.assertEqual((3, "not_allowed\n", ""), self.run_script({"name": NAME, "value": VALUE}))
         self.assertIsNone(self.server.stored(f"external/{NAME}"))
 

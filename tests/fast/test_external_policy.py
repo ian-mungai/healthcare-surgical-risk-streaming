@@ -43,14 +43,14 @@ class ReaderTest(unittest.TestCase):
         for item in declared():
             readers = {name for name, text in policies().items() if grants(text, item.path, "read")}
             with self.subTest(secret=item.name):
-                self.assertEqual({item.consumer}, readers)
+                self.assertEqual({item.consumer, "external_intake"}, readers)
 
-    def test_no_service_policy_can_list_or_write_an_external_path(self) -> None:
+    def test_no_service_policy_but_the_intake_role_s_can_write_an_external_path_and_none_can_list_one(self) -> None:
         for item in declared():
             for name, text in policies().items():
                 for capability in ("create", "update", "delete", "list"):
                     with self.subTest(secret=item.name, service=name, capability=capability):
-                        self.assertFalse(grants(text, item.path, capability))
+                        self.assertEqual(name == "external_intake" and capability != "list", grants(text, item.path, capability))
 
     def test_a_consumer_policy_reads_the_declared_path_and_its_own_folder_and_nothing_else(self) -> None:
         paths = re.findall(r'path "([^"]+)"', policies()["deploy"])
@@ -61,7 +61,7 @@ class ReaderTest(unittest.TestCase):
 
     def test_a_service_that_consumes_nothing_external_has_no_external_path_in_its_policy(self) -> None:
         for name, text in policies().items():
-            if name not in {item.consumer for item in declared()}:
+            if name not in {item.consumer for item in declared()} | {"external_intake"}:
                 with self.subTest(service=name):
                     self.assertNotIn("external", text)
 
@@ -75,17 +75,38 @@ class AdminPolicyTest(unittest.TestCase):
     def admin_text(self) -> str:
         return HCL.split("write_admin_policy", 1)[1].split("EOT", 2)[1]
 
-    def test_the_admin_policy_writes_reads_and_removes_an_external_value_and_reads_its_metadata(self) -> None:
-        text = self.admin_text()
+    def test_the_admin_policy_has_no_external_rule_because_the_intake_role_holds_them_and_a_host_made_before_them_could_never_get_one(self) -> None:
+        self.assertEqual([], [glob for glob, _ in RULE.findall(self.admin_text()) if "external" in glob])
+
+
+class IntakePolicyTest(unittest.TestCase):
+    def intake(self) -> str:
+        return policies()["external_intake"]
+
+    def test_the_intake_role_creates_reads_updates_and_removes_each_declared_value_and_reads_its_metadata(self) -> None:
         for item in declared():
             for capability in ("create", "read", "update", "delete"):
                 with self.subTest(secret=item.name, capability=capability):
-                    self.assertTrue(grants(text, item.path, capability))
-            self.assertTrue(grants(text, item.path.replace("/data/", "/metadata/"), "read"))
+                    self.assertTrue(grants(self.intake(), item.path, capability))
+            self.assertTrue(grants(self.intake(), item.path.replace("/data/", "/metadata/"), "read"))
 
-    def test_the_admin_policy_has_no_other_external_rule(self) -> None:
-        rules = [glob for glob, _ in RULE.findall(self.admin_text()) if "external" in glob]
-        self.assertEqual(["secret/data/external/*", "secret/metadata/external/*"], rules)
+    def test_the_intake_policy_holds_exactly_the_declared_paths_and_their_metadata_and_cannot_list(self) -> None:
+        expected = sorted(path for item in declared() for path in (item.path, item.path.replace("/data/", "/metadata/")))
+        self.assertEqual(expected, sorted(re.findall(r'path "([^"]+)"', self.intake())))
+        for item in declared():
+            self.assertFalse(grants(self.intake(), item.path, "list"))
+            self.assertFalse(grants(self.intake(), item.path.replace("/data/", "/metadata/"), "update"))
+        for other in (
+            "secret/data/services/nessie/postgres",
+            "secret/data/external/not_declared",
+            "sys/policies/acl/service_nessie",
+            "auth/approle/role/nessie",
+        ):
+            self.assertFalse(grants(self.intake(), other, "read"), other)
+
+    def test_the_intake_role_is_a_listed_service_that_runs_outside_compose_so_root_owns_its_secret_id_file(self) -> None:
+        lines = [line.split("#", 1)[0].split() for line in SERVICES_TEXT.splitlines() if line.split("#", 1)[0].split()]
+        self.assertIn(["external_intake"], lines)
 
 
 class PlanTest(unittest.TestCase):

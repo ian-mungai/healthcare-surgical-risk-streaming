@@ -32,7 +32,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.external_secrets import ExternalSecretError, form_ok, parse_external, value_digest
+from ansible.module_utils.external_secrets import INTAKE_ROLE, ExternalSecretError, form_ok, parse_external, value_digest
 from ansible.module_utils.secret_files import (
     Entry,
     PasswordStore,
@@ -67,8 +67,21 @@ def policy_name(service: str) -> str:
     return f"service_{service}"
 
 
+def intake_policy_text(paths: Sequence[str]) -> str:
+    """The policy of the intake role: it creates, reads, updates and removes each declared external path, reads its metadata (the version for check-and-set)."""
+    return "".join(
+        f'path "{path}" {{ capabilities = ["create", "read", "update", "delete"] }}\n'
+        f'path "{path.replace("/data/", "/metadata/", 1)}" {{ capabilities = ["read"] }}\n'
+        for path in paths
+    )
+
+
 def policy_text(service: str, external_paths: Sequence[str] = ()) -> str:
-    """The one policy of a service: it reads and lists its own path, and reads each external secret that the list gives it as consumer, and nothing else."""
+    """The one policy of a service: it reads and lists its own path, and reads each external secret that the list gives it as consumer, and nothing else.
+
+    The intake role has the other form (``intake_policy_text``): it writes the declared paths and has no path of its own."""
+    if service == INTAKE_ROLE:
+        return intake_policy_text(external_paths)
     return (
         f'path "secret/data/services/{service}/*" {{ capabilities = ["read"] }}\n'
         f'path "secret/metadata/services/{service}/*" {{ capabilities = ["read", "list"] }}\n'
@@ -77,7 +90,9 @@ def policy_text(service: str, external_paths: Sequence[str] = ()) -> str:
 
 
 def external_paths(list_text: str, services: Sequence[str]) -> dict[str, list[str]]:
-    """The paths of the external secrets that each consumer reads, from the tracked list. A consumer that is no listed service has no policy: it is refused."""
+    """The paths of the external secrets that each consumer reads, from the tracked list, and under the intake role the paths of all of them.
+
+    A consumer that is no listed service has no policy: it is refused."""
     try:
         declared = parse_external(list_text)
     except ExternalSecretError as error:
@@ -87,6 +102,7 @@ def external_paths(list_text: str, services: Sequence[str]) -> dict[str, list[st
         if item.consumer not in services:
             raise BootstrapError(f"the consumer {item.consumer!r} of external secret {item.name!r} is not in the service list, so it has no policy")
         paths.setdefault(item.consumer, []).append(item.path)
+    paths[INTAKE_ROLE] = [item.path for item in declared]
     return paths
 
 
@@ -228,9 +244,7 @@ class Api:
         if status == 200 and token and type(token) is not str:
             raise BootstrapError(f"the login of role {role} gave a token that is not text")
         if status != 200 or not token:
-            raise BootstrapError(
-                f"the login of role {role} was refused (HTTP {status}); if OpenBao started with another admin secret ID, its data volume must be reset"
-            )
+            raise BootstrapError(f"the login of role {role} was refused (HTTP {status}): the secret ID in its file is not one that OpenBao holds for the role")
         return str(token)
 
 

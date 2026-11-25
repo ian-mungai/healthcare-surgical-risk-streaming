@@ -8,3 +8,6 @@ alloy
 apicurio 10002:10002
 # The deploy consumer: the stack playbook's login to Docker Hub reads the read token (compose/external_secrets.txt) through this AppRole. It runs outside Compose, so root owns its secret ID file.
 deploy
+# The intake role: the script that the launcher runs on the host to store each external secret (compose/external_secrets.txt) logs in as this service. Its policy writes
+# the declared external paths and nothing else, and every deploy writes it, so a host whose OpenBao was made before external secrets existed has it too. It runs outside Compose, so root owns its secret ID file.
+external_intake

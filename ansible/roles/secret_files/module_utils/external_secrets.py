@@ -2,8 +2,8 @@
 
 An external secret is one that a third party issues (the first is the host's read-only Docker Hub token). ``compose/external_secrets.txt`` declares each
 by name, consumer, OpenBao path and form check, and never its value. Three programs read the same file: the launcher on the owner's computer (before it
-sends a value), the intake script on the host (before it writes a value) and the OpenBao module (which gives each consumer's policy its own paths).
-It uses only the standard library.
+sends a value), the intake script on the host (before it writes a value) and the OpenBao module (which gives each consumer's policy its own paths and the
+intake role's policy all of them). It uses only the standard library.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ from dataclasses import dataclass
 
 NAME_FORM = re.compile(r"[a-z][a-z0-9_]{0,30}")
 PATH_PREFIX = "secret/data/external/"
+# The AppRole of the intake script that runs on the host: its policy writes the declared paths, and it is written at every deploy from the list, so a host whose
+# OpenBao was made before the list existed gets it too.
+INTAKE_ROLE = "external_intake"
 # The closed set of named checks. A value is one line: no white space and no character outside the set.
 FORM_CHECKS = {"dockerhub_token": re.compile(r"dckr_pat_[A-Za-z0-9_-]{20,100}")}
 
