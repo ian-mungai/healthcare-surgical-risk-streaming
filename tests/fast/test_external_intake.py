@@ -11,9 +11,11 @@ import getpass
 import io
 import json
 import sys
+import tempfile
 import warnings
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -253,3 +255,20 @@ class HostCodeTest(IntakeCase):
         for reply in ((0, "surprise\n"), (255, ""), (1, "")):
             with self.subTest(reply=reply), self.assertRaises(IntakeError):
                 external_intake.run_intake(declared(), replying(reply), answering(VALUE), external_intake.write_line)
+
+
+class ListFileTest(IntakeCase):
+    """A list file that cannot be read or decoded is one fixed refusal: no byte, offset or path of the file reaches the text."""
+
+    def test_a_list_that_is_not_utf_8_is_the_fixed_cannot_be_read_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "external_secrets.yml"
+            path.write_bytes(b"secrets:\n  - name: \xff\xfeodd\n")
+            with self.assertRaises(IntakeError) as caught:
+                external_intake.declared_secrets(path)
+        self.assertEqual("the list of external secrets cannot be read", str(caught.exception))
+
+    def test_a_list_that_cannot_be_opened_is_the_same_refusal_without_its_path(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, self.assertRaises(IntakeError) as caught:
+            external_intake.declared_secrets(Path(folder) / "missing.yml")
+        self.assertEqual("the list of external secrets cannot be read", str(caught.exception))
