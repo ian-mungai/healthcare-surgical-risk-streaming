@@ -1,14 +1,20 @@
 """The decisions of the phase 5 host runner (``tests/e2e/bronze_host.py``): what it refuses before it touches the host, what counts as a match with the
 independent read, what counts as a passed control or a held planted fault, and what counts as left behind.
 
-The runner stays untracked, so each test skips when it is not on this machine. No host, no Docker and no AWS access are used: every decision is a pure function.
+The runner stays untracked, so each test skips when it is not on this machine. No host, no Docker and no AWS access are used: every decision here is a pure
+function. The steps that change something are in ``test_runner_bronze_host_run.py``.
 
 Failure modes covered here:
 
 - A reference file that is not a manifest reference, or a source hash that is not a Nessie hash, starts a run on the host with nothing to read.
-- A manifest that did not pass, one with no case file or two clinical tables, or one that holds a case outside the development set, is read or decoded.
-- The comparison with the independent read passes when a payload differs, when a key is on one side only, when a table is empty, or when a row count differs.
-- A passing control is accepted although main moved, a table is missing, the published hash is not the checked hash or the snapshots differ.
+- A manifest that did not pass, one with no case file or two clinical tables, one that holds a case outside the development set, one that holds only some
+  of the fixed sample's cases or one that names a case twice, is read or decoded.
+- The comparison with the independent read passes when a payload differs, when a key is on one side only, when a table is empty, when a row count differs,
+  when a key is written twice with other payloads on each side, or when a key is repeated on both sides.
+- A passing control is accepted although main moved, a table is missing, the published hash is not the checked hash, the snapshots differ or the branch is not
+  one that the job confirmed it made. Two runs are taken for different parallelism when the job reports the same one for both.
+- A clinical verify is accepted although its hash or a snapshot ID is not the one that the write confirmed in Nessie, and the sealed notes keep a Boolean
+  for the hash.
 - A planted fault is accepted as held although the guard that stopped it is not the named one, the named check did not fail, or the base or the trunk moved.
 - A reference of the run, a second tag, or a changed listing of the landing and manifests prefixes is not found as left behind; a folder outside the
   run's own is removed.
@@ -96,6 +102,14 @@ class Sample(unittest.TestCase):
         keys = [*self.KEYS, "vitaldb/1.0.0/vital_files/0565.vital"]
         self.assertEqual("case_not_development", self.module.sample_problem("passed", keys, self.DEVELOPMENT))
 
+    def test_a_manifest_that_holds_only_some_of_the_fixed_samples_cases_is_refused(self) -> None:
+        self.assertEqual("case_set", self.module.sample_problem("passed", self.KEYS[1:], self.DEVELOPMENT))
+        self.assertEqual("case_set", self.module.sample_problem("passed", [self.KEYS[0], self.KEYS[2]], self.DEVELOPMENT))
+
+    def test_a_manifest_that_names_a_case_twice_is_refused(self) -> None:
+        keys = [*self.KEYS, "vitaldb/1.0.0/vital_files/0908.vital"]
+        self.assertEqual("case_set", self.module.sample_problem("passed", keys, self.DEVELOPMENT))
+
     def test_a_case_that_the_candidates_do_not_list_is_refused(self) -> None:
         keys = [*self.KEYS, "vitaldb/1.0.0/vital_files/0777.vital"]
         self.assertEqual("case_not_development", self.module.sample_problem("passed", keys, self.DEVELOPMENT))
@@ -145,6 +159,23 @@ class Comparison(unittest.TestCase):
         self.assertEqual([2, 3], report["numeric_observations"]["rows"])
         self.assertFalse(self.module.tables_equal(report))
 
+    def test_a_key_written_twice_with_other_payloads_on_each_side_is_not_hidden_by_the_last_one(self) -> None:
+        left = dumps(numeric_observations=f'["k1"]\t{HASH}\n["k1"]\t{OTHER}\n["k2"]\t{OTHER}\n')
+        right = dumps(numeric_observations=f'["k1"]\t{OTHER}\n["k1"]\t{OTHER}\n["k2"]\t{OTHER}\n')
+        report = self.module.compare_tables(left, right)
+        self.assertEqual([3, 3], report["numeric_observations"]["rows"])
+        self.assertFalse(self.module.tables_equal(report))
+        self.assertFalse(self.module.tables_identical(report))
+
+    def test_a_key_repeated_on_both_sides_with_the_same_payloads_is_refused(self) -> None:
+        twice = dumps(numeric_observations=f'["k1"]\t{HASH}\n["k1"]\t{HASH}\n["k2"]\t{OTHER}\n')
+        report = self.module.compare_tables(twice, twice)
+        self.assertFalse(self.module.tables_equal(report))
+
+    def test_the_same_rows_in_another_order_match(self) -> None:
+        reversed_rows = dumps(tracks=f'["k2"]\t{OTHER}\n["k1"]\t{HASH}\n')
+        self.assertTrue(self.module.tables_equal(self.module.compare_tables(dumps(), reversed_rows)))
+
 
 class Control(unittest.TestCase):
     def setUp(self) -> None:
@@ -168,6 +199,7 @@ class Control(unittest.TestCase):
             "base_after": "c" * 64,
             "entries": [f"bronze.{n}" for n in TABLES],
             "plan_size": 3,
+            "created": True,
         }
         problem: str | None = self.module.control_problem(**{**held, **changes})
         return problem
@@ -208,6 +240,116 @@ class Control(unittest.TestCase):
     def test_a_result_that_did_not_pass_fails(self) -> None:
         self.result["passed"] = False
         self.assertEqual("not_passed", self.problem())
+
+    def test_a_branch_that_the_job_did_not_confirm_it_made_fails(self) -> None:
+        self.assertEqual("branch_not_made", self.problem(created=False))
+
+
+class Parallelism(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = runner()
+
+    def problem(self, first: object, second: object, cases: int = 9, requested: tuple[int, int] = (1, 9)) -> str | None:
+        found: str | None = self.module.parallelism_problem(first, second, cases=cases, requested=requested)
+        return found
+
+    def test_the_effective_parallelism_that_the_job_reports_is_distinct_and_as_asked(self) -> None:
+        self.assertIsNone(self.problem(1, 9))
+
+    def test_two_runs_that_report_the_same_parallelism_are_refused(self) -> None:
+        self.assertEqual("parallelism_not_distinct", self.problem(1, 1))
+        self.assertEqual("parallelism_not_distinct", self.problem(1, 1, cases=1, requested=(1, 1)))
+
+    def test_a_parallelism_that_is_not_the_one_asked_for_is_refused(self) -> None:
+        self.assertEqual("parallelism_not_as_asked", self.problem(1, 4))
+        self.assertEqual("parallelism_not_as_asked", self.problem(2, 9))
+
+    def test_a_missing_or_wrong_type_is_refused(self) -> None:
+        for bad in (None, "1", True, 1.0):
+            with self.subTest(bad=bad):
+                self.assertEqual("parallelism_not_reported", self.problem(bad, 9))
+                self.assertEqual("parallelism_not_reported", self.problem(1, bad))
+
+    def test_a_request_above_the_number_of_cases_is_the_number_of_cases(self) -> None:
+        self.assertIsNone(self.problem(1, 3, cases=3, requested=(1, 12)))
+
+
+class ClinicalVerify(unittest.TestCase):
+    NAMES = ("clinical_cases", "lab_results")
+
+    def setUp(self) -> None:
+        self.module = runner()
+        self.bronze = {"clinical_cases": 11, "lab_results": 12}
+        self.source = {"clinical_cases": 21, "lab_results": 22}
+        self.result: dict[str, Any] = {
+            "passed": True,
+            "branch_hash": HASH,
+            "source_hash": OTHER,
+            "tables": {name: {"bronze_snapshot_id": self.bronze[name], "source_snapshot_id": self.source[name]} for name in self.NAMES},
+        }
+
+    def problem(self, **changes: object) -> str | None:
+        held = {"branch_hash": HASH, "source_hash": OTHER, "bronze": self.bronze, "source": self.source}
+        found: str | None = self.module.verify_problem(self.result, **{**held, **changes})
+        return found
+
+    def test_a_verify_at_the_write_ids_passes(self) -> None:
+        self.assertIsNone(self.problem())
+
+    def test_a_verify_that_did_not_pass_fails(self) -> None:
+        self.result["passed"] = False
+        self.assertEqual("not_passed", self.problem())
+
+    def test_a_verify_at_another_branch_hash_fails(self) -> None:
+        self.result["branch_hash"] = "c" * 64
+        self.assertEqual("branch_hash", self.problem())
+
+    def test_a_verify_at_another_source_hash_fails(self) -> None:
+        self.assertEqual("source_hash", self.problem(source_hash="c" * 64))
+
+    def test_a_verify_at_another_snapshot_of_either_table_fails(self) -> None:
+        self.result["tables"]["lab_results"]["bronze_snapshot_id"] = 99
+        self.assertEqual("snapshots", self.problem())
+        self.result["tables"]["lab_results"]["bronze_snapshot_id"] = 12
+        self.result["tables"]["clinical_cases"]["source_snapshot_id"] = 99
+        self.assertEqual("snapshots", self.problem())
+
+    def test_ids_that_nessie_does_not_hold_or_a_boolean_never_match(self) -> None:
+        self.assertEqual("snapshots", self.problem(bronze={**self.bronze, "lab_results": None}))
+        self.result["tables"]["lab_results"]["bronze_snapshot_id"] = True
+        self.assertEqual("snapshots", self.problem(bronze={**self.bronze, "lab_results": 1}))
+
+    def test_a_table_that_the_verify_lacks_fails(self) -> None:
+        del self.result["tables"]["lab_results"]
+        self.assertEqual("snapshots", self.problem())
+
+    def test_the_sealed_notes_keep_the_hash_and_the_snapshot_ids_that_nessie_confirmed(self) -> None:
+        from tests.fast.sealed_record import confirm_id
+
+        notes = self.module.clinical_notes(
+            "p5h_ab12cd_cl_a",
+            confirm_id(HASH, HASH),
+            OTHER,
+            {name: confirm_id(value, value) for name, value in self.bronze.items()},
+            {name: confirm_id(value, value) for name, value in self.source.items()},
+        )
+        self.assertEqual(HASH, notes["branch_hash"])
+        self.assertEqual(OTHER, notes["source_hash"])
+        self.assertEqual({"clinical_cases": {"bronze": 11, "source": 21}, "lab_results": {"bronze": 12, "source": 22}}, notes["snapshots"])
+
+    def test_the_sealed_notes_refuse_an_id_that_nessie_did_not_confirm(self) -> None:
+        from tests.fast.sealed_record import confirm_id
+
+        with self.assertRaises(ValueError):
+            self.module.clinical_notes("p5h_ab12cd_cl_a", None, OTHER, {}, {})
+        with self.assertRaises(ValueError):
+            self.module.clinical_notes(
+                "p5h_ab12cd_cl_a",
+                confirm_id(HASH, HASH),
+                OTHER,
+                {"clinical_cases": None, "lab_results": confirm_id(1, 1)},
+                {"clinical_cases": confirm_id(1, 1), "lab_results": confirm_id(1, 1)},
+            )
 
 
 class Planted(unittest.TestCase):
