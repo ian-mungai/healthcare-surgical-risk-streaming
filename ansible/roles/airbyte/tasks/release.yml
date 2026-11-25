@@ -245,7 +245,8 @@
           [ -n "$names" ] || exit 5
           end=$(( $(date +%s) + DEADLINE ))
           for name in $names; do
-            left=$(( end - $(date +%s) ))
+            # date counts whole seconds, so one second less is the time surely left: the waits together never pass the deadline.
+            left=$(( end - $(date +%s) - 1 ))
             [ "$left" -gt 0 ] || exit 6
             k3s kubectl rollout status "$name" --namespace "$NAMESPACE" "--timeout=${left}s" >/dev/null 2>&1 || exit 6
           done

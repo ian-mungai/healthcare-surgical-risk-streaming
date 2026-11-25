@@ -201,7 +201,9 @@ leak() { echo "Error: LEAKED-STDERR $1" >&2; echo "LEAKED-STDOUT $1"; exit 1; }
 case "$2 $3" in
 "rollout restart") [ -e "$STAND_IN/flag_fail_restart" ] && leak restart ;;
 "get deployment") [ -e "$STAND_IN/flag_no_deployments" ] || printf 'deployment.apps/airbyte-server\ndeployment.apps/airbyte-workload-launcher\n' ;;
-"rollout status") [ -e "$STAND_IN/flag_fail_rollout" ] && [ "$4" = deployment.apps/airbyte-workload-launcher ] && leak rollout ;;
+"rollout status")
+  [ -e "$STAND_IN/flag_fail_rollout" ] && [ "$4" = deployment.apps/airbyte-workload-launcher ] && leak rollout
+  [ -e "$STAND_IN/flag_slow_rollout" ] && sleep 2 ;;
 esac
 exit 0
 """
@@ -427,7 +429,10 @@ class ReleaseRecoveryTest(unittest.TestCase):
         code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
         self.assertEqual(0, code, output)
         self.assertEqual([UPGRADE, *RESTART], self.commands(log))
-        self.assertIn(f"kubectl rollout status deployment.apps/airbyte-workload-launcher --namespace airbyte --timeout={DEADLINE}s", log)
+        waits = [line for line in log if line.startswith("kubectl rollout status deployment.apps/airbyte-workload-launcher --namespace airbyte --timeout=")]
+        self.assertEqual(1, len(waits), log)
+        seconds = int(waits[0].rsplit("--timeout=", 1)[1].rstrip("s"))
+        self.assertTrue(0 < seconds < DEADLINE, f"the second wait gets what is left of the one deadline, less a second: {seconds}")
 
     def test_a_release_whose_latest_revision_failed_is_upgraded_and_restarted(self) -> None:
         """Helm upgrades a release whose latest revision failed over an older deployed one, and its pods still run the old settings."""
@@ -457,13 +462,18 @@ class ReleaseRecoveryTest(unittest.TestCase):
             self.assertEqual(0, code, output)
             self.assertEqual([], log)
 
-    def test_every_rollout_wait_shares_the_release_deadline(self) -> None:
-        """Each deployment's rollout gets the time left on one deadline, so two waits together never pass the release deadline."""
-        text = (ROOT / "ansible" / "roles" / "airbyte" / "tasks" / "release.yml").read_text()
-        self.assertIn("end=$(( $(date +%s) + DEADLINE ))", text)
-        self.assertIn("left=$(( end - $(date +%s) ))", text)
-        self.assertIn('[ "$left" -gt 0 ] || exit 6', text)
-        self.assertIn('"--timeout=${left}s"', text)
+    def test_the_rollout_waits_together_stay_within_one_release_deadline(self) -> None:
+        """Each rollout of the stand-in takes two seconds. With a three-second deadline the first wait gets two seconds and nothing is left for the second,
+        so the run stops with the rollout code and records nothing; with a seven-second deadline both waits fit and the run passes."""
+        for deadline, passes in ((3, False), (7, True)):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as scratch:
+                box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {"airbyte_release_deadline_seconds": deadline})
+                code, output, _ = box.run(flags=("slow_rollout",))
+                self.assertEqual(passes, code == 0, output)
+                self.assertEqual(passes, box.record().exists())
+                if not passes:
+                    self.assertIn("exit status 6", output)
+                    self.assertNotIn(LEAK, output)
 
     def test_a_first_install_restarts_nothing_because_every_pod_starts_with_the_new_settings(self) -> None:
         code, output, log = self.run_release(NOT_INSTALLED, recorded="none")
