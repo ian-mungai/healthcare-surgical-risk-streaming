@@ -38,7 +38,7 @@ from typing import Any
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import FixedTextError, describe_error
+from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ConfigurationError, load_configuration
 
@@ -230,7 +230,7 @@ def profile_is_the_user(project: Aws, user_arn: str, *, timeout: float = AWS_TIM
     return bool(identity.get("Arn") == user_arn and identity.get("Account") == user_arn.split(":")[4])
 
 
-class KeyAdviceError(ConfigurationError, FixedTextError):
+class KeyAdviceError(ConfigurationError):
     """The key command stops, and its text tells the owner what to do before a retry. Built from constants and the configured user and profile names only."""
 
 

@@ -19,6 +19,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 from scripts import aws_cli
@@ -134,7 +135,6 @@ ALLOWED_PARTS = frozenset(
         "note",
         "PINNED_TERRAFORM",
         "result.returncode",
-        "run_id",
         "tag",
         "what",
     }
@@ -277,6 +277,38 @@ class LauncherErrorTextTests(unittest.TestCase):
         self.assertEqual(
             "the bucket name is not a valid S3 bucket name: 3 to 63 lower case letters, digits and dashes, starting and ending with a letter or digit\n", text
         )
+
+    def test_a_run_id_from_the_binding_file_never_reaches_a_shown_refusal(self) -> None:
+        """The binding file is an input: a refusal shows where its output was kept by the file's fixed name, never by the run id the file gives."""
+        from dataclasses import replace
+
+        from scripts.process import TimeoutExpired
+
+        marked = replace(BOUND, run_id=f"{PLANTED}/nested")
+        failed = SimpleNamespace(returncode=1, stdout="out", stderr="err")
+        expired = TimeoutExpired(["terraform"], 5, output=b"partial", stderr=b"")
+        cases: dict[str, Callable[[], object]] = {}
+        outcomes: tuple[tuple[str, dict[str, Any]], ...] = (("terraform failure", {"return_value": failed}), ("terraform timeout", {"side_effect": expired}))
+        for label, outcome in outcomes:
+
+            def call(outcome: dict[str, Any] = outcome) -> object:
+                with (
+                    mock.patch.object(terraform_wrapper, "run_command", **outcome),
+                    mock.patch.object(terraform_wrapper, "save_raw"),
+                    mock.patch.object(terraform_wrapper, "pinned_terraform", return_value=Path("terraform")),
+                    mock.patch.object(terraform_wrapper, "configuration_folder", return_value=Path("folder")),
+                ):
+                    return terraform_wrapper.terraform(marked, ["plan"], 5)
+
+            cases[label] = call
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(host, "ROOT", Path(root)):
+            cases["missing plan"] = lambda: host.saved_plan(marked.run_id, applied=True)
+            for label, raiser in cases.items():
+                with self.subTest(case=label):
+                    code, text = host_stderr(raiser)
+                    self.assertEqual(1, code)
+                    self.assertNotIn(PLANTED, text)
+                    self.assertNotEqual("WrapperError\n", text, "the fixed advice is still shown")
 
     def test_a_class_that_is_not_marked_shows_its_type_name_and_nothing_of_a_planted_value(self) -> None:
         for name, raiser in (("WrapperError", refused_planted_limits), ("HostError", bad_state_figure), ("AwsError", failed_aws_call)):

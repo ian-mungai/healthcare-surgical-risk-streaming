@@ -334,7 +334,7 @@ def saved_plan(run_id: str, *, applied: bool) -> dict[str, Any]:
     folder = ROOT / "runs" / run_id / "plans"
     found = [folder / name for name in (("apply.json",) if applied else ("apply.json", "apply_check.json")) if (folder / name).is_file()]
     if not found:
-        raise FixedHostError(f"no saved plan JSON of run {run_id} gives the planned heavy_memory_mib: run make host-up again to plan first")
+        raise FixedHostError("no saved plan JSON of the run gives the planned heavy_memory_mib: run make host-up again to plan first")
     document: dict[str, Any] = json.loads(max(found, key=lambda path: path.stat().st_mtime_ns).read_text())
     return document
 

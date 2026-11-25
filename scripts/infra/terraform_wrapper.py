@@ -67,12 +67,14 @@ def save_raw(run_id: str, name: str, text: str) -> None:
 
 
 def kept_note(run_id: str, name: str, text: str, what: str) -> str:
-    """Keep ``text`` privately as ``name`` and return the clause that tells where it is, or that it could not be kept. A failed write hides no error."""
+    """Keep ``text`` privately as ``name`` and return the clause that tells where it is, or that it could not be kept. A failed write hides no error.
+
+    The clause names the file by its fixed name in the run's raw folder and never by the run id, which a command reads from the binding file, an input."""
     try:
         save_raw(run_id, name, text)
     except OSError:
         return f"its {what} could not be kept"
-    return f"its {what} is in runs/{run_id}/raw/{name}"
+    return f"its {what} is in the run's raw folder as {name}"
 
 
 class WrapperError(RuntimeError):

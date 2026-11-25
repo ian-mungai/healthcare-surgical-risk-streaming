@@ -505,7 +505,7 @@ class ErrorTextTest(unittest.TestCase):
             terraform_wrapper.terraform(RUN, ["apply", "-input=false"], 10)
         saved.assert_called_once()
         self.assertEqual(
-            "terraform apply failed with exit status 1; its full output is in runs/20260101t0000-abcdef/raw/terraform_apply_failure.txt", str(raised.exception)
+            "terraform apply failed with exit status 1; its full output is in the run's raw folder as terraform_apply_failure.txt", str(raised.exception)
         )
 
 
