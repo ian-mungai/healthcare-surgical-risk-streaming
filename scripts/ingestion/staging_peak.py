@@ -29,7 +29,8 @@ from typing import Any
 
 from scripts.ingestion.cli import read_input, say, write_private
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, describe_error, render
+from scripts.ingestion.output_file import check_new_output
 from scripts.process import run_command
 from scripts.stack.capacity_sampler import (
     DEFAULT_INTERVAL_SECONDS,
@@ -129,7 +130,7 @@ def run_sampler(
         }
         out = Output(output)
     except SamplerError as error:
-        emit(f"staging sampler: {error}")
+        emit(f"staging sampler: {describe_error(error)}")
         return 1
     seq, reason = 0, ""
     try:
@@ -148,7 +149,7 @@ def run_sampler(
             flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause, clock=clock)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})
     except SamplerError as error:
-        emit(f"staging sampler: {error}")
+        emit(f"staging sampler: {describe_error(error)}")
         return 1
     finally:
         out.close()
@@ -236,7 +237,7 @@ def peak_record(text: str) -> dict[str, Any]:
 
 def command_peak(arguments: argparse.Namespace) -> int:
     record = peak_record(read_input(arguments.samples, Subject.STAGING_SAMPLES))
-    write_private(arguments.output, json.dumps(record, indent=1, sort_keys=True) + "\n", Subject.STAGING_PEAK)
+    write_private(arguments.output, json.dumps(record, indent=1, sort_keys=True) + "\n")
     say(Notice(Code.STAGING_PEAK_WROTE, count=record["samples"]))
     return 0
 
@@ -282,9 +283,10 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "sample" and not (0 < arguments.interval_seconds <= MAX_INTERVAL_SECONDS and 0 < arguments.max_seconds <= MAX_RUN_SECONDS):
         emit("staging sampler: the interval or the run time is out of range")
         return 1
-    if arguments.command == "sample":
-        return command_sample(arguments)
     try:
+        check_new_output(arguments.output)
+        if arguments.command == "sample":
+            return command_sample(arguments)
         return command_peak(arguments)
     except ClosedError as error:
         for notice in error.notices:

@@ -182,7 +182,7 @@ def desired_state(selection: Selection, *, bucket: str, region: str, source_tag:
 
 def chosen_selection(arguments: argparse.Namespace) -> Selection:
     if arguments.selection:
-        return require_pinned_payloads(Selection.from_json(arguments.selection.read_text()))
+        return require_pinned_payloads(Selection.from_json(arguments.selection.read_text(encoding="utf-8")))
     return fixed_sample_selection() if arguments.fixed_sample else full_release_selection()
 
 
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         for notice in error.notices:
             sys.stderr.write(f"{render(notice)}\n")
         return 1
-    except OSError:
+    except OSError, UnicodeDecodeError:
         sys.stderr.write("cannot read the selection file\n")
         return 1
 

@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any
 
 from features import batch, document
+from features.leakage import LeakageError
 from features.model import FeatureInputError
 from features.registry import INPUT_OBJECTS
 from features.row import build_row
@@ -83,21 +84,28 @@ class Entry(unittest.TestCase):
         self.root = Path(self.folder.name)
 
     def run_text(self, text: str) -> tuple[int, str, Path]:
-        """Run the entry point on the text of a file, with an earlier result already at the target."""
+        """Run the entry point on the text of a file, to a target that is free."""
         source, target = self.root / "windows.json", self.root / "rows.json"
         source.write_text(text)
-        target.write_text("OLD")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = batch.main([str(source), str(target)])
-        return code, stderr.getvalue(), target
+        return code, stderr.getvalue() + self.library_reason(source), target
+
+    def library_reason(self, source: Path) -> str:
+        """The text of the error that the library raises for this file, which the entry point shows by its type only: the rule that names the fault."""
+        try:
+            batch.run(source, self.root / "reason_rows.json")
+        except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
+            return f" | {error}"
+        return ""
 
     def assert_refused(self, text: str, *patterns: str) -> None:
         code, message, target = self.run_text(text)
         self.assertEqual(2, code, message)
         for pattern in patterns:
             self.assertIn(pattern, message)
-        self.assertEqual("OLD", target.read_text())
+        self.assertFalse(target.exists())
 
 
 class ClosedKeys(Entry):

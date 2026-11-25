@@ -137,7 +137,7 @@ def maintain(arguments: Any) -> dict[str, Any]:
     trunk = default_branch(client)
     if arguments.trunk is not None and arguments.trunk != trunk:
         raise RetentionError(
-            f"{arguments.trunk} is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted",
+            f"the trunk argument is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted",
             code="trunk_not_default",
         )
     branches = list_references(client, "BRANCH")

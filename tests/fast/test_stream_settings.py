@@ -53,9 +53,68 @@ class Settings(unittest.TestCase):
             ("STREAM_MAX_OFFSETS_PER_TRIGGER", "0"),
             ("STREAM_TEST_EXIT_AFTER_SINK", "0"),
             ("STREAM_TEST_EXIT_AFTER_SINK", "x"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "\u00b2"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "\u0661"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "1_0"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", " 7"),
         ):
             with self.subTest(name=name, value=value), self.assertRaisesRegex(StreamSettingsError, name):
                 from_environment({**BASE, name: value})
+
+    def test_a_step_that_rounds_to_no_microsecond_is_refused_and_one_microsecond_is_kept(self) -> None:
+        for text in ("1e-7", "4e-7", "5e-7", "0.0000004"):
+            with self.subTest(text=text), self.assertRaisesRegex(StreamSettingsError, "STREAM_CUTOFF_STEP_SECONDS") as caught:
+                from_environment({**BASE, "STREAM_CUTOFF_STEP_SECONDS": text})
+            self.assertNotIn(text, str(caught.exception))
+        self.assertEqual(1, from_environment({**BASE, "STREAM_CUTOFF_STEP_SECONDS": "1e-6"}).cutoff_step_us)
+        self.assertEqual(0, from_environment({**BASE, "STREAM_LATE_LIMIT_SECONDS": "1e-7"}).late_limit_us)
+
+    def test_the_offsets_per_trigger_are_a_whole_number_from_one_and_a_fraction_is_never_cut(self) -> None:
+        for text in ("0", "0.5", "0.9999999", "1.5", "2.5", "49999.5", "1e-300", "1e30", "-1", "x"):
+            with self.subTest(text=text), self.assertRaisesRegex(StreamSettingsError, "STREAM_MAX_OFFSETS_PER_TRIGGER") as caught:
+                from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text})
+            self.assertNotIn(text, str(caught.exception))
+        for text, wanted in (("1", 1), ("7", 7), ("2.0", 2), ("50000", 50_000)):
+            with self.subTest(text=text):
+                self.assertEqual(wanted, from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text}).max_offsets_per_trigger)
+        self.assertEqual(50_000, from_environment(BASE).max_offsets_per_trigger)
+
+    def test_an_offset_count_that_a_float_would_round_to_a_whole_number_is_refused_and_one_that_is_exact_is_kept(self) -> None:
+        for text in (
+            "1.0000000000000001",
+            "1.00000000000000000001",
+            "0.99999999999999999",
+            "2.0000000000000001",
+            "49999.99999999999999",
+            "2147483647.0000000001",
+            "2147483647.5",
+            "2147483648",
+            "nan",
+            "NaN",
+            "sNaN",
+            "inf",
+            "-inf",
+            "Infinity",
+            "1e999999999999999999999",
+            "\u0661\u0662",
+            "1e_9",
+            "1e3",
+            "1E+3",
+            "1_000",
+            " 5",
+            "5 ",
+            "5\n",
+            "+5",
+            "5.",
+            ".5",
+            "1e0",
+        ):
+            with self.subTest(value=text), self.assertRaisesRegex(StreamSettingsError, "STREAM_MAX_OFFSETS_PER_TRIGGER") as caught:
+                from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text})
+            self.assertNotIn(text, str(caught.exception))
+        for text, expected in (("1.0000000000", 1), ("5", 5), ("5.0", 5), ("00050000", 50_000), ("2147483647.0", 2_147_483_647), ("5.00", 5)):
+            with self.subTest(value=text):
+                self.assertEqual(expected, from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text}).max_offsets_per_trigger)
 
     def test_the_test_input_counts_sink_commits_from_one(self) -> None:
         self.assertEqual(1, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "1"}).test_exit_after_sink)

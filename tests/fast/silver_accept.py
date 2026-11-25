@@ -68,6 +68,7 @@ AS_WRITE, AS_KEEP = "write", "keep"
 NO_FILE = "no result file"
 NO_CATALOG = "the catalog was not read"
 OTHER_BRANCH = "the branch is not the requested one"
+OTHER_MODE = "the mode is not the requested one"
 NOT_CLOSED = "the schema is not the job's closed schema"
 OFF_CATALOG = "a hash or a snapshot differs from the catalog"
 NOT_A_WRITE = "the result is not a write"
@@ -75,7 +76,7 @@ NOT_A_KEEP = "the result is not a call that wrote nothing"
 NOT_PASSED = "a pass flag of the result is not true"
 WRONG_EXIT = "the exit code is not the expected one"
 NOT_EMPTY = "the result folder held something"
-REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP, NOT_PASSED)
+REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, OTHER_MODE, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP, NOT_PASSED)
 REFUSAL_NOT_CLOSED = "the refusal document is not the closed refusal schema"
 REFUSAL_OTHER_CODES = "the refusal codes are not the wanted ones"
 REFUSAL_REASONS = (WRONG_EXIT, NO_FILE, REFUSAL_NOT_CLOSED, REFUSAL_OTHER_CODES)
@@ -180,6 +181,11 @@ def sealed(result: Any, job: str) -> bool:
     )
 
 
+def every_flag_true(document: Mapping[str, Any]) -> bool:
+    """Whether every pass flag of a sealed result is the Boolean true."""
+    return all(value is True for value in document["passed"].values())
+
+
 def refusal_rejection(document: Any, job: str, mode: str, wanted: Sequence[str]) -> str | None:
     """The fixed phrase of the rule that a refusal document fails, or ``None`` when it passes as a refusal (``accept_refusal``). A phrase is one of
     ``REFUSAL_REASONS``: it holds no code or other value of the document."""
@@ -235,7 +241,9 @@ def catalog_matches(result: Any, catalog: Catalog) -> bool:
 def rejection(document: Any, job: str, catalog: Catalog | None, outcome: str) -> str | None:
     """The fixed phrase of the first rule that the document fails as the ``outcome`` (``AS_WRITE`` or ``AS_KEEP``) of ``job``, or ``None`` when it passes. The
     rules run in this order: a file that is there, a catalog that was read, the requested branch, the closed schema, the hashes and snapshot IDs of the catalog
-    and then the outcome. A phrase is one of ``REASONS``: it names the rule and holds no value of the file."""
+    and then the outcome. A call that wrote nothing (a verify, or a build that keeps the tables) also needs every pass flag true: a job that exits 0 with a
+    false flag is not a pass, so the merge after a verify never takes an unverified table. A phrase is one of ``REASONS``: it names the rule and holds no value
+    of the file."""
     if not isinstance(document, Mapping):
         return NO_FILE
     if catalog is None:
@@ -248,7 +256,9 @@ def rejection(document: Any, job: str, catalog: Catalog | None, outcome: str) ->
         return OFF_CATALOG
     if outcome == AS_WRITE:
         return None if named(document["write_hash"]) and document["write_hash"] == document["branch_hash"] != document["checked_hash"] else NOT_A_WRITE
-    return None if document["write_hash"] is None and document["branch_hash"] == document["checked_hash"] else NOT_A_KEEP
+    if not (document["write_hash"] is None and document["branch_hash"] == document["checked_hash"]):
+        return NOT_A_KEEP
+    return None if every_flag_true(document) else NOT_PASSED
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,16 +303,18 @@ def accept_keep(code: int, document: Any, job: str, catalog: Catalog | None) -> 
 
 
 def setup_rejection(document: Any, job: str) -> str | None:
-    """The fixed phrase of the first rule that a document fails as the result of a setup build of ``job``, or ``None``: the closed schema of the job, a write
-    (a write hash that is the branch hash and not the checked hash) and a Boolean true for every pass flag. No catalog is compared: a setup step is
-    judged by the runner's own later reads of the tables that it made."""
+    """The fixed phrase of the first rule that a document fails as the result of a setup build of ``job``, or ``None``: the closed schema of the job, the mode
+    ``build`` (a setup step asks for nothing else), a write (a write hash that is the branch hash and not the checked hash) and a Boolean true for every pass
+    flag. No catalog is compared: a setup step is judged by the runner's own later reads of the tables that it made."""
     if not isinstance(document, Mapping):
         return NO_FILE
     if not sealed(document, job):
         return NOT_CLOSED
+    if document["mode"] != "build":
+        return OTHER_MODE
     if not (named(document["write_hash"]) and document["write_hash"] == document["branch_hash"] != document["checked_hash"]):
         return NOT_A_WRITE
-    return None if all(value is True for value in document["passed"].values()) else NOT_PASSED
+    return None if every_flag_true(document) else NOT_PASSED
 
 
 def accept_setup(code: int, document: Any, job: str) -> Accepted:

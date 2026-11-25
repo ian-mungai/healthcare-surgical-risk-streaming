@@ -17,6 +17,8 @@ from dagster import (
     sensor,
 )
 
+from scripts.ingestion.folder import list_files
+
 from . import housekeeping, lineage_sample, record_load, table_checks
 from .concurrency import HEAVY_TAG_KEY, HEAVY_TAG_VALUE, heavy_memory_mib
 from .groups import GroupResource
@@ -68,7 +70,7 @@ def group_probe_job() -> None:
 
 @sensor(job=ping_job, minimum_interval_seconds=5, default_status=DefaultSensorStatus.RUNNING)
 def marker_file_sensor(context: SensorEvaluationContext) -> RunRequest | SkipReason:
-    markers = sorted(INBOX.glob(f"*{MARKER_SUFFIX}")) if INBOX.is_dir() else []
+    markers = list_files(INBOX, f"*{MARKER_SUFFIX}")
     if not markers:
         return SkipReason(f"no {MARKER_SUFFIX} file in {INBOX}")
     marker = markers[0]

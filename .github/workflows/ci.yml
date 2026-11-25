@@ -47,11 +47,20 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            .venv/bin/python -m scripts.quality.repo_checks commit-range "${BASE}..${HEAD}"
-          else
-            .venv/bin/python -m scripts.quality.repo_checks commit-range "${HEAD}"
-          fi
+          status=0
+          git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null || status=$?
+          case "${status}" in
+            0) range="${BASE}..${HEAD}" ;;
+            1)
+              echo "The base commit '${BASE}' is not in this checkout, so every commit reachable from the head commit is checked."
+              range="${HEAD}"
+              ;;
+            *)
+              echo "git failed with status ${status} while it looked for the base commit '${BASE}'" >&2
+              exit "${status}"
+              ;;
+          esac
+          .venv/bin/python -m scripts.quality.repo_checks commit-range "${range}"
 
   infrastructure:
     name: Static checks of the Terraform and Ansible code

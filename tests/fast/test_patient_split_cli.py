@@ -23,11 +23,12 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from scripts.ingestion.notice import Code, Notice, render
 from scripts.stack.nessie import NessieConflict, NessieError
 from spark.jobs.patient_split import result_document
 from spark.result_file import release_reserved, reserve
-from spark.settings import SettingsError
-from spark.split_cli import number_setting, open_client, run, start_deadline
+from spark.settings import SettingsError, number_setting
+from spark.split_cli import open_client, run, start_deadline
 from spark.split_table import PatientSplitError
 
 MARKER = "MARKER_8731"
@@ -51,6 +52,15 @@ def raising(error: Exception) -> Any:
         raise error
 
     return execute
+
+
+USAGE_TEXT = render(Notice(Code.USAGE))
+PROGRAM = "python -m spark.jobs.patient_split"
+
+
+def is_usage_line(err: str) -> bool:
+    """The one fixed line: the program, at most one of its own subcommand names, then the usage text and nothing of the command line."""
+    return err in {f"{PROGRAM}{mode}: {USAGE_TEXT}\n" for mode in ("", " build", " verify")}
 
 
 class CommandLineTest(unittest.TestCase):
@@ -98,7 +108,8 @@ class CommandLineTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 code, out, err = invoke(argv)
                 self.assertEqual(2, code)
-                self.assertEqual(("", "patient_split: usage\n"), (out, err))
+                self.assertEqual("", out)
+                self.assertTrue(is_usage_line(err))
 
     def test_a_missing_branch_is_a_code_and_not_the_error_from_nessie(self) -> None:
         error = NessieError(f"GET /trees/{MARKER} was refused: {MARKER}", status=404, error_code="REFERENCE_NOT_FOUND")
@@ -153,7 +164,9 @@ class ResultFileTest(unittest.TestCase):
         )
 
     def test_the_result_option_is_required_and_a_file_that_is_there_is_never_replaced(self) -> None:
-        self.assertEqual((2, "", "patient_split: usage\n"), invoke(["build", "--branch", "b", "--result"]))
+        code, out, err = invoke(["build", "--branch", "b", "--result"])
+        self.assertEqual((2, ""), (code, out))
+        self.assertTrue(is_usage_line(err))
         Path(self.path).write_text("old")
         seen: list[str] = []
 
@@ -228,7 +241,8 @@ class ReferenceNameTest(unittest.TestCase):
         ):
             with self.subTest(argv=argv):
                 code, out, err = invoke(argv)
-                self.assertEqual((2, "", "patient_split: usage\n"), (code, out, err))
+                self.assertEqual((2, ""), (code, out))
+                self.assertTrue(is_usage_line(err))
         for name in ("main", "split_52c8bf", "p6_trunk_ab12.x-y", "a" * 128):
             with self.subTest(name=name):
                 self.assertEqual(0, invoke(["build", "--branch", name, "--base", name])[0])

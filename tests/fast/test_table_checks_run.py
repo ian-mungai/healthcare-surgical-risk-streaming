@@ -26,6 +26,7 @@ from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.ingestion import table_checks as run
+from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.process import CompletedProcess, TimeoutExpired
@@ -109,6 +110,9 @@ def legacy_changes() -> dict[str, Callable[[dict[str, Any]], None]]:
     }
 
 
+BASE = fake_hash("main", "0")
+
+
 class FakeNessie(NessieClient):
     """References and the tables of each commit, answering the calls of the checks in the forms of Nessie's API version 2."""
 
@@ -136,6 +140,23 @@ class FakeNessie(NessieClient):
         self.history_reads: list[str] = []
         self.on_history_read: Callable[[], None] | None = None
         self.main_reads = 0
+        self.other: dict[tuple[str, str], dict[tuple[str, ...], dict[str, Any]]] = {}
+        self.hide_content = False
+
+    def entry_list(self, name: str, hash_value: str) -> list[dict[str, Any]]:
+        """The contents of a commit: the namespace of the tables when it holds any, each table, and every other content that a test put on it."""
+        held = self.tables.get((name, hash_value), {})
+        found: list[dict[str, Any]] = []
+        if held:
+            found.append({"name": {"elements": [rules.NAMESPACE]}, "type": "NAMESPACE", "content": {"type": "NAMESPACE", "elements": [rules.NAMESPACE]}})
+        for table, snapshot in sorted(held.items()):
+            content = {"type": "ICEBERG_TABLE", "snapshotId": snapshot, "metadataLocation": f"s3://warehouse/{table}/{snapshot}.json"}
+            found.append({"name": {"elements": [rules.NAMESPACE, table]}, "type": "ICEBERG_TABLE", "content": content})
+        for key, content in sorted(self.other.get((name, hash_value), {}).items()):
+            found.append({"name": {"elements": list(key)}, "type": content["type"], "content": content})
+        if self.hide_content:
+            found = [{key: value for key, value in entry.items() if key != "content"} for entry in found]
+        return found
 
     def load_branch(self, name: str, snapshots: dict[str, int]) -> str:
         self.heads[name] = fake_hash(name, "load")
@@ -204,6 +225,8 @@ class FakeNessie(NessieClient):
                 "token": str(start + len(entries)),
             }
             return 200, json.dumps(document).encode()
+        if method == "GET" and parts[1] == "entries":
+            return 200, json.dumps({"entries": self.entry_list(name, pinned or self.heads[name]), "hasMore": False}).encode()
         if method == "GET" and parts[1] == "contents":
             table = parts[2].removeprefix(f"{rules.NAMESPACE}.")
             held = self.tables.get((name, pinned or self.heads[name]), {})
@@ -279,9 +302,12 @@ class Runner:
         self.calls = 0
         self.seen_files: dict[str, str] = {}
         self.plan: dict[str, Any] = {}
+        self.during: Callable[[], None] | None = None
 
     def __call__(self, staging: Path) -> run.RunnerReply:
         self.calls += 1
+        if self.during is not None:
+            self.during()
         plan_text = (staging / "plan.json").read_text()
         self.plan = json.loads(plan_text)
         self.seen_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in staging.iterdir() if path.name != "plan.json"}
@@ -313,7 +339,11 @@ class Case:
         self.reference: ManifestRef = publish_manifest(self.landed.store, self.landed.selection, self.landed.check())
         self.nessie = FakeNessie()
         self.branch_hash = self.nessie.load_branch(BRANCH, SNAPSHOTS)
-        self.record = run.LoadRecord(BRANCH, self.branch_hash, self.reference, dict(SNAPSHOTS))
+        self.record = run.LoadRecord(BRANCH, self.branch_hash, self.reference, dict(SNAPSHOTS), self.nessie.heads["main"])
+
+    def rebase(self) -> None:
+        """The load branch is taken to have been made from the head that the default branch has now."""
+        self.record = dataclasses.replace(self.record, base_hash=self.nessie.heads["main"])
 
     def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
@@ -401,6 +431,270 @@ class PassingRunTest(unittest.TestCase):
         self.assertEqual({"iter_version"}, {read.method for read in reads})
         self.assertEqual({case.landed.keys["clinical_data.csv"], case.landed.keys["lab_data.csv"]}, {read.key for read in reads})
         self.assertLessEqual(case.landed.store.largest_block, 8)
+
+
+NAMESPACE_CONTENT = {"type": "NAMESPACE", "elements": ["other_space"]}
+OTHER_TABLE = {"type": "ICEBERG_TABLE", "snapshotId": 9, "metadataLocation": "s3://warehouse/other/9.json"}
+
+
+class OutputBindingTest(unittest.TestCase):
+    """The branch is merged only when everything that it changes against the default branch is the output of this load."""
+
+    def refused(self, case: Case, text: str) -> None:
+        with self.assertRaisesRegex(run.TableChecksError, text):
+            case.go(Runner())
+        self.assertEqual([], case.nessie.merges)
+
+    def test_another_table_on_the_branch_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[(BRANCH, case.branch_hash)] = {("other_space", "stray"): OTHER_TABLE}
+        self.refused(case, "other_space.stray")
+
+    def test_a_content_that_the_default_branch_holds_and_the_branch_lacks_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {("other_space", "kept"): OTHER_TABLE}
+        self.refused(case, "other_space.kept")
+
+    def test_an_edit_of_an_existing_namespace_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {("other_space",): NAMESPACE_CONTENT}
+        case.nessie.other[(BRANCH, case.branch_hash)] = {("other_space",): {**NAMESPACE_CONTENT, "properties": {"owner": "x"}}}
+        self.refused(case, "other_space")
+
+    def test_an_edit_of_the_namespace_that_holds_the_tables_of_the_load_is_not_merged(self) -> None:
+        case = Case(self)
+        held = {"type": "NAMESPACE", "elements": [rules.NAMESPACE], "properties": {"owner": "x"}}
+        case.nessie.other[("main", case.nessie.heads["main"])] = {(rules.NAMESPACE,): held}
+        self.refused(case, rules.NAMESPACE)
+
+    def test_a_removal_of_an_existing_namespace_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {("other_space",): NAMESPACE_CONTENT}
+        self.refused(case, "other_space")
+
+    def test_a_table_of_the_load_that_the_default_branch_already_holds_as_it_is_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.tables[("main", case.nessie.heads["main"])] = {"clinical_data": SNAPSHOTS["clinical_data"]}
+        self.refused(case, "clinical_data")
+
+    def test_a_default_branch_that_moved_with_another_change_since_the_branch_was_made_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("another tool", {"other_table": 5})
+        self.refused(case, "recorded base")
+
+    def test_a_default_branch_that_changed_and_came_back_is_refused_because_its_head_is_not_the_recorded_base(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("another tool", {})
+        self.assertNotEqual(case.record.base_hash, case.nessie.heads["main"])
+        self.refused(case, "recorded base")
+
+    def test_a_default_branch_at_another_head_with_the_same_contents_is_refused(self) -> None:
+        case = Case(self)
+        record = run.LoadRecord(BRANCH, case.branch_hash, case.reference, dict(SNAPSHOTS), fake_hash("main", "older"))
+        with self.assertRaisesRegex(run.TableChecksError, "recorded base"):
+            case.go(Runner(), record=record)
+        self.assertEqual([], case.nessie.merges)
+
+    def test_a_listing_that_leaves_out_the_content_of_its_entries_is_refused(self) -> None:
+        case = Case(self)
+        case.nessie.hide_content = True
+        case.nessie.other[("main", case.nessie.heads["main"])] = {("other_space",): NAMESPACE_CONTENT}
+        case.nessie.other[(BRANCH, case.branch_hash)] = {("other_space",): {**NAMESPACE_CONTENT, "properties": {"owner": "x"}}}
+        self.refused(case, "expected form")
+
+    def test_two_keys_that_differ_in_their_name_parts_are_two_keys(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {("other_space.stray",): OTHER_TABLE}
+        case.nessie.other[(BRANCH, case.branch_hash)] = {("other_space", "stray"): OTHER_TABLE}
+        self.refused(case, "other_space")
+
+    def test_a_base_hash_that_is_not_a_hash_is_refused(self) -> None:
+        document = json.loads(Case(self).reference.to_json())
+        record = {"format": run.LOAD_RECORD_FORMAT, "branch": BRANCH, "branch_hash": "a" * 64, "base_hash": "main", "manifest": document, "tables": SNAPSHOTS}
+        with self.assertRaises(run.TableChecksError):
+            run.parse_load_record(json.dumps(record))
+
+    def test_the_load_record_names_the_base_hash_and_refuses_a_record_without_it(self) -> None:
+        document = json.loads(Case(self).reference.to_json())
+        record = {"format": run.LOAD_RECORD_FORMAT, "branch": BRANCH, "branch_hash": "a" * 64, "base_hash": "b" * 64, "manifest": document, "tables": SNAPSHOTS}
+        self.assertEqual("b" * 64, run.parse_load_record(json.dumps(record)).base_hash)
+        del record["base_hash"]
+        with self.assertRaises(run.TableChecksError):
+            run.parse_load_record(json.dumps(record))
+
+    def fresh_load(self, case: Case) -> run.Outcome:
+        """The advised retry: a new load branch, made from the default branch as it is now, checked and merged in the same results folder."""
+        branch_hash = case.nessie.load_branch("load_run_two", SNAPSHOTS)
+        record = run.LoadRecord("load_run_two", branch_hash, case.reference, dict(SNAPSHOTS), case.nessie.heads["main"])
+        return case.go(Runner(), record=record)
+
+    def test_a_stale_base_is_refused_before_the_checks_run_and_before_any_result_is_saved(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.add_main_commit("another tool", {})
+        with self.assertRaisesRegex(run.TableChecksError, "recorded base"):
+            case.go(runner)
+        self.assertEqual(0, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(self.fresh_load(case).merged)
+
+    def test_a_default_branch_that_moves_while_the_checks_run_saves_no_result_and_the_fresh_load_goes_through(self) -> None:
+        case, runner = Case(self), Runner()
+
+        def move() -> None:
+            case.nessie.add_main_commit("another tool", {})
+
+        runner.during = move
+        with self.assertRaisesRegex(run.TableChecksError, "recorded base"):
+            case.go(runner)
+        self.assertEqual(1, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(self.fresh_load(case).merged)
+
+    def test_a_default_branch_that_moves_after_the_last_check_leaves_no_receipt_and_the_fresh_load_goes_through(self) -> None:
+        case = Case(self)
+        reads: list[int] = []
+
+        def move_at_the_merge() -> None:
+            reads.append(1)
+            if len(reads) == 2:
+                case.nessie.add_main_commit("another tool", {})
+
+        case.nessie.on_branch_read = move_at_the_merge
+        with self.assertRaisesRegex(run.StaleBaseError, "recorded base"):
+            case.go(Runner())
+        case.nessie.on_branch_read = None
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(self.fresh_load(case).merged)
+
+    def test_the_namespace_that_the_default_branch_lacks_is_merged_with_the_tables(self) -> None:
+        case = Case(self)
+        self.assertTrue(case.go(Runner()).merged)
+        self.assertEqual([(BRANCH, case.branch_hash, "main")], case.nessie.merges)
+
+
+class BaseCheckBeforeSavingTest(unittest.TestCase):
+    """The base of the load is checked right before any result is saved, a failed one too, and the merge names the checked base as the target's hash."""
+
+    def test_a_failed_check_saves_nothing_when_the_default_branch_moved_while_the_job_ran(self) -> None:
+        case, runner = Case(self), Runner(lambda plan: result_line(plan, passed=False))
+
+        def move() -> None:
+            case.nessie.add_main_commit("another tool", {})
+
+        runner.during = move
+        with self.assertRaisesRegex(run.StaleBaseError, "recorded base"):
+            case.go(runner)
+        self.assertEqual(1, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+
+    def test_a_failed_check_is_saved_when_the_base_is_unchanged(self) -> None:
+        case = Case(self)
+        outcome = case.go(Runner(lambda plan: result_line(plan, passed=False)))
+        self.assertFalse(outcome.passed)
+        self.assertEqual((False, False), (case.saved()["passed"], case.saved()["merged"]))
+
+    def test_a_job_output_that_cannot_be_read_as_a_result_keeps_its_file_and_saves_no_result(self) -> None:
+        case = Case(self)
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner(lambda plan: "nothing useful\n", exit_code=1))
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+
+    def test_the_merge_request_names_the_checked_base_hash_as_the_expected_hash_of_the_target(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("another tool", {})
+        moved = case.nessie.heads["main"]
+        with mock.patch.object(run, "require_base"), self.assertRaises(run.MergeOutcomeOpen):
+            case.go(Runner())
+        self.assertEqual([case.record.base_hash], [request["expected"] for request in case.nessie.merge_requests])
+        self.assertNotEqual(moved, case.record.base_hash)
+        self.assertEqual([], case.nessie.merges)
+        self.assertEqual(moved, case.nessie.heads["main"], "the server refused the merge, so main is as the other tool left it")
+
+    def test_a_target_that_moved_after_the_check_is_refused_by_the_server_and_nothing_is_merged(self) -> None:
+        case = Case(self)
+        seen: list[int] = []
+
+        def move_after_the_search() -> None:
+            seen.append(1)
+            if len(seen) == 2:
+                case.nessie.defer_main_commit = "another tool writes to main"
+
+        case.nessie.on_history_read = move_after_the_search
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(Runner())
+        self.assertEqual([case.record.base_hash], [request["expected"] for request in case.nessie.merge_requests])
+        self.assertEqual([], case.nessie.merges)
+
+
+class OwnedWriteTest(unittest.TestCase):
+    """The result, the pending record, the job output, the staged files and the plan are replaced through ``replace_owned_file``: a link or a folder in their
+    place is refused and never followed."""
+
+    def planted(self, path: Path, kind: str, elsewhere: Path) -> None:
+        if kind == "link":
+            elsewhere.write_text("kept\n")
+            path.symlink_to(elsewhere)
+        elif kind == "dangling link":
+            path.symlink_to(elsewhere)
+        else:
+            path.mkdir()
+
+    def test_a_link_or_a_folder_in_place_of_the_result_is_refused_and_not_followed(self) -> None:
+        for kind in ("link", "dangling link", "folder"):
+            with self.subTest(kind=kind):
+                case = Case(self)
+                elsewhere = case.root / "elsewhere"
+                self.planted(case.run_folder / run.RESULT_FILE, kind, elsewhere)
+                with self.assertRaises((ClosedInputError, run.TableChecksError)):
+                    run.write_result(case.run_folder, {"passed": True, "merged": False})
+                self.assertEqual("kept\n" if kind == "link" else None, elsewhere.read_text() if elsewhere.exists() else None)
+
+    def test_a_link_or_a_folder_in_place_of_the_pending_record_is_refused_and_not_followed(self) -> None:
+        for kind in ("link", "dangling link", "folder"):
+            with self.subTest(kind=kind):
+                case = Case(self)
+                case.state.mkdir()
+                elsewhere = case.root / "elsewhere"
+                self.planted(case.pending_path, kind, elsewhere)
+                with self.assertRaises((ClosedInputError, run.TableChecksError)):
+                    run.write_pending(case.state, case.record, 1.0, "a" * 32)
+                self.assertEqual("kept\n" if kind == "link" else None, elsewhere.read_text() if elsewhere.exists() else None)
+
+    def test_a_link_in_place_of_the_job_output_file_is_refused_and_not_followed(self) -> None:
+        case = Case(self)
+        elsewhere = case.root / "elsewhere"
+        elsewhere.write_text("kept\n")
+        (case.run_folder / run.JOB_OUTPUT_FILE).symlink_to(elsewhere)
+        with self.assertRaises(ClosedInputError):
+            run.keep_output(case.run_folder, sorted(run.REFUSAL_CODES)[0], 1, 0)
+        self.assertEqual("kept\n", elsewhere.read_text())
+
+    def test_a_link_in_place_of_a_staged_file_or_the_plan_is_refused_and_not_followed(self) -> None:
+        case = Case(self)
+        case.staging.mkdir()
+        elsewhere = case.root / "elsewhere"
+        elsewhere.write_text("kept\n")
+        (case.staging / "clinical_data.csv").symlink_to(elsewhere)
+        (case.staging / run.PLAN_FILE).symlink_to(elsewhere)
+        with self.assertRaises((ClosedInputError, run.TableChecksError)):
+            run.stage_verified_files(case.landed.store, case.reference, case.staging, os.getgid())
+        with self.assertRaises(ClosedInputError):
+            run.write_plan(case.staging, {"format": "x"}, os.getgid())
+        self.assertEqual("kept\n", elsewhere.read_text())
+
+    def test_the_result_is_replaced_whole_in_the_run_folder_and_a_merged_receipt_is_not_replaced_by_an_unmerged_one(self) -> None:
+        case = Case(self)
+        run.write_result(case.run_folder, {"passed": True, "merged": False})
+        run.write_result(case.run_folder, {"passed": True, "merged": True})
+        with self.assertRaises(run.TableChecksError):
+            run.write_result(case.run_folder, {"passed": True, "merged": False})
+        self.assertEqual(True, case.saved()["merged"])
+        self.assertEqual([run.RESULT_FILE], [path.name for path in case.run_folder.iterdir()])
+        self.assertEqual(0o644, stat.S_IMODE((case.run_folder / run.RESULT_FILE).stat().st_mode))
 
 
 class MergeRecordTest(unittest.TestCase):
@@ -586,12 +880,15 @@ class OneTargetHashTest(unittest.TestCase):
     def test_the_log_is_searched_from_the_hash_of_main_that_the_merge_names_as_its_expected_hash(self) -> None:
         case = Case(self)
         case.nessie.add_main_commit("an unrelated commit")
+        case.rebase()
         head = case.nessie.heads["main"]
         case.go(Runner())
         merged = case.nessie.heads["main"]
         self.assertEqual([head, head, merged], case.nessie.history_reads)
         self.assertEqual([head], [request["expected"] for request in case.nessie.merge_requests])
-        self.assertEqual(3, case.nessie.main_reads)
+        self.assertEqual(
+            5, case.nessie.main_reads, "the base is read before the checks, before the result is saved and at the merge, besides the two reads of the history"
+        )
 
     def test_a_merge_refused_because_main_moved_is_an_open_outcome_that_is_not_sent_again(self) -> None:
         case = Case(self)
@@ -662,6 +959,7 @@ class MergeOutcomeTest(unittest.TestCase):
     def test_the_receipt_is_built_from_the_commit_in_the_history_and_its_parent_and_not_from_what_was_sent_or_answered(self) -> None:
         case = Case(self)
         case.nessie.add_main_commit("an unrelated commit")
+        case.rebase()
         case.nessie.reply_hash = "f" * 64
         case.go(Runner())
         commit, _, parent = case.nessie.commits[-1]
@@ -764,6 +1062,7 @@ class MergeOutcomeTest(unittest.TestCase):
         case, runner = Case(self), Runner()
         for number in range(30):
             case.nessie.add_main_commit(f"unrelated commit {number}")
+        case.rebase()
         case.nessie.history_page_size = 1
         case.nessie.on_history_read = lambda: setattr(case, "now", case.now + 4.0)
         with self.assertRaisesRegex(run.TableChecksError, "deadline"):
@@ -837,7 +1136,7 @@ class MergeOutcomeTest(unittest.TestCase):
         case, runner = Case(self), Runner()
         self.open_outcome(case, runner)
         before = case.pending_path.read_text()
-        other = run.LoadRecord("load_run_two", case.nessie.load_branch("load_run_two", SNAPSHOTS), case.reference, dict(SNAPSHOTS))
+        other = run.LoadRecord("load_run_two", case.nessie.load_branch("load_run_two", SNAPSHOTS), case.reference, dict(SNAPSHOTS), BASE)
         cached = run.receipt(other, "empty", None, passed=True)
         cached.update(merged=True, merged_into="main", main_hash_before="1" * 64, merged_hash="2" * 64)
         run.write_result(case.root / "other_results", cached)
@@ -870,7 +1169,7 @@ class MergeOutcomeTest(unittest.TestCase):
         other_hash = case.nessie.load_branch("load_run_two", SNAPSHOTS)
         case.run_folder = case.root / "other_results"
         with self.assertRaisesRegex(run.TableChecksError, "pending merge record of another load"):
-            case.go(runner, record=run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS)))
+            case.go(runner, record=run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS), BASE))
 
     def test_a_pending_record_that_is_not_in_its_form_is_refused(self) -> None:
         for label in (
@@ -1048,7 +1347,7 @@ class OtherLoadTest(unittest.TestCase):
         case = Case(self)
         self.lost_receipt(case)
         other_hash = case.nessie.load_branch("load_run_two", SNAPSHOTS)
-        retry = run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS))
+        retry = run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS), BASE)
         runner = Runner()
         with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
             case.go(runner, record=retry)
@@ -1062,7 +1361,7 @@ class OtherLoadTest(unittest.TestCase):
         case.nessie.heads[BRANCH] = moved
         case.nessie.tables[(BRANCH, moved)] = dict(SNAPSHOTS)
         with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
-            case.go(Runner(), record=run.LoadRecord(BRANCH, moved, case.reference, dict(SNAPSHOTS)))
+            case.go(Runner(), record=run.LoadRecord(BRANCH, moved, case.reference, dict(SNAPSHOTS), BASE))
 
     def test_a_matching_recovery_rebuilds_the_receipt_and_runs_and_sends_nothing(self) -> None:
         case, runner = Case(self), Runner()
@@ -1369,7 +1668,7 @@ class RefusalTest(unittest.TestCase):
         case, runner = Case(self), Runner()
         other = ManifestRef(case.reference.bucket, case.reference.key, case.reference.version_id, "b" * 64)
         with self.assertRaises(Exception):  # noqa: B017
-            case.go(runner, record=run.LoadRecord(BRANCH, case.branch_hash, other, dict(SNAPSHOTS)))
+            case.go(runner, record=run.LoadRecord(BRANCH, case.branch_hash, other, dict(SNAPSHOTS), BASE))
         self.assert_nothing_ran(case, runner)
 
     def test_a_branch_that_moved_since_the_load_is_refused_before_the_job_runs(self) -> None:
@@ -1382,13 +1681,13 @@ class RefusalTest(unittest.TestCase):
     def test_a_branch_that_does_not_exist_is_refused(self) -> None:
         case, runner = Case(self), Runner()
         with self.assertRaises(NessieError):
-            case.go(runner, record=run.LoadRecord("load_other", case.branch_hash, case.reference, dict(SNAPSHOTS)))
+            case.go(runner, record=run.LoadRecord("load_other", case.branch_hash, case.reference, dict(SNAPSHOTS), BASE))
         self.assert_nothing_ran(case, runner)
 
     def test_a_snapshot_that_differs_from_the_load_record_is_refused(self) -> None:
         case, runner = Case(self), Runner()
         with self.assertRaisesRegex(run.TableChecksError, "snapshot"):
-            case.go(runner, record=run.LoadRecord(BRANCH, case.branch_hash, case.reference, {**SNAPSHOTS, "lab_data": 999}))
+            case.go(runner, record=run.LoadRecord(BRANCH, case.branch_hash, case.reference, {**SNAPSHOTS, "lab_data": 999}, BASE))
         self.assert_nothing_ran(case, runner)
 
     def test_a_table_the_branch_does_not_hold_at_the_hash_is_refused(self) -> None:
@@ -1750,7 +2049,7 @@ class RerunTest(unittest.TestCase):
         other.run_folder = case.run_folder
         other.nessie.load_branch("load_run_two", SNAPSHOTS)
         with self.assertRaisesRegex(run.TableChecksError, "another load"):
-            other.go(Runner(), record=run.LoadRecord("load_run_two", other.nessie.heads["load_run_two"], other.reference, dict(SNAPSHOTS)))
+            other.go(Runner(), record=run.LoadRecord("load_run_two", other.nessie.heads["load_run_two"], other.reference, dict(SNAPSHOTS), BASE))
 
 
 class ComposeRunnerTest(unittest.TestCase):
@@ -1819,9 +2118,17 @@ class LoadRecordTest(unittest.TestCase):
             "format": run.LOAD_RECORD_FORMAT,
             "branch": BRANCH,
             "branch_hash": "a" * 64,
+            "base_hash": "c" * 64,
             "manifest": {"bucket": "example-bucket", "key": "manifests/probe_set/" + "b" * 64 + ".json", "version_id": "v1", "sha256": "b" * 64},
             "tables": dict(SNAPSHOTS),
         }
+
+    def test_a_load_record_of_version_1_is_refused_by_name_and_not_as_an_unknown_field(self) -> None:
+        document = self.document()
+        del document["base_hash"]
+        document["format"] = "load_record_1"
+        with self.assertRaisesRegex(run.TableChecksError, "version 1"):
+            run.parse_load_record(json.dumps(document))
 
     def test_control_a_record_with_a_branch_a_hash_a_manifest_and_a_snapshot_for_each_table_is_read(self) -> None:
         record = run.parse_load_record(json.dumps(self.document()))

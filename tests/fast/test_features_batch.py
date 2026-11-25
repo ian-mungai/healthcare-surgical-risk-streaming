@@ -22,7 +22,7 @@ from unittest import mock
 
 from features import batch
 from features.leakage import LeakageError
-from features.model import ClinicalValue, FeatureRow, Reading, WindowInput
+from features.model import ClinicalValue, FeatureInputError, FeatureRow, Reading, WindowInput
 from features.row import build_row
 from tests.fast.features_support import (
     ARTERIAL_MEAN,
@@ -167,7 +167,10 @@ class Entry(unittest.TestCase):
                 with contextlib.redirect_stderr(stderr):
                     code, target = self.run_batch([document])
                 self.assertEqual(2, code)
-                self.assertIn(pattern.strip(), stderr.getvalue())
+                self.assertNotIn(pattern.strip(), stderr.getvalue())
+                with self.assertRaises((FeatureInputError, LeakageError, KeyError, TypeError, ValueError)) as raised:
+                    batch.run(self.root / "windows.json", self.root / "reason_rows.json")
+                self.assertIn(pattern.strip(), str(raised.exception))
                 self.assertFalse(target.exists())
 
     def test_the_rows_keep_the_order_of_the_windows_and_data_after_the_cutoff_changes_nothing(self) -> None:
@@ -198,16 +201,23 @@ class Entry(unittest.TestCase):
             batch.compute_rows([WindowInput(CUTOFF_US, {}, {}, {})])
 
     def run_text(self, text: str) -> tuple[int, str, Path]:
-        """Run the batch entry point on the text of a windows file, with an earlier result already at the target."""
+        """Run the batch entry point on the text of a windows file, to a target that is free."""
         source, target = self.root / "windows.json", self.root / "rows.json"
         source.write_text(text)
-        target.write_text("OLD")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = batch.main([str(source), str(target)])
-        return code, stderr.getvalue(), target
+        return code, stderr.getvalue() + self.library_reason(source), target
 
-    def test_a_shape_that_is_not_the_documented_one_is_refused_by_name_and_leaves_the_earlier_result(self) -> None:
+    def library_reason(self, source: Path) -> str:
+        """The text of the error that the library raises for this file, which the entry point shows by its type only: the rule that names the fault."""
+        try:
+            batch.run(source, self.root / "reason_rows.json")
+        except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
+            return f" | {error}"
+        return ""
+
+    def test_a_shape_that_is_not_the_documented_one_is_refused_by_name_and_writes_no_result(self) -> None:
         def edited(change: Callable[[dict[str, Any]], None]) -> str:
             document = window_document("w")
             change(document)
@@ -243,13 +253,25 @@ class Entry(unittest.TestCase):
                 code, message, target = self.run_text(text)
                 self.assertEqual(2, code)
                 self.assertIn(pattern.strip(), message)
-                self.assertEqual("OLD", target.read_text())
+                self.assertFalse(target.exists())
 
-    def test_a_file_that_is_not_json_is_refused_and_leaves_the_earlier_result(self) -> None:
+    def test_the_entry_point_shows_the_type_of_the_error_and_no_word_of_its_text(self) -> None:
+        document = window_document("w")
+        document["numeric"][HEART_RATE] = [[CUTOFF_US, 10**400, True]]
+        source, target = self.root / "windows.json", self.root / "rows.json"
+        source.write_text(json.dumps({"windows": [document]}))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = batch.main([str(source), str(target)])
+        self.assertEqual(2, code)
+        self.assertRegex(stderr.getvalue(), r"^features\.batch: (ValueError|FeatureInputError)\n$")
+        self.assertNotIn(HEART_RATE, stderr.getvalue())
+
+    def test_a_file_that_is_not_json_is_refused_and_writes_no_result(self) -> None:
         code, message, target = self.run_text("not json")
         self.assertEqual(2, code)
         self.assertIn("features.batch", message)
-        self.assertEqual("OLD", target.read_text())
+        self.assertFalse(target.exists())
 
     def test_a_number_too_large_for_a_float_is_a_named_error_and_not_a_traceback(self) -> None:
         document = window_document("w")
@@ -257,7 +279,7 @@ class Entry(unittest.TestCase):
         code, message, target = self.run_text(json.dumps({"windows": [document]}))
         self.assertEqual(2, code)
         self.assertIn(HEART_RATE, message)
-        self.assertEqual("OLD", target.read_text())
+        self.assertFalse(target.exists())
 
     def test_a_row_that_breaks_the_leakage_check_never_reaches_the_file_through_the_entry_point(self) -> None:
         # A run that called build_row and wrote its rows without the check would write the file here, and this test would fail.
@@ -273,7 +295,7 @@ class Entry(unittest.TestCase):
                 code, message, target = self.run_text(document)
                 self.assertEqual(2, code)
                 self.assertIn(pattern, message)
-                self.assertEqual("OLD", target.read_text())
+                self.assertFalse(target.exists())
 
     def test_a_bad_window_stops_the_run_and_leaves_no_output(self) -> None:
         bad = window_document("bad")

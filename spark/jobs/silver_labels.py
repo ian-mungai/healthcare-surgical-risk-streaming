@@ -3,7 +3,7 @@
 ``python -m spark.jobs.silver_labels build --branch <name> --result <path> [--base <name>]``
 ``python -m spark.jobs.silver_labels verify --branch <name> --result <path>``
 
-The result is one JSON file at ``--result`` (an absolute path that does not exist; it is written whole and renamed, see ``spark/silver/cli.py``), also a
+The result is one JSON file at ``--result`` (an absolute path that does not exist; it is written whole and linked in, see ``spark/silver/cli.py``), also a
 refusal, whose file holds the refusal codes. Standard output stays empty and standard error is for an operator: a caller reads the exit code and the file.
 
 ``build`` creates the branch from ``main`` (or from ``--base``, which must hold ``silver.cases`` and ``silver.lab_results``), refuses a branch that exists and

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.images import pins
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ENV_FILE, ConfigurationError, load_configuration
 
@@ -46,7 +47,7 @@ STARTED_TEXT = "could not be started: it is not installed, not on the path or no
 NOT_PLAIN = "a source holds a symbolic link or another file that is not a plain file"
 
 
-class PublishError(Exception):
+class PublishError(FixedTextError):
     """A fixed-text failure. The text holds no output of Docker or Git. ``exit_status`` is the exit status of the Docker command that failed, if any."""
 
     def __init__(self, message: str, exit_status: int | None = None) -> None:
@@ -222,7 +223,7 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
         for message in publish(settings or default_settings()):
             sys.stdout.write(message + "\n")
     except PublishError as error:
-        sys.stderr.write(f"publish: {error}\n")
+        sys.stderr.write(f"publish: {describe_error(error)}\n")
         status = error.exit_status
         return status if status is not None and 0 < status < 256 else 1
     return 0

@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import os
 import stat
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.quality.repo_checks import git
 
 HOOK_NAME = "pre-commit.legacy"
@@ -32,6 +33,19 @@ HOOK_MODE = 0o755
 
 class KeptHookError(RuntimeError):
     """The older hook that pre-commit moved aside cannot be kept."""
+
+
+def hooks_folder(root: Path, env: Mapping[str, str] | None = None) -> Path:
+    """The hooks folder that Git reports for the repository, with every link followed when it leads to a folder.
+
+    The owned-file write refuses a state folder that is a link, so the folder is resolved here, before the owner's hook is moved or anything is written. A link
+    that leads to nothing, to a file or in a loop is returned as Git reports it: the installer then refuses at its first step, before anything moves.
+    """
+    reported = root / git("rev-parse", "--git-path", "hooks", cwd=root, env=env).strip()
+    try:
+        return Path(os.path.realpath(reported, strict=True))
+    except OSError:
+        return reported
 
 
 @dataclass(frozen=True)
@@ -50,7 +64,7 @@ SCANNER = LegacyHook(HOOK_NAME, KEPT_NAME, HOOK_TEXT, EARLIER_HOOK_TEXTS)
 def hook_path(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> Path:
     """The hook's file. With ``env``, Git resolves the hook folder in that environment alone, so a repository with its own Git environment, such as a scratch
     repository, does not read the caller's global ``core.hooksPath``."""
-    return root / git("rev-parse", "--git-path", "hooks", cwd=root, env=env).strip() / hook.name
+    return hooks_folder(root, env) / hook.name
 
 
 def installed(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> bool:
@@ -63,6 +77,12 @@ def is_scanner(path: Path, hook: LegacyHook = SCANNER) -> bool:
     return path.is_file() and path.read_bytes() in (hook.text.encode(), *(text.encode() for text in hook.earlier_texts))
 
 
+def would_keep(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> bool:
+    """Whether ``install`` would move a file of the owner at the hook's path to the kept name."""
+    path = hook_path(root, hook, env)
+    return os.path.lexists(path) and not is_scanner(path, hook)
+
+
 def install(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> bool:
     """Write the hook and return True, or return False when it is already installed.
 
@@ -70,8 +90,9 @@ def install(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | Non
     """
     if installed(root, hook, env):
         return False
-    path = hook_path(root, hook, env)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    folder = hooks_folder(root, env)
+    path = folder / hook.name
+    folder.mkdir(parents=True, exist_ok=True)  # a link that leads to no folder raises here, before the owner's hook moves
     if os.path.lexists(path) and not is_scanner(path, hook):
         kept = path.with_name(hook.kept_name)
         if os.path.lexists(kept):
@@ -80,13 +101,8 @@ def install(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | Non
                 f"move one away as the owner, then run setup again; nothing was overwritten"
             )
         os.rename(path, kept)
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f"{hook.name}.")
-    os.close(descriptor)
-    pending = Path(name)
     try:
-        pending.write_text(hook.text)
-        pending.chmod(HOOK_MODE)
-        os.replace(pending, path)
-    finally:
-        pending.unlink(missing_ok=True)
+        replace_owned_file(path, hook.text, state_root=folder, mode=HOOK_MODE)
+    except ClosedInputError:
+        raise OSError("the hook could not be written") from None
     return True

@@ -15,6 +15,7 @@ from dagster import Config, Definitions, Failure, OpExecutionContext, in_process
 
 from scripts.aws_cli import Aws
 from scripts.ingestion import table_checks as checks
+from scripts.ingestion.record_load import current_load_record_text
 from scripts.ingestion.store import S3Store
 from scripts.stack.groups import settings_from_environment
 from scripts.stack.nessie import NessieClient
@@ -42,7 +43,7 @@ def required(name: str) -> str:
 @op
 def table_checks_step(context: OpExecutionContext, config: TableChecksConfig) -> None:
     try:
-        record = checks.parse_load_record(Path(config.load_record).read_text())
+        record = checks.parse_load_record(current_load_record_text(Path(config.load_record)))
         pin = checks.read_track_pin()
         store = S3Store(Aws(required("AWS_PROFILE"), required("AWS_REGION")), required("S3_BUCKET"))
         settings = settings_from_environment()

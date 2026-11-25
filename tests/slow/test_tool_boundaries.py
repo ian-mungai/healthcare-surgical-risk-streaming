@@ -186,9 +186,7 @@ class TerraformCallTest(Boundary):
 
     def test_a_failed_call_gives_the_exit_status_and_names_the_file_that_keeps_the_output(self) -> None:
         error = self.run_terraform(CompletedProcess(["terraform"], 43, "", f"Error: {ROLE} {BUCKET}"))
-        self.assertEqual(
-            "terraform apply failed with exit status 43; its full output is in runs/20260101t0000-abcdef/raw/terraform_apply_failure.txt", str(error)
-        )
+        self.assertEqual("terraform apply failed with exit status 43; its full output is in the run's raw folder as terraform_apply_failure.txt", str(error))
         self.save.assert_called_once_with(RUN.run_id, "terraform_apply_failure.txt", f"Error: {ROLE} {BUCKET}")
 
     def test_a_failed_write_of_the_private_file_still_gives_the_exit_status(self) -> None:
@@ -201,9 +199,7 @@ class TerraformCallTest(Boundary):
         timeout = TimeoutExpired(["/opt/terraform", "-chdir=x", "apply", *PRIVATE_ARGUMENTS], 30, output=f"out {BUCKET}".encode(), stderr=f"err {ROLE}")
         error = self.run_terraform(timeout)
         self.assertIsInstance(error, WrapperError)
-        self.assertEqual(
-            "terraform apply timed out after 30 seconds; its partial output is in runs/20260101t0000-abcdef/raw/terraform_apply_failure.txt", str(error)
-        )
+        self.assertEqual("terraform apply timed out after 30 seconds; its partial output is in the run's raw folder as terraform_apply_failure.txt", str(error))
         self.assert_private_values_absent(error, "terraform")
         self.save.assert_called_once_with(RUN.run_id, "terraform_apply_failure.txt", f"out {BUCKET}err {ROLE}")
 
@@ -231,7 +227,7 @@ class HostCallTest(Boundary):
         self.assertIsInstance(error, host.HostError)
         deadline = f"{host.HOST_SETUP_TIMEOUT_SECONDS:g}"
         self.assertEqual(
-            f"ansible-playbook host.yml timed out after {deadline} seconds; its partial output is in runs/{RUN.run_id}/raw/ansible_output.txt", str(error)
+            f"ansible-playbook host.yml timed out after {deadline} seconds; its partial output is in the run's raw folder as ansible_output.txt", str(error)
         )
         self.assert_private_values_absent(error, "run_ansible")
         save.assert_called_once_with(RUN.run_id, "ansible_output.txt", f"x {BUCKET}")

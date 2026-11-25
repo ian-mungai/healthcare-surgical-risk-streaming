@@ -17,6 +17,7 @@ import sys
 import time
 from typing import Any
 
+from scripts.ingestion.notice import describe_error
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.catalog import required_environment
 from spark.session import build_session
@@ -43,26 +44,38 @@ def ensure_branch(client: NessieClient, branch: str) -> None:
             raise NessieError(f"{branch} exists and is not a branch") from None
 
 
+def open_client(uri: str) -> NessieClient:
+    """The Nessie client for ``uri``. An address that cannot be used, such as a port that is not a number, is a ``SettingsError`` that names no value."""
+    try:
+        return NessieClient(uri, NESSIE_TIMEOUT_SECONDS)
+    except NessieError:
+        raise SettingsError("the Nessie address cannot be used") from None
+
+
 def main() -> int:
     try:
         settings = from_environment(os.environ)
         check_checkpoint(settings.checkpoint_dir)
         load_clinical(settings.clinical_file)
-        client = NessieClient(required_environment("NESSIE_URI"), NESSIE_TIMEOUT_SECONDS)
+        client = open_client(required_environment("NESSIE_URI"))
         client.config()
         ensure_branch(client, settings.branch)
-        from replay.service.registry import RegistryClient
+        from replay.service.registry import RegistryClient, RegistryError
         from replay.service.wire_codec import Writer
 
-        writer = Writer(RegistryClient(settings.registry_url))
+        try:
+            registry = RegistryClient(settings.registry_url)
+        except RegistryError:
+            raise SettingsError("the registry address cannot be used") from None
+        writer = Writer(registry)
     except (StreamSettingsError, SettingsError, ClinicalFileError) as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     except CheckpointFormatError as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return CHECKPOINT_EXIT_CODE
     except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
+        sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")
         return 1
     session = build_session(JOB, settings.branch, extra=SESSION_OPTIONS)
     sinks = LakeSinks(session, writer, settings.bootstrap, settings.output_topic)
@@ -78,7 +91,7 @@ def main() -> int:
     deadline = time.monotonic() + settings.max_seconds if settings.max_seconds else None
     progress, failure = run_query(query, session, deadline, lambda: stopped["signal"], WAIT_SLICE_SECONDS)
     if failure is not None:
-        sys.stderr.write(f"{JOB}: the query failed: {type(failure).__name__}: {str(failure)[:500]}\n")
+        sys.stderr.write(f"{JOB}: the query failed: {type(failure).__name__}\n")
         return 1
     sys.stdout.write(RESULT_PREFIX + json.dumps({"branch": settings.branch, "last_progress": progress}, sort_keys=True, default=str) + "\n")
     return 0

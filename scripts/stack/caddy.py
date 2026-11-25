@@ -16,6 +16,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.project_config import ROOT
 
 CADDY_FOLDER = ROOT / "compose" / "caddy"
@@ -101,7 +103,7 @@ def load_routes(path: Path = ROUTES_FILE) -> list[Route]:
     try:
         return parse_routes(path.read_text())
     except OSError as error:
-        raise RoutesError(f"cannot read {path.name}: {error.strerror}") from error
+        raise RoutesError(f"cannot read the routes file ({type(error).__name__})") from None
 
 
 def site(address_port: int, body: list[str]) -> str:
@@ -177,12 +179,12 @@ def main() -> int:
     try:
         text = render(load_routes(Path(arguments[1]) if len(arguments) == 2 else ROUTES_FILE))
     except (RoutesError, RenderError) as error:
-        sys.stderr.write(f"caddy: {error}\n")
+        sys.stderr.write(f"caddy: {describe_error(error)}\n")
         return 1
     if verb == "render":
         sys.stdout.write(text)
     elif verb == "write":
-        CADDYFILE.write_text(text)
+        replace_owned_file(CADDYFILE, text, state_root=CADDY_FOLDER, mode=0o644)
     elif not CADDYFILE.exists() or CADDYFILE.read_text() != text:
         sys.stderr.write("caddy: compose/caddy/Caddyfile differs from the list; run `python -m scripts.stack.caddy write`\n")
         return 1

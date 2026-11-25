@@ -10,7 +10,7 @@ Failure modes covered here:
 - The job is told to read a table at the head of the branch instead of the hash that it resolved, so a branch that moves changes what it reads.
 - A module that the job imports, directly or through another, is left out of the image or of the build context.
 - The result reaches the caller through the free text of the job's two streams, so that a line of them can carry a value or be read as a result. It is one
-  file at a path on the command line, written whole and then renamed into place, with a closed schema, and it never overwrites a file.
+  file at a path on the command line, written whole into its part file and then linked, with a closed schema, and it never overwrites a file.
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ def read_file(folder: str) -> Any:
 
 
 class ResultFile(unittest.TestCase):
-    """The result is one file at ``--result``: the closed schema, written whole and renamed into place, for every ending that the job maps to a code."""
+    """The result is one file at ``--result``: the closed schema, written whole and linked into place, for every ending that the job maps to a code."""
 
     def setUp(self) -> None:
         self.folder = self.enterContext(tempfile.TemporaryDirectory(prefix="reconcile_result_"))
@@ -215,7 +215,6 @@ class ResultFile(unittest.TestCase):
     def test_a_path_that_cannot_hold_a_result_is_usage_and_is_not_echoed(self) -> None:
         Path(f"{self.folder}/{MARKER}_directory").mkdir()
         Path(f"{self.folder}/{MARKER}_file").write_text("x")
-        Path(f"{self.path}.part").write_text("x")
         paths = (
             "",
             "result.json",
@@ -224,7 +223,6 @@ class ResultFile(unittest.TestCase):
             f"{self.folder}/{MARKER}_file/result.json",
             f"{self.folder}/{MARKER}_directory",
             f"{self.folder}/{MARKER}_dangling",
-            self.path,
             f"{self.folder}/result\x00.json",
         )
         os.symlink(f"{self.folder}/{MARKER}_nowhere", f"{self.folder}/{MARKER}_dangling")
@@ -232,7 +230,13 @@ class ResultFile(unittest.TestCase):
             with self.subTest(path=path):
                 code, out, err = invoke(["verify", "--branch", "b", "--result", path], lambda arguments: {})
                 self.assertEqual((2, "", "silver_reconcile: usage\n"), (code, out, err))
-        self.assertEqual({"result.json.part", f"{MARKER}_directory", f"{MARKER}_file", f"{MARKER}_dangling"}, set(os.listdir(self.folder)))
+        self.assertEqual({f"{MARKER}_directory", f"{MARKER}_file", f"{MARKER}_dangling"}, set(os.listdir(self.folder)))
+
+    def test_a_file_of_the_old_part_name_does_not_refuse_the_path_because_the_job_no_longer_writes_one(self) -> None:
+        Path(f"{self.path}.part").write_text("x")
+        code, _, _ = self.call()
+        self.assertEqual(0, code)
+        self.assertEqual(["result.json", "result.json.part"], sorted(os.listdir(self.folder)))
 
     def test_the_result_option_is_given_once_and_is_required(self) -> None:
         for argv in (
@@ -245,35 +249,35 @@ class ResultFile(unittest.TestCase):
                 self.assertEqual((2, "", "silver_reconcile: usage\n"), (code, out, err))
         self.assertEqual([], os.listdir(self.folder))
 
-    def test_the_file_is_not_there_while_the_job_runs_and_appears_whole_in_one_rename(self) -> None:
+    def test_the_file_is_not_there_while_the_job_runs_and_appears_whole_in_one_link(self) -> None:
         seen: dict[str, Any] = {}
 
         def during(arguments: Namespace) -> dict[str, Any]:
             seen["during"] = os.listdir(self.folder)
             return {"mode": arguments.mode, "branch": arguments.branch}
 
-        real = os.rename
+        real = os.link
 
-        def rename(source: str, target: str) -> None:
+        def link(source: str, target: str) -> None:
             seen["target_before"] = os.path.lexists(target)
             seen["whole"] = json.loads(Path(source).read_text())
-            seen["names"] = (os.path.basename(source), os.path.basename(target))
+            seen["names"] = (os.path.basename(source).startswith(".") and os.path.basename(source).endswith(".part"), os.path.basename(target))
             real(source, target)
 
-        with mock.patch("os.rename", rename):
+        with mock.patch("scripts.ingestion.output_file.os.link", link):
             code, _, _ = self.call(during)
         self.assertEqual(0, code)
         self.assertEqual([], seen["during"])
         self.assertIs(False, seen["target_before"])
         self.assertEqual({"mode": "verify", "branch": "b", "diagnostics": []}, seen["whole"])
-        self.assertEqual(("result.json.part", "result.json"), seen["names"])
+        self.assertEqual((True, "result.json"), seen["names"])
         self.assertEqual(["result.json"], os.listdir(self.folder))
 
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_part_left_and_no_result_line(self) -> None:
         def refuse(source: str, target: str) -> None:
             raise OSError(f"{MARKER} disk full")
 
-        with mock.patch("os.rename", refuse):
+        with mock.patch("scripts.ingestion.output_file.os.link", refuse):
             code, out, err = self.call()
         self.assertEqual((70, "", "silver_reconcile: internal_error\n"), (code, out, err))
         self.assertEqual([], os.listdir(self.folder))

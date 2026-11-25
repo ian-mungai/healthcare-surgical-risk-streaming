@@ -30,13 +30,13 @@ COPY --from=amazon/aws-cli:2.42.1@sha256:b0102d2269f87d8531d931c1a59e248101ace58
 RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 
 COPY --from=stack_scripts __init__.py aws_cli.py process.py project_config.py /opt/dagster/app/scripts/
-COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/limits.py stack/nessie.py stack/yaml_text.py \
+COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/limits.py stack/nessie.py stack/tags.py stack/yaml_text.py \
     /opt/dagster/app/scripts/stack/
 # The table checks and the record load: the ingestion package (gate, manifest, table checks, copy, Airbyte client, catalog and load),
 # the pinned publisher files they read, the rules of the Spark job that the controller also holds the result to, and the tracked release pin that the manifest
 # reader and the track list's pin open.
-COPY --from=stack_scripts ingestion/__init__.py ingestion/airbyte_api.py ingestion/check.py ingestion/closed.py ingestion/gate.py ingestion/landing.py \
-    ingestion/manifest.py ingestion/notice.py ingestion/record_catalog.py ingestion/record_copy.py ingestion/record_definitions.py ingestion/record_load.py \
+COPY --from=stack_scripts ingestion/__init__.py ingestion/airbyte_api.py ingestion/check.py ingestion/closed.py ingestion/folder.py ingestion/gate.py ingestion/landing.py \
+    ingestion/manifest.py ingestion/notice.py ingestion/output_file.py ingestion/record_catalog.py ingestion/record_copy.py ingestion/record_definitions.py ingestion/record_load.py \
     ingestion/record_run.py ingestion/record_state.py ingestion/selection.py ingestion/store.py ingestion/table_checks.py ingestion/track_list.py \
     /opt/dagster/app/scripts/ingestion/
 COPY --from=stack_scripts sample/__init__.py sample/candidates.py sample/publisher.py sample/split.py /opt/dagster/app/scripts/sample/

@@ -18,6 +18,7 @@ from typing import Any
 
 import yaml
 
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.project_config import IMAGE_REPOSITORY_PATTERN
 from scripts.stack.yaml_text import YamlError, load_yaml
 
@@ -31,7 +32,7 @@ HEADER = (
 )
 
 
-class PinError(ValueError):
+class PinError(FixedTextError, ValueError):
     """A fixed-text failure of the pin file or of the render. The text holds no value that was read from outside."""
 
 
@@ -122,7 +123,7 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         sys.stdout.write(render_environment(load(path), [image["name"] for image in load_images()]))
     except PinError as error:
-        sys.stderr.write(f"image pins: {error}\n")
+        sys.stderr.write(f"image pins: {describe_error(error)}\n")
         return 1
     return 0
 

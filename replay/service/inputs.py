@@ -13,11 +13,11 @@ import tempfile
 from pathlib import Path
 
 from casefile.decoding import clinical_times
-from casefile.folder_store import FolderStore
+from casefile.folder_store import FolderStore, ReadLog, refused
 from replay.events.recording import CaseRecording, CaseTimes
 from replay.events.schedule import Plan
 from replay.service.decode import decode_case
-from replay.service.run_record import RunRecord
+from replay.service.run_record import RunRecord, is_state_folder_name
 from scripts.ingestion.check import CheckedFile
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef, read_manifest
@@ -32,9 +32,20 @@ class InputError(RuntimeError):
     """A manifest, a version or a file the replay needs is not what the manifest says."""
 
 
+def read_log_path(text: str) -> Path:
+    named = Path(text)
+    if is_state_folder_name(named.name):
+        raise refused()
+    return named.parent.resolve() / named.name
+
+
 def open_store(record: RunRecord, reference: ManifestRef) -> ObjectStore:
+    """The object store of a run. A folder store's read log, when the record names one, is created here, once, as a new file, so every command that opens the
+    store gets the same checks: a last name that the replay writes in its state folder (``is_state_folder_name``) is refused, and only the log's folder is
+    resolved, never its last part, so a link in that place is left for the exclusive create to refuse. A refusal and a path that exists in any form are
+    ``CANNOT_WRITE`` before any read, and nothing is created."""
     if record.object_store.kind == "folder" and record.object_store.root is not None:
-        read_log = Path(record.object_store.read_log) if record.object_store.read_log else None
+        read_log = ReadLog.create(read_log_path(record.object_store.read_log)) if record.object_store.read_log else None
         return FolderStore(Path(record.object_store.root), reference.bucket, read_log)
     from casefile.s3_store import S3ReadStore  # the folder store needs no boto3, and the host's store is only loaded on the host
 

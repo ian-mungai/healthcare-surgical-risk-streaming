@@ -30,8 +30,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from scripts.process import run_command
-from tests.fast.git_fixture import clean_git_env
+from tests.fast.git_fixture import git_in
 from tests.fast.label_accept import accepted, empty_exit_ok, refusal_ok
 from tests.fast.test_outcome_acceptance import split_run
 from tests.fast.test_silver_acceptance import written
@@ -236,11 +235,20 @@ class SealedList(unittest.TestCase):
 
 def git_tracked(folder: Path) -> list[str]:
     """The names of the files Git tracks directly in ``folder``."""
-    listed = run_command("git", ["ls-files", "--", "."], cwd=folder, env=clean_git_env(), timeout=60)
+    listed = git_in(folder, "ls-files", "--", ".")
     return [name for name in listed.stdout.splitlines() if "/" not in name]
 
 
 class EveryRunner(unittest.TestCase):
+    def test_the_tracked_names_are_read_the_same_inside_a_commit_hook(self) -> None:
+        """A commit hook runs with ``GIT_DIR`` and ``GIT_INDEX_FILE`` set and no work tree: Git then takes the folder it is run in as the top and lists names
+        with their folders, which the reader drops, so a worktree with no untracked runner read every runner as untracked and failed the hook."""
+        git_dir = git_in(E2E, "rev-parse", "--absolute-git-dir").stdout.strip()
+        plain = git_tracked(E2E)
+        with mock.patch.dict(os.environ, {"GIT_DIR": git_dir, "GIT_INDEX_FILE": f"{git_dir}/index"}):
+            self.assertEqual(plain, git_tracked(E2E))
+        self.assertIn("__init__.py", plain)
+
     def test_no_runner_on_this_machine_calls_a_sealed_job_without_the_result_option(self) -> None:
         tracked = set(git_tracked(E2E))
         paths = sorted(path for path in E2E.glob("*.py") if path.name != "__init__.py")

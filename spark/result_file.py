@@ -2,12 +2,13 @@
 
 The caller reads that file with a closed schema and no line of the job's standard output or standard error, which stay for the operator (the Spark launcher
 writes its own lines to them). The path is absolute, its folder is there, and neither the path nor ``<path>.part`` exists, so a file is never replaced. The job
-reserves ``<path>.part`` (an exclusive create) before any work, so a path that cannot hold it (a name of 255 bytes) is a bad call, ``usage``, and nothing runs.
-It writes the whole document to the reserved file, flushes it and renames it to ``<path>``, so that a reader sees no file or the whole file. A watchdog calls
-``release_reserved`` so that the job it stops leaves no part file. The pattern is that of ``spark/reconcile/cli.py``. ``run_sealed`` is the whole ending of a
-job whose failures are problems of the form ``code: failed`` (the patient split job and the Silver cases job; the Silver signals and hypotension jobs use the
-same reserve, write and release in ``spark/silver/cli.py``): every line that it prints for a refusal is a
-fixed code and the flag, never a count. This module imports no Spark.
+reserves ``<path>.part`` (a new file, made with ``write_new_file``) before any work, so a path that cannot hold it (a name of 255 bytes) is a bad call,
+``usage``, and nothing runs. It writes the whole document into that reserved file with ``publish_reserved`` (flushed, then linked to ``<path>``, which
+fails when the path exists), so that a reader sees no file or the whole file and the reserved file is the only staging file. A watchdog calls
+``release_reserved`` so that the job it stops leaves no part file, not even one that holds a result (the stop may come right before the link).
+``run_sealed`` is the whole ending of a job whose failures are problems of the form ``code: failed`` (the patient split job and the Silver cases job; the Silver
+signals and hypotension jobs use the same reserve, write and release in ``spark/silver/cli.py``): every line that it prints for a refusal is a fixed code and
+the flag, never a count. This module imports no Spark.
 """
 
 from __future__ import annotations
@@ -18,8 +19,11 @@ import json
 import os
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.output_file import check_new_output, publish_reserved, write_new_file
 from scripts.stack.nessie import NessieError
 from spark.settings import SettingsError
 
@@ -62,49 +66,41 @@ def add_result_option(command: argparse.ArgumentParser) -> None:
 RESERVED: list[str] = []
 
 
-def reserve(path: str) -> int | None:
-    """Reserve the result: create ``<path>.part`` exclusively and return its descriptor, or ``None`` when the result cannot be written there.
+def reserve(path: str) -> str | None:
+    """Reserve the result: create ``<path>.part`` as a new file (``write_new_file``) and return its name, or ``None`` when the result cannot be written there.
 
-    ``None`` is every case that makes the call a bad one: the path or its part file exists (also a dangling link or a folder), the part file's name is too
-    long (a name of 255 bytes passes ``result_path``, but ``<name>.part`` does not), the folder is missing or the folder cannot be written. Nothing is
-    replaced."""
+    ``None`` is every case that makes the call a bad one: the path or its part file exists (also a dangling link or a folder, or a name that differs only in
+    letter case), the part file's name is too long (a name of 255 bytes passes ``result_path``, but ``<name>.part`` does not), the folder is missing or the
+    folder cannot be written. Nothing is replaced."""
     part = path + ".part"
-    if os.path.lexists(path):
-        return None
     try:
-        descriptor = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
-    except OSError:
+        check_new_output(Path(path))
+        write_new_file(Path(part), b"", mode=FILE_MODE)
+    except ClosedInputError:
         return None
     RESERVED.append(part)
-    return descriptor
+    return part
 
 
 def release_reserved() -> None:
-    """Remove every part file that this process reserved and did not rename. The watchdog and the end of a call use it, so that no part file is left."""
+    """Remove every part file that this process reserved and did not release. The watchdog and the end of a call use it, so that no part file is left. A name
+    that cannot be removed stays: the name gets one attempt here and the error is dropped."""
     while RESERVED:
         with contextlib.suppress(OSError):
             os.unlink(RESERVED.pop())
 
 
-def write_reserved(descriptor: int, path: str, document: dict[str, Any]) -> None:
-    """Write the whole document to the reserved part file and rename it to ``path``. The descriptor belongs to the file object from the first line, so every
-    error path closes it. A failure removes the part file. A file that appeared at ``path`` after the reservation is never replaced: that is a
-    ``FileExistsError``."""
-    part = path + ".part"
+def write_reserved(path: str, document: dict[str, Any]) -> None:
+    """Write the whole document into the reserved part file and link it to ``path`` (``publish_reserved``: the part file is the only staging file, so a reader
+    sees no file or the whole file and the watchdog's release of the part file removes every staged byte), then release the reserved name. A file that
+    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A write or link that fails leaves no result file. Every
+    removal of the part name is an attempt: after a failed link and after a successful one, the end of the call (``release_reserved``) tries once more, so
+    a part file whose first removal failed can be gone when the call raises, and one whose name still cannot be removed stays (the watchdog's removal is an
+    attempt too). After a successful link a failed removal raises, with the result file whole: a sealed job then ends as ``internal_error``, exit 70."""
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            text = json.dumps(document, sort_keys=True) + "\n"
-            os.fchmod(handle.fileno(), FILE_MODE)
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.path.lexists(path):
-            raise FileExistsError
-        os.rename(part, path)
-    except BaseException:
+        publish_reserved(Path(path + ".part"), Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
+    finally:
         release_reserved()
-        raise
-    RESERVED.remove(part)
 
 
 def problem_code(problem: str) -> str:
@@ -147,18 +143,17 @@ def run_sealed(
     close: Callable[[argparse.Namespace, Callable[[argparse.Namespace], dict[str, Any]], str], tuple[int, dict[str, Any], list[str]]] = ending,
 ) -> int:
     """Parse the call, reserve the result file, run ``execute``, write the result file and then print the operator lines. A path that cannot hold a result is
-    a bad call and nothing runs. A result that cannot be written is ``internal_error``. A bad call and the watchdog write no file and leave no part file. The
-    job prints no result line: the caller reads the file. ``close`` maps the end of ``execute`` to the exit code, the document and the lines (a job with its
-    own list of codes passes its own)."""
+    a bad call and nothing runs. A result that cannot be written is ``internal_error``. A bad call and the watchdog write no file and leave no part file,
+    unless the part name cannot be removed. The job prints no result line: the caller reads the file. ``close`` maps the end of ``execute`` to the exit code,
+    the document and the lines (a job with its own list of codes passes its own)."""
     arguments = command.parse_args(argv)
-    descriptor = reserve(arguments.result)
-    if descriptor is None:
+    if reserve(arguments.result) is None:
         sys.stderr.write(f"{job}: usage\n")
         return 2
     try:
         status, document, lines = close(arguments, execute, job)
         try:
-            write_reserved(descriptor, arguments.result, document)
+            write_reserved(arguments.result, document)
         except Exception:
             sys.stderr.write(f"{job}: {line_of('internal_error')}\n")
             return INTERNAL_EXIT_CODE

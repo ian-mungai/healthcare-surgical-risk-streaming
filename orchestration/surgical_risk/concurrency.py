@@ -46,7 +46,7 @@ def heavy_memory_mib(environment: Mapping[str, str] = os.environ) -> int:
     if value == "":
         raise ConcurrencyError(f"{HEAVY_MEMORY_ENVIRONMENT} is empty, so the figure above which a job is heavy is unknown")
     if WHOLE_NUMBER.fullmatch(value) is None or int(value) == 0:
-        raise ConcurrencyError(f"{HEAVY_MEMORY_ENVIRONMENT} must be a positive whole number of MiB, not {value!r}")
+        raise ConcurrencyError(f"{HEAVY_MEMORY_ENVIRONMENT} must be a positive whole number of MiB")
     return int(value)
 
 
@@ -55,7 +55,7 @@ def group_memory_mib(group: str, limits_file: Path = LIMITS_FILE) -> int:
     try:
         document = yaml.safe_load(limits_file.read_text())
     except (OSError, yaml.YAMLError) as error:
-        raise ConcurrencyError(f"cannot read the limits file {limits_file.name}: {error}") from error
+        raise ConcurrencyError(f"cannot read the limits file {limits_file.name}: {type(error).__name__}") from error
     services = document.get("services") if isinstance(document, dict) else None
     if not isinstance(services, dict):
         raise ConcurrencyError(f"the limits file {limits_file.name} holds no services mapping")

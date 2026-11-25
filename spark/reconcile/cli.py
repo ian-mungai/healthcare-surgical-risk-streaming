@@ -3,8 +3,8 @@ text.
 
 ``python -m spark.jobs.silver_reconcile verify --branch <name> --result <path>``. The result reaches the caller through the file and through nothing else: the
 caller reads no line of the job's standard output or standard error, which stay for the operator (the Spark launcher writes its own lines to them). The path
-is absolute, its folder is there, and neither the path nor ``<path>.part`` exists, so that a file is never replaced. The job writes the whole document to
-``<path>.part`` and renames it to ``<path>``, so that a reader sees no file or the whole file. Every ending that the job maps to a code writes one: a clean
+is absolute, its folder is there and the path does not exist, so that a file is never replaced. The job writes the whole document with ``write_new_file``
+(``scripts/ingestion/output_file.py``), so that a reader sees no file or the whole file. Every ending that the job maps to a code writes one: a clean
 run (outcome ``verified``, with the facts of the run), a failed check (outcome ``failed``, one diagnostic for each cause, each a code with a count or with no
 count, and the flag of each table when every flag was judged), and a failed upstream, setting or other error (outcome ``failed`` and its one code). A bad call,
 and a job that the watchdog stops, write none.
@@ -17,13 +17,14 @@ only reads, so it has one mode. Exit 0 on success, 1 on a failed check or a fail
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.output_file import write_new_file
 from scripts.stack.nessie import NessieError
 from spark.reconcile.checks import ReconcileError
 from spark.settings import SettingsError
@@ -70,25 +71,15 @@ def parser() -> argparse.ArgumentParser:
 
 
 def usable(path: str) -> bool:
-    """Whether the result can be written there without replacing anything: the folder is there and neither the path nor its part file is."""
-    return os.path.isdir(os.path.dirname(path)) and not os.path.lexists(path) and not os.path.lexists(path + ".part")
+    """Whether the result can be written there without replacing anything: the folder is there and the path is not."""
+    return os.path.isdir(os.path.dirname(path)) and not os.path.lexists(path)
 
 
 def write_result(path: str, document: dict[str, Any]) -> None:
-    """Write the whole document to ``<path>.part`` and rename it to ``<path>``. A part file that a failure leaves is removed."""
-    part = path + ".part"
-    descriptor = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            os.fchmod(handle.fileno(), FILE_MODE)
-            handle.write(json.dumps(document, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.rename(part, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(part)
-        raise
+    """Write the whole document to a new file at ``path`` (``write_new_file``: a path that exists in any form is refused, and a failed write leaves no result
+    file and no part file when the part name can be removed; a part name that cannot be removed stays, after a failed link as after a link that worked
+    (beside the whole file), and the call raises)."""
+    write_new_file(Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
 
 
 def diagnostic(problem: str) -> dict[str, Any]:

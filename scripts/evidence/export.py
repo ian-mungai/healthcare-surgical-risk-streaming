@@ -7,7 +7,6 @@ started on a GitHub runner hands these two files to the owner, who verifies them
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import tarfile
@@ -16,17 +15,20 @@ from pathlib import Path
 from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.project_config import ROOT
 
 
 def main() -> int:
     """Write the manifest and the archive, print their size and return a non-zero code on a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         run = load_run(parser.parse_args().binding)
     except WrapperError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     folder = ROOT / "runs" / run.run_id
     export = folder / "export"
@@ -36,7 +38,7 @@ def main() -> int:
     if problems:
         sys.stderr.write("".join(f"{problem}\n" for problem in problems) + "nothing was exported\n")
         return 1
-    (export / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    replace_owned_file(export / "manifest.json", json.dumps(manifest, indent=2) + "\n", state_root=export, mode=0o644)
     with tarfile.open(export / "evidence.tar.gz", "w:gz") as archive:
         for item in manifest["files"]:
             archive.add(folder / item["path"], arcname=item["path"])

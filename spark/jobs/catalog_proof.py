@@ -20,10 +20,12 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.stack.nessie import CONFLICT_TEXT, NessieClient, NessieConflict, NessieError
 from spark.catalog import required_environment
 from spark.session import build_session, start_deadline
-from spark.settings import BYTES_PER_MIB, SettingsError, read_memory_limit_mib
+from spark.settings import BYTES_PER_MIB, MAX_DEADLINE_SECONDS, MAX_NESSIE_TIMEOUT_SECONDS, SettingsError, number_setting, read_memory_limit_mib
 
 JOB = "catalog_proof"
 NAMESPACE = "catalog_proof"
@@ -39,7 +41,7 @@ class PlannedFailure(RuntimeError):
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog=f"python -m spark.jobs.{JOB}", description="Write the proof table on a private Nessie branch.")
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Write the proof table on a private Nessie branch.")
     command.add_argument("--branch", required=True, help="the private branch to create from main and write to")
     command.add_argument("--base", default="main", help="the branch to create the private branch from")
     command.add_argument("--rows", type=int, default=DEFAULT_ROWS, help="how many rows to write")
@@ -70,13 +72,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"{JOB}: --rows must be at least 1\n")
         return 2
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
-        client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
+        start_deadline(number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS), JOB)
+        client = NessieClient(
+            required_environment("NESSIE_URI"), number_setting("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS, MAX_NESSIE_TIMEOUT_SECONDS)
+        )
         client.config()
         client.create_branch(arguments.branch, arguments.base)
         written = write_table(arguments.branch, arguments.rows)
         if arguments.fail_after_write:
-            raise PlannedFailure(f"planned failure after the write on branch {arguments.branch}")
+            raise PlannedFailure("planned failure after the write")
         result = {
             "branch": arguments.branch,
             "branch_hash": client.reference(arguments.branch).hash,
@@ -87,14 +91,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "uid": os.getuid(),
             **written,
         }
-    except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch {arguments.branch}: {error}\n")
+    except NessieConflict:
+        sys.stderr.write(f"{JOB}: {CONFLICT_TEXT}\n")
         return 1
     except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
+        sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")
         return 1
     except SettingsError as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0
