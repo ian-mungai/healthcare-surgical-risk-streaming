@@ -51,6 +51,7 @@ E2E = Path(__file__).resolve().parents[1] / "e2e"
 NAMES = ("cases_with_arterial_waveform", "tracks")
 TOTAL = 987654
 FLAG_NODES = (ast.Compare, ast.BoolOp, ast.Constant)
+FLAG_CALLS = frozenset({"all", "any", "bool"})
 
 
 def flag_shaped(node: ast.expr) -> bool:
@@ -208,7 +209,7 @@ class ProfileMismatch(unittest.TestCase):
         self.assertEqual({"as_planted"}, {key for function, key, _ in result_values(source, ("counts_flag",))})
         self.assertEqual([], total_values(source, ("counts_flag",)))
 
-    def test_the_dump_holds_no_flag_for_a_named_count(self) -> None:
+    def test_the_dump_prints_flags_for_the_counts_and_no_row_of_the_counts_table(self) -> None:
         source = runner("signal_profile").STAND_IN
         dump = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "dump")
         result = next(
@@ -217,15 +218,13 @@ class ProfileMismatch(unittest.TestCase):
             if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "result" and isinstance(node.value, ast.Dict)
         )
         values = {getattr(key, "value", ""): value for key, value in zip(result.keys, result.values, strict=True)}
-        row = values["counts"].elt  # type: ignore[attr-defined]
-        self.assertEqual({"name", "expected"}, {key.value for key in row.keys if key is not None})
-        spread = [value for key, value in zip(row.keys, row.values, strict=True) if key is None]
-        self.assertEqual(1, len(spread))
-        self.assertIsInstance(spread[0], ast.IfExp)
-        self.assertEqual({"value"}, {key.value for key in spread[0].orelse.keys}, "the value is held for a count that is not sealed only")
-        self.assertEqual([], spread[0].body.keys, "a sealed count holds no value field")
-        self.assertIn("count_flags", values)
-        self.assertIn("sealed_values_empty", values)
+        self.assertNotIn("counts", values, "a row of the counts table holds an expected total and a value")
+        for flag in ("count_names_equal", "development_values_equal", "expected_equal", "count_flags", "sealed_values_empty"):
+            self.assertIn(flag, values)
+        for flag in ("count_names_equal", "development_values_equal", "expected_equal", "sealed_values_empty"):
+            node = values[flag]
+            compared = isinstance(node, ast.Compare) or (isinstance(node, ast.Call) and getattr(node.func, "id", "") in FLAG_CALLS)
+            self.assertTrue(compared, f"{flag} is not a comparison or a Boolean call")
 
     def test_the_dump_holds_no_row_total_of_the_silver_tables(self) -> None:
         source = runner("signal_profile").STAND_IN

@@ -28,10 +28,12 @@ from typing import Any
 
 from tests.e2e.run_record import Record
 from tests.fast.sealed_record import FLAG_NAME
+from tests.fast.test_heldout_figures import figure_derivable
 from tests.fast.test_runner_gold_sealed import runner
 
 BRANCH_HASH, BASE_HASH = "b" * 64, "a" * 64
 SECRET = 31337
+PATIENT_COUNT_NAMES = ("patients", "development_patients_training", "development_patients_validation")
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 
 
@@ -307,10 +309,9 @@ class ProfileCases(unittest.TestCase):
             "arterial": {},
             "grid": {},
             "unscored": [{**zero, **rule, "scope": "development", "unscored_share": None}],
-            "counts": [
-                {"name": count.name, "expected": float(count.expected), **({"value": 7.0} if count.scope != "full cohort" else {})}
-                for count in module.PRESPECIFIED
-            ],
+            "count_names_equal": True,
+            "development_values_equal": True,
+            "expected_equal": True,
             "sealed_values_empty": True,
             "count_flags": ["None"],
             "rule": [{**asdict(module.planned_rule(5)), "written_at": "2026-11-24"}],
@@ -335,15 +336,36 @@ class ProfileCases(unittest.TestCase):
 
         def stand(mode: str, branch: str, **values: Any) -> tuple[int, dict[str, Any], str, float]:
             asked.append(values)
-            return 0, {**self.healthy_dump(), "counts": [{"name": "x", "value": 1}]}, "", 0.1
+            return 0, self.healthy_dump(), "", 0.1
 
         self.flow.stand = stand
         built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
-        self.flow.independent(built, [908], {"development_cases": 7.0}, "", "control", pinned=False, arterial=False)
+        pinned = {name: float(self.module.BY_NAME[name].expected) for name in ("development_cases", *PATIENT_COUNT_NAMES[1:])}
+        self.flow.independent(built, [908], pinned, "", "control", pinned=False, arterial=False)
         wanted = sorted(count.name for count in self.module.PRESPECIFIED if count.scope == "full cohort")
         self.assertEqual([wanted], [values["sealed"] for values in asked])
         self.assertGreater(len(wanted), 0)
         self.assertNotIn("development_cases", wanted)
+
+    def test_the_independent_read_sends_the_container_no_total_of_patients_and_nothing_that_the_test_count_follows_from(self) -> None:
+        asked: list[dict[str, Any]] = []
+        self.stack.write_spec = lambda *_: None
+
+        def stand(mode: str, branch: str, **values: Any) -> tuple[int, dict[str, Any], str, float]:
+            asked.append(values)
+            return 0, self.healthy_dump(), "", 0.1
+
+        self.flow.stand = stand
+        built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
+        pinned = {name: float(self.module.BY_NAME[name].expected) for name in ("development_cases", *PATIENT_COUNT_NAMES[1:])}
+        self.flow.independent(built, [908], pinned, "", "control", pinned=True, arterial=False)
+        sent = asked[0]
+        self.assertEqual(sorted(count.name for count in self.module.PRESPECIFIED), sent["names"])
+        self.assertEqual(
+            ["development_cases"], sorted(sent["want_values"]), "the development patient counts are the rule's pinned counts, read in the container"
+        )
+        self.assertTrue(set(PATIENT_COUNT_NAMES).isdisjoint(sent["count_expected"]), "an expected total of patients is sent")
+        self.assertFalse(figure_derivable(sent), "the test count follows from the numbers that the runner sends")
 
     def test_the_independent_read_returns_true_when_every_comparison_passes_and_records_flags_only(self) -> None:
         self.assertIs(True, self.independent(self.healthy_dump()))
@@ -364,10 +386,14 @@ class ProfileCases(unittest.TestCase):
             "an unscored share with no cutoff": (1, mutated(unscored=[{**dump["unscored"][0], "unscored_share": 0.5}])),
             "another rule": (1, mutated(unscored=[{**dump["unscored"][0], "waveform_limit": 1}])),
             "an arterial second in a development case": (1, mutated(arterial={"908": [[1, True]]})),
-            "a count with another value": (
-                3,
-                mutated(counts=[{**item, "value": 8.0} if item["name"] == "development_cases" else item for item in dump["counts"]]),
-            ),
+            "a development count with another value": (3, mutated(development_values_equal=False)),
+            "names of counts that are not the prespecified ones": (3, mutated(count_names_equal=False)),
+            "an expected value that is not the prespecified one": (3, mutated(expected_equal=False)),
+            "a development flag that is a text": (3, mutated(development_values_equal="True")),
+            "no flag of the development values": (3, {key: value for key, value in self.healthy_dump().items() if key != "development_values_equal"}),
+            "a flag of the names that is a number": (3, mutated(count_names_equal=1)),
+            "no flag of the expected values": (3, {key: value for key, value in self.healthy_dump().items() if key != "expected_equal"}),
+            "a row of the counts table in the reply": (3, mutated(counts=[{"name": "patients", "expected": 1.0}])),
             "a sealed count that held a value": (3, mutated(sealed_values_empty=False)),
             "no flag of the sealed counts": (3, {key: value for key, value in self.healthy_dump().items() if key != "sealed_values_empty"}),
             "a flag of the sealed counts that is a text": (3, mutated(sealed_values_empty="True")),
