@@ -10,6 +10,10 @@ from __future__ import annotations
 # The packages whose files give a frame its name (a path under the root of the project and one of these folders).
 PACKAGES = ("spark", "casefile", "features", "scripts", "replay")
 
+# The longest name of a function and the longest path of a file in the inventory of trusted code locations (``spark/internal_inventory.py``).
+NAME_LIMIT = 100
+PATH_LIMIT = 200
+
 # Library classes that a job can raise, as ``module.Class``: the standard library, botocore and py4j. A class that is not loaded is skipped and never imported.
 LIBRARY_CLASSES = (
     "json.decoder.JSONDecodeError",
@@ -140,6 +144,7 @@ PROJECT_CLASSES = (
     "scripts.ingestion.track_list.TrackListRowError",
     "scripts.process.ProcessGroupSurvived",
     "scripts.project_config.ConfigurationError",
+    "scripts.quality.internal_inventory.InventoryError",
     "scripts.quality.worktree_scan_hook.KeptHookError",
     "scripts.sample.candidates.CandidateError",
     "scripts.sample.publisher.PublisherError",

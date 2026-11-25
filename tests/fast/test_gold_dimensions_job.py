@@ -25,7 +25,7 @@ from spark.gold_dimensions import DIMENSIONS, Dimension, GoldDimensionsError
 from spark.gold_dimensions_run import CHECKS, JOB, run, run_build, run_verify
 from spark.jobs import gold_dimensions
 from spark.settings import SettingsError
-from tests.fast.internal_line_support import assert_internal, error_with_raising_loader
+from tests.fast.internal_line_support import ENTRY_FRAME, assert_internal, error_with_raising_loader
 
 NAMES = tuple(item.name for item in DIMENSIONS)
 OPEN_NAMES = tuple(item.name for item in DIMENSIONS if item.name != "dim_lab_test")
@@ -363,7 +363,7 @@ class CommandTests(unittest.TestCase):
 
         code, out, err = self.call(["verify", "--branch", "x"], execute)
         self.assertEqual((70, ""), (code, out))
-        self.assertEqual("fake_job.py:2:entry", assert_internal(self, err, JOB, f"{JOB}: internal_error", ("builtins.KeyError",), "the loader failed")[-1])
+        self.assertEqual(ENTRY_FRAME, assert_internal(self, err, JOB, f"{JOB}: internal_error", ("builtins.KeyError",), "the loader failed")[-1])
 
 
 if __name__ == "__main__":

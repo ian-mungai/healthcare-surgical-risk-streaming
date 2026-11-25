@@ -48,6 +48,7 @@ from scripts.process import TimeoutExpired
 from spark.internal_diagnostic import internal_error_line
 from spark.settings import SettingsError
 from tests.e2e.run_record import Record
+from tests.fast.internal_line_support import ENTRY_FRAME
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 
@@ -339,7 +340,8 @@ class Refusals(unittest.TestCase):
         self.assertIn("out 4417", out)
 
     def test_the_diagnostic_line_of_an_internal_error_is_not_returned_and_not_counted_as_unknown(self) -> None:
-        lines = "gold_dimensions: internal_error\ngold_dimensions: internal_error class=builtins.RuntimeError <- builtins.OSError frames=a.py:1:f | b.py:2:g\n"
+        classes = "builtins.RuntimeError <- builtins.OSError"
+        lines = f"gold_dimensions: internal_error\ngold_dimensions: internal_error class={classes} frames={ENTRY_FRAME} | {ENTRY_FRAME}\n"
         stack = self.stack([(70, "", lines)])
         code, _, err = stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
         self.assertEqual((70, "gold_dimensions: internal_error\n"), (code, err))
@@ -353,7 +355,7 @@ class Refusals(unittest.TestCase):
 
     def test_a_line_that_is_shaped_like_the_diagnostic_line_but_holds_text_is_counted_as_unknown(self) -> None:
         for text in (
-            "internal_error class=builtins.RuntimeError frames=a.py:1:f message",
+            f"internal_error class=builtins.RuntimeError frames={ENTRY_FRAME} message",
             "internal_error class=builtins.RuntimeError: boom frames=",
             "internal_error class=a frames=",
             "internal_error class=builtins.RuntimeError frames=/x/a.py:1:f",
@@ -366,14 +368,25 @@ class Refusals(unittest.TestCase):
                 self.assertEqual(1, self.counted(70, "internal_error", text))
 
     def test_a_diagnostic_line_is_unknown_on_any_exit_code_but_70(self) -> None:
-        diagnostic = "internal_error class=builtins.KeyError frames=a.py:1:f"
+        diagnostic = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
         for code, first in ((1, "branch_missing"), (1, "internal_error"), (2, "internal_error"), (0, "internal_error")):
             with self.subTest(code=code, first=first):
                 self.assertEqual(1, self.counted(code, first, diagnostic))
         self.assertEqual(0, self.counted(70, "internal_error", diagnostic))
 
+    def test_a_zero_padded_line_number_a_generated_file_and_a_second_pair_are_unknown(self) -> None:
+        good = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
+        padded = good.replace(":2:", ":02:")
+        generated = good.replace("spark/result_file.py", "spark/generated_by_data.py")
+        self.assertEqual(1, self.counted(70, "internal_error", padded))
+        self.assertEqual(1, self.counted(70, "internal_error", generated))
+        self.assertEqual(
+            2, self.counted(70, "internal_error", good, "internal_error", good)
+        )  # a second pair makes both diagnostics unknown (the code lines are known)
+        self.assertEqual(0, self.counted(70, "internal_error", good))
+
     def test_two_diagnostic_lines_on_one_internal_error_are_one_unknown_and_so_is_one_that_follows_another_code(self) -> None:
-        diagnostic = "internal_error class=builtins.KeyError frames=a.py:1:f"
+        diagnostic = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
         self.assertEqual(1, self.counted(70, "internal_error", diagnostic, diagnostic))
         self.assertEqual(1, self.counted(70, "settings", diagnostic))
         self.assertEqual(1, self.counted(70, diagnostic))

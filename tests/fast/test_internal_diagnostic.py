@@ -7,7 +7,12 @@ Failure modes covered here:
 - The line carries a value. The message, the arguments, the ``repr`` or a local variable can hold a value of the test set, and so can a name: a class that
   a library built from data (its module or its name), a file name, a function compiled from a text (``<string>``) and the frames that PySpark 4 rebuilds from
   the message of a Java error. Only a class on a fixed list (found by identity, so a class with the same name is not on it) is named, and a frame is named
-  only when its file is a file of the project's own packages. Every other class and frame is the fixed word ``other``, and no name of one is read.
+  only when its path (``..`` resolved as text) is exactly the root of the project and a path of the fixed inventory of tracked files
+  (``spark/internal_inventory.py``) and its function is a name that the inventory holds for that file (or a fixed name such as ``<lambda>``). A generated file
+  name under ``spark/``, a function name that is made at run time beside a tracked file name and a path with ``..`` are all ``other``. Every other class and
+  frame is the fixed word ``other``, and no name of one is read.
+- Reading a class runs code of a library or of the error: the ``__class__`` of an object, the ``__subclasscheck__`` or ``__instancecheck__`` of a metaclass.
+  The lookup uses ``type(error)`` and the ``__mro__`` slot of each class and never ``isinstance`` or ``issubclass`` on a class that it does not own.
 - Reading a class or a frame runs code of the error or of a library: a source loader that raises (``traceback`` reads the source lines), a property of an
   error class, a name that raises. The formatter reads no source line and no attribute of an error class, and when anything still fails the line is the
   fixed ``internal_error class=unavailable frames=unavailable``. It never raises, so the exit code and the result write of the job do not change.
@@ -30,11 +35,15 @@ from unittest import mock
 from spark import internal_diagnostic as diagnostic
 from spark.internal_classes import PACKAGES
 from spark.internal_diagnostic import CLASS_LIMIT, FRAME_LIMIT, internal_error_line
+from spark.internal_inventory import INVENTORY
 from tests.fast.internal_line_support import RaisingLoader, assert_internal
 
 MARKER = "MARKER_4417"
-ROOT = Path(diagnostic.__file__).parent.parent
-OWN = str(ROOT / "spark" / "fake_job.py")  # a file under a package of the project (the file does not exist: a source line cannot be read)
+ROOT = Path(diagnostic.__file__).resolve().parent.parent
+TRACKED = "spark/result_file.py"  # a tracked file of the project (its source is not read: the code is compiled from a text under its name)
+ENTRY, INNER = sorted(INVENTORY[TRACKED])[:2]  # two names that the inventory holds for that file
+FOREIGN = sorted(set(INVENTORY["spark/profile/checks.py"]) - set(INVENTORY[TRACKED]))[0]  # a name that the inventory holds for another file only
+OWN = str(ROOT / TRACKED)
 
 
 class Secretive(Exception):
@@ -87,7 +96,7 @@ def parts(line: str) -> tuple[list[str], list[str]]:
     return head.partition("class=")[2].split(" <- "), [frame for frame in tail.split(" | ") if frame]
 
 
-def from_file(filename: str, source: str, entry: str = "entry", loader: object | None = None) -> BaseException:
+def from_file(filename: str, source: str, entry: str = ENTRY, loader: object | None = None) -> BaseException:
     """The error of ``entry()`` of ``source`` as if it were compiled from the file ``filename``."""
     scope: dict[str, Any] = {"__name__": "fake_job"}
     if loader is not None:
@@ -109,24 +118,26 @@ class TheLine(unittest.TestCase):
         self.assertEqual(["other"], classes)
         self.assertEqual(["other"], frames)  # the frames of this test file are not a package of the project
 
-    def test_the_frames_of_the_project_are_named_with_file_line_and_function(self) -> None:
-        source = "def entry():\n    inner()\n\n\ndef inner():\n    raise KeyError\n"
+    def test_the_frames_of_the_project_are_named_with_path_line_and_function(self) -> None:
+        source = f"def {ENTRY}():\n    {INNER}()\n\n\ndef {INNER}():\n    raise KeyError\n"
         classes, frames = self.check(internal_error_line(from_file(OWN, source)))
         self.assertEqual(["builtins.KeyError"], classes)
-        self.assertEqual(["other", "fake_job.py:2:entry", "fake_job.py:6:inner"], frames)
+        self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}", f"{TRACKED}:6:{INNER}"], frames)
 
     def test_every_package_of_the_project_counts_and_nothing_near_it_does(self) -> None:
-        source = "def entry():\n    raise KeyError\n"
         for package in PACKAGES:
+            path = next(item for item in sorted(INVENTORY) if item.startswith(f"{package}/") and INVENTORY[item])
+            name = INVENTORY[path][0]
             with self.subTest(package=package):
-                frames = parts(internal_error_line(from_file(str(ROOT / package / "x.py"), source)))[1]
-                self.assertEqual(["other", "x.py:2:entry"], frames)
+                frames = parts(internal_error_line(from_file(str(ROOT / path), f"def {name}():\n    raise KeyError\n", name)))[1]
+                self.assertEqual(["other", f"{path}:2:{name}"], frames)
+        source = f"def {ENTRY}():\n    raise KeyError\n"
         for filename in (
             str(ROOT / "tests" / "fast" / "x.py"),  # the tests are not a package of the job
             str(ROOT / "spark_extra" / "x.py"),  # the name begins like a package
-            str(ROOT / ".venv" / "lib" / "site-packages" / "spark" / "x.py"),  # a library that has the name of a package
-            str(ROOT.parent / "spark" / "x.py"),  # a folder beside the project
-            "spark/x.py",  # a relative path is no file of the project
+            str(ROOT / ".venv" / "lib" / "site-packages" / TRACKED),  # a library that has the name of a package
+            str(ROOT.parent / TRACKED),  # a folder beside the project
+            TRACKED,  # a relative path is no file of the project
             f"/data/{MARKER}.py",  # a file name of data
             "<string>",
             f"{MARKER}.scala",
@@ -134,17 +145,68 @@ class TheLine(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertEqual(["other"], self.check(internal_error_line(from_file(filename, source)))[1])
 
-    def test_a_file_name_or_function_name_that_is_not_a_name_of_the_project_is_other(self) -> None:
-        for filename in (str(ROOT / "spark" / f"{MARKER}-x.py"), str(ROOT / "spark" / "has space.py"), str(ROOT / "spark" / "x.txt")):
+    def test_a_file_that_the_inventory_does_not_hold_is_other_even_under_a_package_and_with_a_good_name(self) -> None:
+        source = f"def {ENTRY}():\n    raise KeyError\n"
+        for relative in (
+            f"spark/{MARKER}.py",  # a generated file name under spark/
+            "spark/generated_by_a_job.py",  # a name of the right form that no tracked file has
+            f"spark/{MARKER}-x.py",
+            "spark/has space.py",
+            "spark/result_file.txt",
+            "spark/x.py",
+            f"spark/jobs/{MARKER}.py",
+            "spark/../tests/fast/x.py",
+            f"spark/../{MARKER}.py",
+            f"spark/../../{MARKER}.py",
+            "spark/../../../../etc/x.py",
+            "spark/.hidden/x.py",
+        ):
+            with self.subTest(relative=relative):
+                self.assertEqual(["other"], self.check(internal_error_line(from_file(str(ROOT / relative), source)))[1])
+
+    def test_a_path_that_resolves_as_text_to_a_file_of_the_inventory_is_that_file(self) -> None:
+        source = f"def {ENTRY}():\n    raise KeyError\n"
+        for filename in (f"{ROOT}/spark/../{TRACKED}", f"{ROOT}/./{TRACKED}", f"{ROOT}//{TRACKED}"):
             with self.subTest(filename=filename):
-                self.assertEqual(["other"], self.check(internal_error_line(from_file(filename, "def entry():\n    raise KeyError\n")))[1])
-        for name in (f"{MARKER}-x", "has space", "a;b", "x" * 101, "é"):
+                self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}"], self.check(internal_error_line(from_file(filename, source)))[1])
+
+    def test_a_function_name_that_the_inventory_does_not_hold_for_that_file_is_other(self) -> None:
+        for name in (f"{MARKER}_function", FOREIGN, "has space", "a;b", "x" * 101, "é", "", "<string>", "<genexpr> ", ENTRY + "_"):
             with self.subTest(name=name):
-                code = compile("def entry():\n    raise KeyError\n", OWN, "exec")
                 scope: dict[str, Any] = {}
-                exec(code, scope)  # noqa: S102
-                function = types.FunctionType(scope["entry"].__code__.replace(co_name=name), scope)
+                exec(compile(f"def {ENTRY}():\n    raise KeyError\n", OWN, "exec"), scope)  # noqa: S102
+                function = types.FunctionType(
+                    scope[ENTRY].__code__.replace(co_name=name), scope
+                )  # the name is made at run time, the file name is a tracked one
                 self.assertEqual(["other"], self.check(internal_error_line(caught(function)))[1])
+
+    def test_the_fixed_names_of_code_without_a_function_are_named_in_a_file_of_the_inventory(self) -> None:
+        source = f"def {ENTRY}():\n    return list(1 / n for n in [0])\n"
+        frames = self.check(internal_error_line(from_file(OWN, source)))[1]
+        self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}", f"{TRACKED}:2:<genexpr>"], frames)
+        scope: dict[str, Any] = {}
+        exec(compile("run = lambda: 1 / 0\n", OWN, "exec"), scope)  # noqa: S102
+        self.assertEqual(["other", f"{TRACKED}:1:<lambda>"], self.check(internal_error_line(caught(scope["run"])))[1])
+
+    def test_a_line_number_is_a_whole_number_in_range_printed_in_its_one_form(self) -> None:
+        self.assertEqual(f"{TRACKED}:5:{ENTRY}", diagnostic.frame_label(OWN, 5, ENTRY))
+        self.assertEqual(f"{TRACKED}:0:{ENTRY}", diagnostic.frame_label(OWN, 0, ENTRY))
+        self.assertEqual(f"{TRACKED}:9999999:{ENTRY}", diagnostic.frame_label(OWN, diagnostic.LINE_LIMIT, ENTRY))
+        for line in (-1, diagnostic.LINE_LIMIT + 1, True, 5.0, "5", None):
+            with self.subTest(line=line):
+                self.assertEqual("other", diagnostic.frame_label(OWN, line, ENTRY))
+        for filename in (OWN.encode(), None, 5):
+            with self.subTest(filename=filename):
+                self.assertEqual("other", diagnostic.frame_label(filename, 1, ENTRY))
+        self.assertEqual("other", diagnostic.frame_label(OWN, 1, None))
+
+    def test_a_str_that_is_a_subclass_or_is_too_long_is_other(self) -> None:
+        class Text(str):
+            """A str whose methods could run code."""
+
+        self.assertEqual("other", diagnostic.frame_label(Text(OWN), 1, ENTRY))
+        self.assertEqual("other", diagnostic.frame_label(OWN, 1, Text(ENTRY)))
+        self.assertEqual("other", diagnostic.frame_label(OWN + "/" * 5000, 1, ENTRY))
 
     def test_a_function_that_was_compiled_from_a_text_is_other(self) -> None:
         source = f"def {MARKER}():\n    raise KeyError\n"
@@ -160,17 +222,17 @@ class TheLine(unittest.TestCase):
         self.assertEqual((["builtins.ValueError"], ["other"]), (classes, frames))
 
     def test_a_run_of_other_frames_is_one_and_the_project_frames_between_stay(self) -> None:
-        source = "def entry():\n    callback()\n"
+        source = f"def {ENTRY}():\n    callback()\n"
         scope: dict[str, Any] = {"callback": lambda: (_ for _ in ()).throw(KeyError())}
         exec(compile(source, OWN, "exec"), scope)  # noqa: S102
-        _, frames = self.check(internal_error_line(caught(scope["entry"])))
-        self.assertEqual(["other", "fake_job.py:2:entry", "other"], frames)
+        _, frames = self.check(internal_error_line(caught(scope[ENTRY])))
+        self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}", "other"], frames)
 
     def test_the_frames_are_cut_at_forty_with_the_innermost_last(self) -> None:
-        source = "def entry(depth=200):\n    if depth == 0:\n        raise RuntimeError\n    entry(depth - 1)\n"
+        source = f"def {ENTRY}(depth=200):\n    if depth == 0:\n        raise RuntimeError\n    {ENTRY}(depth - 1)\n"
         _, frames = self.check(internal_error_line(from_file(OWN, source)))
         self.assertEqual(FRAME_LIMIT, len(frames))
-        self.assertEqual("fake_job.py:3:entry", frames[-1])
+        self.assertEqual(f"{TRACKED}:3:{ENTRY}", frames[-1])
         self.assertNotIn("other", frames)
 
     def test_an_error_that_was_never_raised_has_a_class_and_no_frames(self) -> None:
@@ -240,6 +302,59 @@ class TheClasses(unittest.TestCase):
                 raise RuntimeError(MARKER)
 
         self.assertEqual("internal_error class=other frames=", internal_error_line(Hostile(MARKER)))
+
+    def test_no_hook_of_a_metaclass_or_a_class_attribute_runs_when_the_lists_are_read(self) -> None:
+        calls: list[str] = []
+
+        class Hooked(type):
+            def __subclasscheck__(cls, other: Any) -> bool:
+                calls.append("subclasscheck")
+                return True
+
+            def __instancecheck__(cls, other: Any) -> bool:
+                calls.append("instancecheck")
+                return True
+
+            def __hash__(cls) -> int:
+                calls.append("hash")
+                return 1
+
+            def __eq__(cls, other: object) -> bool:
+                calls.append("eq")
+                return True
+
+        class Trap:
+            """An object in the module of a library whose class can be asked for."""
+
+            @property  # type: ignore[misc]
+            def __class__(self) -> Any:
+                calls.append("class")
+                return type
+
+            def __bases__(self) -> Any:
+                calls.append("bases")
+
+        errors = types.ModuleType("pyspark.errors")
+        base = Hooked("PySparkException", (Exception,), {})
+        errors.PySparkException = base  # type: ignore[attr-defined]
+        errors.AnalysisException = Hooked("AnalysisException", (base,), {})  # type: ignore[attr-defined]
+        errors.ParseException = Trap()  # type: ignore[attr-defined]
+        protocol = types.ModuleType("py4j.protocol")
+        protocol.Py4JJavaError = Trap()  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"pyspark.errors": errors, "py4j.protocol": protocol}):
+            self.assertEqual(["pyspark.errors.AnalysisException"], self.classes_of(errors.AnalysisException()))
+            self.assertEqual(["pyspark.errors.PySparkException"], self.classes_of(base()))
+            self.assertEqual(["builtins.ValueError"], self.classes_of(ValueError(MARKER)))
+            self.assertEqual(["other"], self.classes_of(Hooked(MARKER, (Exception,), {})(MARKER)))  # a class of data with the same hooks
+        self.assertEqual([], calls)
+
+    def test_a_class_that_claims_another_class_is_the_class_that_it_is(self) -> None:
+        class Liar(Exception):
+            @property  # type: ignore[misc]
+            def __class__(self) -> Any:
+                return ValueError
+
+        self.assertEqual(["other"], self.classes_of(Liar(MARKER)))
 
     def test_a_class_of_the_project_is_named_by_its_module(self) -> None:
         from scripts.stack.nessie import NessieError
@@ -314,13 +429,13 @@ class TheClasses(unittest.TestCase):
 
 class TheFallback(unittest.TestCase):
     def test_a_source_loader_that_raises_does_not_stop_the_line(self) -> None:
-        source = "def entry():\n    raise KeyError\n"
+        source = f"def {ENTRY}():\n    raise KeyError\n"
         line = internal_error_line(from_file(OWN, source, loader=RaisingLoader()))
-        self.assertEqual("internal_error class=builtins.KeyError frames=other | fake_job.py:2:entry", line)
+        self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:2:{ENTRY}", line)
 
     def test_no_source_line_of_any_file_is_read(self) -> None:
         with mock.patch("linecache.getlines", side_effect=AssertionError("a source line was read")) as read, mock.patch("linecache.getline", read):
-            self.assertTrue(diagnostic.is_diagnostic(internal_error_line(from_file(OWN, "def entry():\n    raise KeyError\n"))))
+            self.assertTrue(diagnostic.is_diagnostic(internal_error_line(from_file(OWN, f"def {ENTRY}():\n    raise KeyError\n"))))
 
     def test_any_failure_of_the_formatter_is_the_fixed_line_and_never_an_error(self) -> None:
         self.assertEqual("internal_error class=unavailable frames=unavailable", diagnostic.UNAVAILABLE_LINE)

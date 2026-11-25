@@ -8,8 +8,13 @@ from typing import Any
 
 from spark import internal_diagnostic
 from spark.internal_diagnostic import is_diagnostic
+from spark.internal_inventory import INVENTORY
 
-OWN_FILE = str(Path(internal_diagnostic.__file__).parent / "fake_job.py")  # a file of a package of the project that does not exist
+ROOT = Path(internal_diagnostic.__file__).resolve().parent.parent
+TRACKED = "spark/result_file.py"  # a tracked file of the project, standing in for a module of a job
+OWN_FILE = str(ROOT / TRACKED)
+ENTRY = sorted(INVENTORY[TRACKED])[0]  # a name that the inventory holds for that file
+ENTRY_FRAME = f"{TRACKED}:2:{ENTRY}"  # the frame of ``def ENTRY(): raise KeyError`` in the second line
 
 
 def split_lines(err: str, job: str) -> tuple[list[str], list[str]]:
@@ -43,9 +48,9 @@ class RaisingLoader:
 def error_with_raising_loader() -> KeyError:
     """An error that was raised in a frame of a project file whose module has a source loader that raises."""
     scope: dict[str, Any] = {"__name__": "fake_job", "__loader__": RaisingLoader()}
-    exec(compile("def entry():\n    raise KeyError\n", OWN_FILE, "exec"), scope)  # noqa: S102 (a stand-in for a module of the project)
+    exec(compile(f"def {ENTRY}():\n    raise KeyError\n", OWN_FILE, "exec"), scope)  # noqa: S102 (a stand-in for a module of the project)
     try:
-        scope["entry"]()
+        scope[ENTRY]()
     except KeyError as error:
         return error
     raise AssertionError("no error")

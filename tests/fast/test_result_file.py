@@ -42,7 +42,7 @@ from scripts.stack.nessie import NessieError
 from spark import result_file
 from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, release_reserved, reserve, result_path, run_sealed, write_reserved
 from spark.settings import SettingsError
-from tests.fast.internal_line_support import assert_internal, error_with_raising_loader
+from tests.fast.internal_line_support import ENTRY_FRAME, assert_internal, error_with_raising_loader
 
 DOCUMENT = {"job": "j", "passed": True, "diagnostics": []}
 
@@ -361,7 +361,7 @@ class Sealed(unittest.TestCase):
         code, out, err = sealed(self.argv, raising(error))
         self.assertEqual((70, ""), (code, out))
         frames = assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.KeyError",), "the loader failed")
-        self.assertEqual("fake_job.py:2:entry", frames[-1])
+        self.assertEqual(ENTRY_FRAME, frames[-1])
         self.assertEqual({"mode": "verify", "branch": "b", "job": JOB, "diagnostics": [{"code": "internal_error"}]}, self.written())
 
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_result_line(self) -> None:

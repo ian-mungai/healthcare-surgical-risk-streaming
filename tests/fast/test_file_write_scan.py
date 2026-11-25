@@ -233,6 +233,10 @@ OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "The export folder of the run, which the export command made and export_problem checks; the name is the fixed receipt.json",
     ),
+    ("scripts/quality/internal_inventory.py", "write", "folder"): (
+        1,
+        "The folder of the generated inventory: the root of the checkout joined with the fixed FOLDER. The file name is the fixed MODULE",
+    ),
     ("scripts/quality/install_tools.py", "settle", "tool.folder"): (
         1,
         "The folder of a pinned tool: the module constant TOOLS plus the folder part of the tool's pinned target",

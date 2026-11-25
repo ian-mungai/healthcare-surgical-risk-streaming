@@ -8,16 +8,23 @@ and nothing that it holds: ``internal_error class=<a> <- <b> frames=<f1> | <f2>`
 - ``class`` is the chain of the error (the cause, else the context, at most ``CLASS_LIMIT`` of them, ending at an error that it has seen). A class is named
   only when it is on a fixed list and is that very class (found by ``id``, never by name): the exception classes of ``builtins``, the library classes and
   the classes of the project's own packages (``spark/internal_classes.py``). Every other class is the word ``other``. No ``__name__``, ``__module__`` or
-  attribute of an error class is read, and the cause and the context are read from the slots of ``BaseException``, so no property of an error runs.
+  attribute of an error class is read, and the cause and the context are read from the slots of ``BaseException``, so no property of an error runs. A class
+  is found with ``type()`` and the ``__mro__`` slot of each class: ``isinstance`` and ``issubclass`` are never used on a class that a library or an error
+  owns, because they run its ``__class__``, ``__instancecheck__`` and ``__subclasscheck__``.
 - ``frames`` is the traceback of the first error, the last ``FRAME_LIMIT`` of them, the innermost last. The walk follows ``tb_next`` and reads the code
   object of each frame directly: no source line is read (``traceback`` and ``linecache`` are not used, so a source loader never runs). A frame is
-  ``file-basename:line:function`` only when its file name begins with a folder of one of the project's packages (a comparison of text, no file system call)
-  and the basename and the function have the form of a name of the project's code. Every other frame is the word ``other``, and a run of them is one.
+  ``path:line:function`` (the path from the root of the project, as in ``spark/result_file.py``) only when its file name, with ``..`` resolved as text, is
+  exactly the root of the project and a path of the fixed inventory of tracked code (``spark/internal_inventory.py``, which
+  ``scripts/quality/internal_inventory.py`` generates and a fast test checks against ``git ls-files`` and the AST of each file) and its function is a name
+  that the inventory holds for that file (or one of ``FIXED_NAMES``). The line is a whole number from 0 to ``LINE_LIMIT``, printed with no leading zero.
+  Every other frame is the word ``other``, and a run of them is one: a name that data can build (a generated file name, a function compiled at run time) is
+  never in the inventory.
 - Any failure of the formatter gives the fixed line ``internal_error class=unavailable frames=unavailable``. The function never raises, so it cannot change
   the exit code of a job or skip its result write.
 
 The same module holds the grammar of the line (``is_diagnostic``, ``accepted_diagnostics``), which the runners of the end-to-end checks import, so the producer
-and the readers cannot differ. It imports no Spark and no project module (other than the lists in ``spark/internal_classes.py``), so every job can use it.
+and the readers cannot differ: a reader checks each frame against the same inventory and takes only one diagnostic for each invocation. It imports no Spark
+and no project module (other than the lists in ``spark/internal_classes.py`` and the inventory), so every job can use it.
 """
 
 from __future__ import annotations
@@ -28,14 +35,16 @@ import re
 import sys
 import types
 from collections.abc import Sequence
+from typing import cast
 
-from spark.internal_classes import LIBRARY_CLASSES, PACKAGES, PROJECT_CLASSES, PYSPARK_CLASSES, PYSPARK_MODULE
+from spark.internal_classes import LIBRARY_CLASSES, NAME_LIMIT, PATH_LIMIT, PROJECT_CLASSES, PYSPARK_CLASSES, PYSPARK_MODULE
+from spark.internal_inventory import INVENTORY
 
 CLASS_LIMIT = 5
 FRAME_LIMIT = 40
-NAME_LIMIT = 100
 WALK_LIMIT = 100_000
 LINE_LIMIT = 9_999_999
+ROOT_LIMIT = 4_096  # a file name longer than this is never a path of the project
 INTERNAL_EXIT_CODE = 70
 OTHER = "other"
 UNAVAILABLE = "unavailable"
@@ -43,24 +52,34 @@ UNAVAILABLE_LINE = f"internal_error class={UNAVAILABLE} frames={UNAVAILABLE}"
 # The fixed lines that the jobs write directly before the diagnostic line: the bare code, and the code with the flag of the sealed jobs.
 CODE_LINES = ("internal_error", "internal_error: failed")
 
-# The folders of the project's packages, as text (the root is the folder above ``spark``).
-ROOT = os.path.dirname(os.path.dirname(__file__))
-PREFIXES = tuple(f"{ROOT}{os.sep}{package}{os.sep}" for package in PACKAGES)
+# The root of the project (the folder above ``spark``) with ``..`` resolved as text, and its slash. A frame file is this root plus a path of the inventory.
+ROOT = os.path.normpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PREFIX = f"{ROOT}/"
 
-BASENAME = re.compile(rf"[A-Za-z0-9_]{{1,{NAME_LIMIT - 4}}}\.py")
-FUNCTION = re.compile(rf"(?:[A-Za-z_][A-Za-z0-9_]{{0,{NAME_LIMIT - 1}}}|<module>|<lambda>|<listcomp>|<dictcomp>|<setcomp>|<genexpr>)")
+# The names of code that has no function of its own, and so no entry in the inventory.
+FIXED_NAMES = ("<module>", "<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>")
+FILES: dict[str, frozenset[str]] = {path: frozenset(names) for path, names in INVENTORY.items()}
 
-# The slots of ``BaseException``, read without running any property that an error class may define.
+# The slots of ``BaseException`` and ``type``, read without running any property or hook that a class or an error may define.
 _TRACEBACK = BaseException.__dict__["__traceback__"]
 _CAUSE = BaseException.__dict__["__cause__"]
 _CONTEXT = BaseException.__dict__["__context__"]
+_MRO = type.__dict__["__mro__"]
+
+
+def mro_of(kind: type) -> tuple[type, ...]:
+    """The method resolution order of the class ``kind``, from its slot: no ``__mro__`` property and no ``__subclasscheck__`` of a metaclass runs."""
+    found: tuple[type, ...] = _MRO.__get__(kind)
+    return found
+
+
+def is_exception_class(item: object) -> bool:
+    """Whether ``item`` is a class that derives from ``BaseException``, by ``type(item)`` and the ``__mro__`` slots: never ``isinstance`` or ``issubclass``."""
+    return any(base is type for base in mro_of(type(item))) and any(base is BaseException for base in mro_of(cast(type, item)))
+
 
 # An alias (``IOError`` is ``OSError``) keeps the name of the class.
-BUILTIN_CLASSES = {
-    id(item): f"builtins.{name}"
-    for name, item in vars(builtins).items()
-    if isinstance(item, type) and issubclass(item, BaseException) and item.__name__ == name
-}
+BUILTIN_CLASSES = {id(item): f"builtins.{name}" for name, item in vars(builtins).items() if is_exception_class(item) and item.__name__ == name}
 
 
 def trusted_classes() -> dict[int, str]:
@@ -76,18 +95,18 @@ def trusted_classes() -> dict[int, str]:
     if base is not None:
         for name in PYSPARK_CLASSES:
             found = module_class(PYSPARK_MODULE, name)
-            if found is not None and issubclass(found, base):
+            if found is not None and any(parent is base for parent in mro_of(found)):
                 table.setdefault(id(found), f"{PYSPARK_MODULE}.{name}")
     return table
 
 
 def module_class(module_name: str, name: str) -> type[BaseException] | None:
-    """The exception class ``name`` in the dictionary of a loaded module (no import and no module ``__getattr__``), or none."""
+    """The exception class ``name`` in the dictionary of a loaded module (no import, no module ``__getattr__`` and no hook of the class), or none."""
     module = sys.modules.get(module_name)
     if type(module) is not types.ModuleType:
         return None
     found = module.__dict__.get(name)
-    return found if isinstance(found, type) and issubclass(found, BaseException) else None
+    return found if is_exception_class(found) else None
 
 
 def class_chain(error: BaseException) -> list[str]:
@@ -111,13 +130,16 @@ def traceback_of(error: BaseException) -> types.TracebackType | None:
 
 
 def frame_label(filename: object, line: object, name: object) -> str:
-    """``file-basename:line:function`` of a frame of the project's packages, else ``other``. The three values come from a code object and a traceback."""
-    if type(filename) is not str or type(line) is not int or type(name) is not str or not 0 <= line <= LINE_LIMIT:
+    """``path:line:function`` of a frame of the inventory, else ``other``. The three values come from a code object and a traceback: the path (``..``
+    resolved as text) must be exactly the root of the project and a path of the inventory, and the function a name that the inventory holds for it."""
+    if type(filename) is not str or type(line) is not int or type(name) is not str or not 0 <= line <= LINE_LIMIT or len(filename) > ROOT_LIMIT:
         return OTHER
-    if not filename.startswith(PREFIXES):
+    path = os.path.normpath(filename)
+    if not path.startswith(PREFIX):
         return OTHER
-    base = filename[filename.rfind(os.sep) + 1 :]
-    return f"{base}:{line}:{name}" if BASENAME.fullmatch(base) and FUNCTION.fullmatch(name) else OTHER
+    relative = path[len(PREFIX) :]
+    names = FILES.get(relative)
+    return f"{relative}:{line}:{name}" if names is not None and (name in names or name in FIXED_NAMES) else OTHER
 
 
 def frames_of(error: BaseException) -> list[str]:
@@ -150,28 +172,45 @@ def _any_of(names: Sequence[str]) -> str:
 
 
 CLASS_TOKEN = _any_of([*BUILTIN_CLASSES.values(), *PROJECT_CLASSES, *LIBRARY_CLASSES, *(f"{PYSPARK_MODULE}.{name}" for name in PYSPARK_CLASSES), OTHER])
-FRAME_TOKEN = rf"(?:[A-Za-z0-9_]{{1,{NAME_LIMIT - 4}}}\.py:[0-9]{{1,7}}:{FUNCTION.pattern}|{OTHER})"
+NUMBER = r"(?:0|[1-9][0-9]{0,6})"  # a whole number up to LINE_LIMIT with no leading zero (a digit of another script is not in [0-9])
+FRAME_BODY = rf"(?P<path>[A-Za-z0-9_/]{{1,{PATH_LIMIT}}}\.py):(?P<line>{NUMBER}):(?P<name>[A-Za-z_<][A-Za-z0-9_>]{{0,{NAME_LIMIT + 1}}})"
+FRAME = re.compile(FRAME_BODY)
+FRAME_TOKEN = rf"(?:{FRAME_BODY.replace('?P<path>', '').replace('?P<line>', '').replace('?P<name>', '')}|{OTHER})"
 CLASSES = rf"{CLASS_TOKEN}(?: <- {CLASS_TOKEN}){{0,{CLASS_LIMIT - 1}}}"
 FRAMES = rf"{FRAME_TOKEN}(?: \| {FRAME_TOKEN}){{0,{FRAME_LIMIT - 1}}}"
 LINE = re.compile(rf"internal_error class=(?P<classes>{CLASSES}) frames=(?P<frames>{FRAMES})?")
 
 
+def is_frame(token: str) -> bool:
+    """Whether ``token`` is a frame that ``frame_label`` can return: its path is in the inventory in the form that it prints and its function is a name of that
+    file or a fixed name."""
+    matched = FRAME.fullmatch(token)
+    if matched is None:
+        return False
+    names = FILES.get(matched["path"])
+    return names is not None and (matched["name"] in names or matched["name"] in FIXED_NAMES)
+
+
 def is_diagnostic(text: str) -> bool:
     """Whether ``text`` (a line without the name of the job) is a line that ``internal_error_line`` can return, and nothing else: the fixed unavailable line,
-    or at most five class labels of the lists and at most forty frames, no two ``other`` frames side by side."""
+    or at most five class labels of the lists and at most forty frames, each ``other`` or a frame of the inventory, no two ``other`` frames side by side."""
     if text == UNAVAILABLE_LINE:
         return True
     matched = LINE.fullmatch(text)
     if matched is None:
         return False
     frames = matched["frames"].split(" | ") if matched["frames"] else []
-    return not any(first == OTHER and second == OTHER for first, second in zip(frames, frames[1:], strict=False))
+    if any(first == OTHER and second == OTHER for first, second in zip(frames, frames[1:], strict=False)):
+        return False
+    return all(frame == OTHER or is_frame(frame) for frame in frames)
 
 
 def accepted_diagnostics(bodies: Sequence[str], exit_code: int) -> frozenset[int]:
     """The places in ``bodies`` (the lines of one job's standard error that carry its name, without the name, in order) of the lines that are a diagnostic of
-    an ``internal_error``: only when the job ended with exit code 70, only the line directly after a fixed ``internal_error`` line, and only of the form of
-    ``is_diagnostic``. A second diagnostic line, or one after another code, is not one."""
+    an ``internal_error``: only when the job ended with exit code 70, only the line directly after a fixed ``internal_error`` line, only of the form of
+    ``is_diagnostic``, and only when it is the one such pair of the invocation. A second diagnostic line, one after another code, or a second complete pair
+    (a code line and its diagnostic) makes none of them one: a job writes one."""
     if exit_code != INTERNAL_EXIT_CODE:
         return frozenset()
-    return frozenset(place for place in range(1, len(bodies)) if bodies[place - 1] in CODE_LINES and is_diagnostic(bodies[place]))
+    places = frozenset(place for place in range(1, len(bodies)) if bodies[place - 1] in CODE_LINES and is_diagnostic(bodies[place]))
+    return places if len(places) <= 1 else frozenset()

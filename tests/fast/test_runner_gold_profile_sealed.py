@@ -33,6 +33,7 @@ from unittest import mock
 from spark import split_table
 from spark.internal_diagnostic import internal_error_line
 from tests.e2e.run_record import Record
+from tests.fast.internal_line_support import ENTRY_FRAME
 from tests.fast.test_runner_gold_sealed import healthy_result, runner, texts
 from tests.fast.test_runner_setup_builds import stand_in_stack
 
@@ -370,11 +371,11 @@ class ProfileDroppedSteps(unittest.TestCase):
         job = ["-m", "spark.jobs.signal_profile"]
         code, diagnostic = (
             "signal_profile: internal_error\n",
-            "signal_profile: internal_error class=builtins.KeyError <- builtins.OSError frames=other | cli.py:63:run | q.py:9:go\n",
+            f"signal_profile: internal_error class=builtins.KeyError <- builtins.OSError frames=other | {ENTRY_FRAME} | {ENTRY_FRAME}\n",
         )
         self.assertEqual((["signal_profile: internal_error"], 0), self.module.Stack.known_lines(job, code + diagnostic, 70))
         for text in (
-            "signal_profile: internal_error class=builtins.KeyError frames=a.py:1:f text\n",
+            f"signal_profile: internal_error class=builtins.KeyError frames={ENTRY_FRAME} text\n",
             "signal_profile: internal_error class=a: b frames=\n",
             "signal_profile: internal_error class=" + "C" * 121 + " frames=\n",
             "signal_profile: internal_error class=builtins.NotAClass frames=\n",
@@ -387,7 +388,7 @@ class ProfileDroppedSteps(unittest.TestCase):
     def test_a_diagnostic_line_is_dropped_and_counted_on_any_exit_code_but_70_and_anywhere_but_after_the_code(self) -> None:
         job = ["-m", "spark.jobs.signal_profile"]
         code = "signal_profile: internal_error\n"
-        line = "signal_profile: internal_error class=builtins.KeyError frames=a.py:1:f\n"
+        line = f"signal_profile: internal_error class=builtins.KeyError frames={ENTRY_FRAME}\n"
         for status in (0, 1, 2, 137):
             with self.subTest(status=status):
                 self.assertEqual((["signal_profile: internal_error"], 1), self.module.Stack.known_lines(job, code + line, status))
