@@ -113,10 +113,12 @@ services:
     runtime: k3s
     group: ingestion
     memory_limit_mib: 1024
+  # The connector sidecar of a check, discover or sync pod was OOMKilled at 256 MiB during the source-s3 discover on the live host (Nov 24 2026); 512 MiB
+  # matches the check and discover containers and is to be measured on the host's next connection step.
   airbyte_job_sidecar:
     runtime: k3s
     group: ingestion
-    memory_limit_mib: 256
+    memory_limit_mib: 512
   kafka:
     runtime: compose
     group: supporting

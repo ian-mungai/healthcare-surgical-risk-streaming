@@ -74,10 +74,9 @@ def shares_place(path: str | Path, folder: str | Path) -> bool:
 
 
 def written_into(path: str | Path, folder: str | Path) -> bool:
-    """Whether a write of ``path`` by ``replace_owned_file`` lands in ``folder`` or below it, or lands in the place that ``path`` links to.
+    """Whether ``path`` is placed in ``folder`` or below it, judged both by the resolved folder that holds ``path`` and by the resolved ``path`` itself.
 
-    The write makes a temporary file beside ``path`` and renames it over ``path``, so a link in ``path`` is replaced by the file and the place that counts is
-    the resolved folder that holds ``path``, not where the link points.
-    The place that a link ``path`` points to counts too: a reader or an appender gets there."""
+    The writer (``replace_owned_file``) refuses a link in the place of ``path`` and never follows it, so a write lands only in the folder that holds it; a
+    reader or an appender follows a link, so the place that ``path`` resolves to is checked too."""
     spelled = absolute(path)
     return inside(spelled.parent, folder) or inside(spelled, folder)
