@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,7 +70,22 @@ CAP_NAMES = {
 }
 
 
-def render(folder: Path) -> list[dict[str, Any]]:
+POST_RENDERER = ROOT / "ansible" / "roles" / "airbyte" / "files" / "recreate_post_renderer.py"
+
+
+def post_renderer_arguments(folder: Path) -> list[str]:
+    """The Helm arguments that run the role's post-renderer the way the role does: its release name and its comma-separated list of deployments.
+
+    A wrapper program runs the script with the project's Python in isolated mode, because the script's own interpreter line names the host's interpreter.
+    """
+    wrapper = folder / "post_renderer.sh"
+    wrapper.write_text(f'#!/bin/sh\nexec "{ROOT / ".venv" / "bin" / "python"}" -I "{POST_RENDERER}" "$@"\n')
+    wrapper.chmod(stat.S_IRWXU)
+    names = ",".join(group_variables()["airbyte_recreate_deployments"])
+    return ["--post-renderer", str(wrapper), "--post-renderer-args", "airbyte", "--post-renderer-args", names]
+
+
+def render(folder: Path, post_render: bool = False) -> list[dict[str, Any]]:
     limits = run_command(str(ROOT / ".venv" / "bin" / "python"), ["-m", "scripts.stack.k3s_limits", "values"], cwd=ROOT, timeout=60, check=True)
     (folder / "limits.values.yaml").write_text(limits.stdout)
     (folder / "host.values.yaml").write_text(HOST_VALUES)
@@ -87,6 +103,7 @@ def render(folder: Path) -> list[dict[str, Any]]:
             str(folder / "limits.values.yaml"),
             "--values",
             str(folder / "host.values.yaml"),
+            *(post_renderer_arguments(folder) if post_render else []),
         ],
         timeout=120,
     )
@@ -127,6 +144,7 @@ def effective_environment(container: dict[str, Any], config_maps: dict[str, dict
 @unittest.skipUnless(ARCHIVE and HELM, WHY_SKIPPED)
 class RenderedReleaseTest(unittest.TestCase):
     documents: list[dict[str, Any]]
+    post_rendered: list[dict[str, Any]]
     config_maps: dict[str, dict[str, str]]
 
     @classmethod
@@ -136,6 +154,7 @@ class RenderedReleaseTest(unittest.TestCase):
             raise AssertionError("the chart archive does not match airbyte_chart_sha256 of ansible/group_vars/all.yml")
         with tempfile.TemporaryDirectory() as scratch:
             cls.documents = render(Path(scratch))
+            cls.post_rendered = render(Path(scratch), post_render=True)
         cls.config_maps = {item["metadata"]["name"]: item.get("data", {}) for item in cls.documents if item["kind"] == "ConfigMap"}
 
     def workloads(self) -> dict[str, dict[str, Any]]:
@@ -186,3 +205,46 @@ class RenderedReleaseTest(unittest.TestCase):
             if document["kind"] == "Deployment" and document["spec"].get("strategy", {}).get("type") != "Recreate":
                 rolling.add(name.removeprefix("airbyte-"))
         self.assertEqual(rolling, set(group_variables()["airbyte_recreate_deployments"]))
+
+    def deployments(self, documents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {item["metadata"]["name"]: item for item in documents if item["kind"] == "Deployment"}
+
+    def test_the_post_rendered_release_gives_each_deployment_that_holds_connections_the_recreate_strategy_and_nothing_else_changes(self) -> None:
+        """The upgrade patch that Helm computes comes from these manifests, and a later rollback applies them, so the strategy is Recreate in the manifest."""
+        before, after = self.deployments(self.documents), self.deployments(self.post_rendered)
+        listed = {f"airbyte-{name}" for name in group_variables()["airbyte_recreate_deployments"]}
+        self.assertEqual(set(before), set(after))
+        for name, document in after.items():
+            with self.subTest(name=name):
+                if name in listed:
+                    self.assertEqual({"type": "Recreate"}, document["spec"]["strategy"])
+                    changed = {**document, "spec": {key: value for key, value in document["spec"].items() if key != "strategy"}}
+                    original = {**before[name], "spec": {key: value for key, value in before[name]["spec"].items() if key != "strategy"}}
+                    self.assertEqual(original, changed, "only the strategy differs from the chart's own manifest")
+                else:
+                    self.assertEqual(before[name], document)
+        others = [item for item in self.documents if item["kind"] != "Deployment"]
+        self.assertEqual(others, [item for item in self.post_rendered if item["kind"] != "Deployment"])
+
+    def test_every_deployment_of_a_database_pod_is_recreate_after_the_post_renderer_and_every_listed_one_names_its_replicas(self) -> None:
+        """A rolled-back release restores the replicas that its manifest states, so each listed deployment states one: the role scales them to zero first."""
+        after = self.deployments(self.post_rendered)
+        for name, _ in WORKLOADS.values():
+            if name in after:
+                with self.subTest(name=name):
+                    self.assertEqual("Recreate", after[name]["spec"]["strategy"]["type"])
+                    self.assertNotIn("rollingUpdate", after[name]["spec"]["strategy"])
+        for name in group_variables()["airbyte_recreate_deployments"]:
+            with self.subTest(listed=name):
+                self.assertGreaterEqual(after[f"airbyte-{name}"]["spec"]["replicas"], 1)
+
+    def test_each_listed_deployments_selector_labels_select_only_its_own_pods(self) -> None:
+        """The role waits for a deployment's pods to go with the deployment's own selector, which must name something that the pod template carries."""
+        after = self.deployments(self.post_rendered)
+        for name in group_variables()["airbyte_recreate_deployments"]:
+            document = after[f"airbyte-{name}"]
+            selector = document["spec"]["selector"]["matchLabels"]
+            with self.subTest(name=name):
+                self.assertTrue(selector)
+                self.assertEqual(name, selector["airbyte"])
+                self.assertLessEqual(selector.items(), document["spec"]["template"]["metadata"]["labels"].items())

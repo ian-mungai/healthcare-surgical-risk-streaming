@@ -15,7 +15,8 @@
 # budget reserves for them. A pool that a setting can cap has no allotment. A setting with count 0
 # holds no connection (an idle-pool figure that must not exceed its maximum, or a switch with the value false that keeps a thread pool off) and is checked only for its value. The margin is for the administrator's own sessions,
 # the provisioning step, the health checks and the one-shot schema setup of Temporal. A restart does not overlap an old and a new pod of a client: the role gives
-# every Airbyte deployment that holds connections the Recreate strategy (ansible/roles/airbyte/tasks/release.yml), and Compose stops a container before it starts the new one.
+# every Airbyte deployment that holds connections the Recreate strategy in the manifests of the upgrade (the post-renderer ansible/roles/airbyte/files/recreate_post_renderer.py) and scales
+# them to zero before a rollback (ansible/roles/airbyte/tasks/scale_down.yml), and Compose stops a container before it starts the new one.
 postgres:
   max_connections: 100
   superuser_reserved_connections: 3

@@ -1,5 +1,5 @@
-# Reads airbyte_directory, airbyte_chart_version, airbyte_chart_sha256, airbyte_namespace, airbyte_release, airbyte_kubeconfig and
-# airbyte_release_deadline_seconds. The release is installed or upgraded only when it is not deployed or when the chart or a values file changed since the
+# Reads airbyte_directory, airbyte_chart_version, airbyte_chart_sha256, airbyte_namespace, airbyte_release, airbyte_kubeconfig, airbyte_recreate_deployments,
+# airbyte_scale_down_deadline_seconds and airbyte_release_deadline_seconds. The release is installed or upgraded only when it is not deployed or when the chart or a values file changed since the
 # last success, so a second run starts no migration and changes nothing. A failure shows each pod's phase and why it waits, and never a log or a value. A run
 # that was stopped inside Helm leaves the release with an operation pending, and Helm refuses to install over it. Before the decision, a pending upgrade or
 # rollback is rolled back to the last deployed revision and a pending first install, or an uninstall that did not finish, is uninstalled (Helm keeps the
@@ -11,6 +11,9 @@
 # of the six Helm commands has no_log, because the host launcher inherits ANSIBLE_VERBOSITY and Ansible prints each task's result from verbosity 1; a Helm
 # command that fails stops the run with fixed text naming the status and the step, which stays visible. A status read decides only when it succeeded or Helm
 # said "release: not found" (the release is absent); any other error stops the run.
+# The deployments that hold database connections never run an old and a new pod together: the upgrade passes the chart's manifests through the post-renderer of the
+# role (files/recreate_post_renderer.py, placed beside the values files), which gives each the Recreate strategy in the manifest that Helm applies and stores, and a
+# rollback, which has no post-renderer and applies older manifests, comes after those deployments were scaled to zero and their pods are gone (scale_down.yml).
 - name: Read the checksum of each values file
   ansible.builtin.stat:
     path: "{{ airbyte_directory }}/{{ item }}"
@@ -20,12 +23,15 @@
     - values.yaml
     - limits.values.yaml
     - host.values.yaml
+    - recreate_post_renderer.py
 
 - name: Work out the inputs that the release is made from
   ansible.builtin.set_fact:
-    # The form "release-inputs-2" is part of the digest: a record from the role before it restarted the deployments after an upgrade never matches, so the
-    # first run with the restart upgrades and restarts once.
-    airbyte_release_inputs: "{{ (['release-inputs-2', airbyte_chart_sha256] + (airbyte_values_status.results | map(attribute='stat.checksum') | list)) | join(':') | hash('sha256') }}"
+    # The form "release-inputs-3" is part of the digest: a record from the role before it shaped the manifests with the post-renderer never matches, so the first
+    # run with it upgrades and restarts once. The post-renderer's checksum and the list of deployments it shapes are inputs too.
+    airbyte_release_inputs: >-
+      {{ (['release-inputs-3', airbyte_chart_sha256] + (airbyte_values_status.results | map(attribute='stat.checksum') | list) + [airbyte_recreate_deployments | join(',')])
+         | join(':') | hash('sha256') }}
 
 - name: Read the inputs of the last successful release
   ansible.builtin.slurp:
@@ -97,6 +103,10 @@
   ansible.builtin.file:
     path: "{{ airbyte_directory }}/release_inputs.sha256"
     state: absent
+
+- name: Take the pods of the deployments that hold database connections away before the rollback
+  when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
+  ansible.builtin.include_tasks: scale_down.yml
 
 - name: Roll the release back to its last deployed revision
   when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
@@ -196,14 +206,10 @@
         state: absent
 
     # A rolling update starts the new pod while the old one still holds its connections, and Temporal alone holds up to 24 of the 97 slots that the shared PostgreSQL
-    # gives ordinary accounts (compose/postgres_connections.yml). The chart gives the server and the workload launcher the Recreate strategy and leaves the deployments
-    # of airbyte_recreate_deployments to the default surge, and its template for the workload API server states a rolling update that an upgrade puts back. So the
-    # strategy is set to Recreate before the upgrade, which rolls a deployment whose pod changed, and again before the restart. A deployment that the release lacks
-    # is skipped, and any other failure stops the run with fixed text and no output.
-    - name: Make the deployments that hold database connections stop the old pod before they start the new one, before the upgrade
-      when: airbyte_release_state_now not in ['not installed', 'uninstalled']
-      ansible.builtin.include_tasks: recreate_strategy.yml
-
+    # gives ordinary accounts (compose/postgres_connections.yml). The chart gives the server and the workload launcher the Recreate strategy, leaves the deployments
+    # of airbyte_recreate_deployments to the default surge, and its template for the workload API server states a rolling update with a surge of 1. A patch before or
+    # after the upgrade would come too late for the rollout that the upgrade itself starts, so the strategy is rendered into the manifests: the upgrade runs the role's
+    # post-renderer, and Helm applies and stores the Recreate manifests. The restart below rolls the same deployments under that strategy.
     - name: Install or upgrade the release from the pinned chart archive
       ansible.builtin.command:
         argv:
@@ -220,6 +226,12 @@
           - "{{ airbyte_directory }}/limits.values.yaml"
           - --values
           - "{{ airbyte_directory }}/host.values.yaml"
+          - --post-renderer
+          - "{{ airbyte_directory }}/recreate_post_renderer.py"
+          - --post-renderer-args
+          - "{{ airbyte_release }}"
+          - --post-renderer-args
+          - "{{ airbyte_recreate_deployments | join(',') }}"
           - --wait
           - --timeout
           - "{{ airbyte_release_deadline_seconds }}s"
@@ -244,10 +256,6 @@
     # and the run waits for each deployment's rollout to finish within one shared release deadline, which needs its new pods ready (an Available condition can still hold on an old replica
     # alone). Only Helm's two install cases, a release not installed or uninstalled, start every pod new and restart nothing. A failure, or a namespace with
     # no deployment, stops the run before the inputs are recorded, so the next run upgrades and restarts again.
-    - name: Make the deployments that hold database connections stop the old pod before they start the new one, before the restart
-      when: airbyte_release_state_now not in ['not installed', 'uninstalled']
-      ansible.builtin.include_tasks: recreate_strategy.yml
-
     - name: Restart every Airbyte deployment and wait for each rollout, so that changed settings reach the pods
       when: airbyte_release_state_now not in ['not installed', 'uninstalled']
       ansible.builtin.shell:

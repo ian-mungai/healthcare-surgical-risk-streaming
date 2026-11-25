@@ -14,6 +14,7 @@ import pwd
 import re
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,7 @@ def values(folder: Path) -> dict[str, object]:
         "airbyte_web_unit": str(folder / "airbyte-web.service"),
         "airbyte_kubeconfig": "/etc/rancher/k3s/k3s.yaml",
         "airbyte_recreate_deployments": list(RECREATE_DEPLOYMENTS),
+        "airbyte_scale_down_deadline_seconds": 30,
     }
 
 
@@ -193,24 +195,63 @@ upgrade)
     prev="$argument"
   done > "$STAND_IN/configmap"
   if [ -e "$STAND_IN/flag_interrupt" ]; then printf pending-upgrade > "$STAND_IN/status"; echo pending-upgrade >> "$STAND_IN/history"; exit 137; fi
+  renderer=""; renderer_arguments=""; prev=""
+  for argument in "$@"; do
+    [ "$prev" = "--post-renderer" ] && renderer="$argument"
+    [ "$prev" = "--post-renderer-args" ] && renderer_arguments="$renderer_arguments $argument"
+    prev="$argument"
+  done
+  if [ -n "$renderer" ]; then
+    # Helm runs the post-renderer on the rendered manifests and applies its output; a failing post-renderer fails the upgrade before anything is applied.
+    # shellcheck disable=SC2086
+    "$STAND_IN_PYTHON" -I "$renderer" $renderer_arguments < "$STAND_IN/manifests.yaml" > "$STAND_IN/applied.yaml" 2>/dev/null || refuse post-renderer
+  else
+    cp "$STAND_IN/manifests.yaml" "$STAND_IN/applied.yaml"
+  fi
+  "$STAND_IN_PYTHON" "$STAND_IN/rollout.py" "$STAND_IN/applied.yaml"
   printf deployed > "$STAND_IN/status"; echo deployed >> "$STAND_IN/history" ;;
-rollback) : > "$STAND_IN/recovered"; printf deployed > "$STAND_IN/status"; echo deployed >> "$STAND_IN/history" ;;
+rollback)
+  # A rollback applies the manifests of an older revision, which no post-renderer shaped (Helm's rollback has no --post-renderer): the chart's own manifests.
+  "$STAND_IN_PYTHON" "$STAND_IN/rollout.py" "$STAND_IN/manifests.yaml"
+  : > "$STAND_IN/recovered"; printf deployed > "$STAND_IN/status"; echo deployed >> "$STAND_IN/history" ;;
 uninstall) : > "$STAND_IN/recovered"; : > "$STAND_IN/status"; : > "$STAND_IN/history" ;;
 *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
 """
 # The k3s stand-in logs each call and answers ``kubectl get deployment --output name`` with two deployments (``flag_no_deployments`` lists none).
-# ``flag_fail_restart`` fails the restart, ``flag_fail_rollout`` fails the rollout status of the second deployment and ``flag_fail_patch`` fails a strategy
-# patch, each with text that must never reach the task log. ``flag_patch_missing`` answers every patch as kubectl does for a deployment that is absent.
+# ``flag_fail_restart`` fails the restart and ``flag_fail_rollout`` fails the rollout status of the second deployment, each with text that must never reach
+# the task log. It keeps the running pods in the file ``pods`` (one deployment name per line, the old pod of each): ``get deployment <name>`` answers with the
+# selector of that deployment, as ``flag_scale_missing`` answers with the NotFound error for an absent one and ``flag_fail_scale_read`` fails; ``scale`` takes
+# the deployment's pod off the list at once and logs ``old exits <name>`` (``flag_fail_scale`` fails it); ``get pods --selector`` shows that pod until the
+# poll count of ``flag_pods_linger`` (one poll) has passed, and for ever with ``flag_pods_stay``.
 K3S_STAND_IN = """#!/bin/sh
 echo "$*" >> "$STAND_IN/log"
 leak() { echo "Error: LEAKED-STDERR $1" >&2; echo "LEAKED-STDOUT $1"; exit 1; }
 case "$2 $3" in
-"patch deployment")
-  [ -e "$STAND_IN/flag_fail_patch" ] && leak patch
-  [ -e "$STAND_IN/flag_patch_missing" ] && { echo "Error from server (NotFound): deployments.apps \"$4\" not found" >&2; exit 1; } ;;
+"scale deployment")
+  [ -e "$STAND_IN/flag_fail_scale" ] && leak scale
+  if grep -qx "$4" "$STAND_IN/pods"; then
+    grep -vx "$4" "$STAND_IN/pods" > "$STAND_IN/pods.next"; mv "$STAND_IN/pods.next" "$STAND_IN/pods"; echo "old exits $4" >> "$STAND_IN/pods.log"
+  fi
+  : > "$STAND_IN/scaled_$4" ;;
+"get pods")
+  selector=""; prev=""
+  for argument in "$@"; do [ "$prev" = "--selector" ] && selector="$argument"; prev="$argument"; done
+  [ -n "$selector" ] || exit 0
+  name=${selector#airbyte=}; name=${name%,}
+  [ -e "$STAND_IN/flag_pods_stay" ] && { echo "pod/$name-0"; exit 0; }
+  if [ -e "$STAND_IN/flag_pods_linger" ] && [ -e "$STAND_IN/scaled_$name" ] && [ ! -e "$STAND_IN/polled_$name" ]; then
+    : > "$STAND_IN/polled_$name"; echo "pod/$name-0"
+  fi ;;
 "rollout restart") [ -e "$STAND_IN/flag_fail_restart" ] && leak restart ;;
-"get deployment") [ -e "$STAND_IN/flag_no_deployments" ] || printf 'deployment.apps/airbyte-server\ndeployment.apps/airbyte-workload-launcher\n' ;;
+"get deployment")
+  case "$4" in
+  --*) [ -e "$STAND_IN/flag_no_deployments" ] || printf 'deployment.apps/airbyte-server\ndeployment.apps/airbyte-workload-launcher\n' ;;
+  *)
+    [ -e "$STAND_IN/flag_fail_scale_read" ] && leak read
+    [ -e "$STAND_IN/flag_scale_missing" ] && { echo "Error from server (NotFound): deployments.apps \"$4\" not found" >&2; exit 1; }
+    [ -e "$STAND_IN/flag_empty_selector" ] || echo "airbyte=$4," ;;
+  esac ;;
 "rollout status")
   [ -e "$STAND_IN/flag_fail_rollout" ] && [ "$4" = deployment.apps/airbyte-workload-launcher ] && leak rollout
   [ -e "$STAND_IN/flag_slow_rollout" ] && sleep 2 ;;
@@ -222,23 +263,90 @@ DEADLINE = 600
 UPGRADE = "upgrade --install"
 NOT_INSTALLED = ""
 VALUES_FILES = ("values.yaml", "limits.values.yaml", "host.values.yaml")
+POST_RENDERER = "recreate_post_renderer.py"
+# The files whose checksums are part of the release's inputs: the three values files and the post-renderer that shapes every manifest.
+INPUT_FILES = (*VALUES_FILES, POST_RENDERER)
 HOST_VALUES_B = "host.values.yaml from inputs B\n"
 CONFIGMAP_A = "".join(f"{name}\n" for name in VALUES_FILES)
 CONFIGMAP_B = CONFIGMAP_A.replace("host.values.yaml\n", HOST_VALUES_B)
 LEAK = "LEAKED"
 RECORD = "release_inputs.sha256"
 # The form of the recorded inputs: the role writes it into the digest, so a record from a role that did not restart the deployments never matches.
-RECORD_FORM = "release-inputs-2"
+RECORD_FORM = "release-inputs-3"
 RESTART = [
     "kubectl rollout restart deployment",
     "kubectl get deployment",
     "kubectl rollout status deployment.apps/airbyte-server",
     "kubectl rollout status deployment.apps/airbyte-workload-launcher",
 ]
-# The strategy of each deployment that holds connections is set to Recreate, so that no new pod starts while the old one holds its connections. It runs before
-# the upgrade, which rolls a deployment whose pod changed, and again after it, because an upgrade puts back a strategy that the chart states (the API server's).
-NO_SURGE = [f"kubectl patch deployment airbyte-{name}" for name in RECREATE_DEPLOYMENTS]
-UPGRADE_AND_RESTART = [*NO_SURGE, UPGRADE, *NO_SURGE, *RESTART]
+# The post-renderer makes each deployment that holds connections Recreate in the manifests of the upgrade itself, so no patch follows the upgrade. A rollback
+# applies the manifests of an older revision, which no post-renderer shaped, so the role first takes the pods of each such deployment away: it reads the
+# deployment's selector and scales it to zero (one pair for each deployment), then polls until no pod has the selector (one poll for each deployment).
+SCALE_DOWN = [
+    *[line for name in RECREATE_DEPLOYMENTS for line in (f"kubectl get deployment airbyte-{name}", f"kubectl scale deployment airbyte-{name}")],
+    *["kubectl get pods" for _ in RECREATE_DEPLOYMENTS],
+]
+UPGRADE_AND_RESTART = [UPGRADE, *RESTART]
+# The chart's own manifests for the deployments that hold connections and two that the role leaves alone, as ``helm template`` renders them for chart 2.5.0
+# (tests/slow/test_airbyte_rendered_environment.py renders the real ones): no strategy for Temporal, the cron and the worker, a rolling update with a surge
+# for the workload API server and for the manifest server (which holds no connection), and Recreate for the server.
+DEPLOYMENT = """\
+---
+# Source: airbyte/templates/airbyte-{name}/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: airbyte
+  name: airbyte-{name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      airbyte: {name}
+{strategy}  template:
+    metadata:
+      labels:
+        airbyte: {name}
+"""
+STRATEGIES = {
+    "temporal": "",
+    "cron": "",
+    "worker": "",
+    "workload-api-server": (
+        "  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 0\n      # Surge one pod at a time instead.\n      maxSurge: 1\n"
+    ),
+    "manifest-server": "  strategy:\n    type: RollingUpdate\n",
+    "server": "  strategy:\n    type: Recreate # Needed due to volume claims\n",
+}
+MANIFESTS = "".join(DEPLOYMENT.format(name=name, strategy=strategy) for name, strategy in STRATEGIES.items())
+# Applies a set of manifests to the pods in the file ``pods`` the way the Deployment controller would, one event for each deployment in ``pods.log``:
+# Recreate stops the old pod before it starts the new one, and a rolling update (also the default, which surges by one pod) starts the new pod first. A
+# deployment with no old pod only starts the new one.
+ROLLOUT = """\
+import sys
+from pathlib import Path
+
+import yaml
+
+folder = Path(sys.argv[0]).parent
+running = (folder / "pods").read_text().split()
+events = []
+for document in yaml.safe_load_all(Path(sys.argv[1]).read_text()):
+    if not document or document["kind"] != "Deployment":
+        continue
+    name = document["metadata"]["name"]
+    recreate = document["spec"].get("strategy", {}).get("type") == "Recreate"
+    if name not in running:
+        events.append(f"new starts {name}")
+    elif recreate:
+        events += [f"old exits {name}", f"new starts {name}"]
+    else:
+        events += [f"new starts {name}", f"old exits {name}"]
+    running = [item for item in running if item != name] + [name]
+(folder / "pods").write_text("".join(f"{item}\\n" for item in running))
+with (folder / "pods.log").open("a") as log:
+    log.write("".join(f"{item}\\n" for item in events))
+"""
 
 
 def history(*states: str) -> list[dict[str, object]]:
@@ -258,6 +366,9 @@ class ReleaseSandbox:
         for name, text in (("helm", HELM_STAND_IN), ("k3s", K3S_STAND_IN)):
             (programs / name).write_text(text)
             (programs / name).chmod(stat.S_IRWXU)
+        (self.stand_in / "rollout.py").write_text(ROLLOUT)
+        (self.stand_in / "manifests.yaml").write_text(MANIFESTS)
+        (self.stand_in / "pods").write_text("".join(f"airbyte-{name}\n" for name in STRATEGIES))
         (self.stand_in / "status").write_text(status)
         (self.stand_in / "history").write_text("".join(f"{item['status']}\n" for item in past or []))
         self.variables = (
@@ -267,26 +378,37 @@ class ReleaseSandbox:
         self.directory.mkdir()
         for name in VALUES_FILES:
             (self.directory / name).write_text(f"{name}\n")
-        sums = [hashlib.sha256((self.directory / name).read_bytes()).hexdigest() for name in VALUES_FILES]
-        self.inputs = hashlib.sha256(":".join([RECORD_FORM, CHART_SHA, *sums]).encode()).hexdigest()
+        # The role's place_files step copies the post-renderer beside the values files, and the release reads its checksum with theirs.
+        (self.directory / POST_RENDERER).write_bytes((ROLE / "files" / POST_RENDERER).read_bytes())
+        sums = [hashlib.sha256((self.directory / name).read_bytes()).hexdigest() for name in INPUT_FILES]
+        names = ",".join(changes.get("airbyte_recreate_deployments", RECREATE_DEPLOYMENTS))  # type: ignore[arg-type]
+        self.inputs = hashlib.sha256(":".join([RECORD_FORM, CHART_SHA, *sums, names]).encode()).hexdigest()
         if recorded == "match":
             (self.directory / RECORD).write_text(f"{self.inputs}\n")
         elif recorded == "legacy":
             # The record that the role wrote before it restarted the deployments: the same inputs without the form, so it never matches now.
-            (self.directory / RECORD).write_text(hashlib.sha256(":".join([CHART_SHA, *sums]).encode()).hexdigest() + "\n")
+            (self.directory / RECORD).write_text(hashlib.sha256(":".join([CHART_SHA, *sums[:3]]).encode()).hexdigest() + "\n")
         elif recorded == "other":
             (self.directory / RECORD).write_text("0" * 64 + "\n")
         self.playbook = folder / "check.yml"
         include = f"    - ansible.builtin.include_role:\n        name: {ROLE}\n        tasks_from: release.yml\n"
         self.playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{include}")
         # The host launcher passes its own environment on, so a shell with ANSIBLE_VERBOSITY=1 prints every task's result: the cases run at that level.
-        self.env = environment(folder) | {"PATH": f"{programs}:/usr/bin:/bin", "STAND_IN": str(self.stand_in), "ANSIBLE_VERBOSITY": "1"}
+        self.env = environment(folder) | {
+            "PATH": f"{programs}:/usr/bin:/bin",
+            "STAND_IN": str(self.stand_in),
+            "STAND_IN_PYTHON": str(ROOT / ".venv" / "bin" / "python"),
+            "ANSIBLE_VERBOSITY": "1",
+        }
 
     def run(self, flags: tuple[str, ...] = (), host_values: str | None = None) -> tuple[int, str, list[str]]:
         for old in self.stand_in.glob("flag_*"):
             old.unlink()
-        for name in ("status_seen", "recovered", "log"):
+        for name in ("status_seen", "recovered", "log", "pods.log", "pods.next"):
             (self.stand_in / name).unlink(missing_ok=True)
+        for old in (*self.stand_in.glob("scaled_*"), *self.stand_in.glob("polled_*")):
+            old.unlink()
+        (self.stand_in / "pods").write_text("".join(f"airbyte-{name}\n" for name in STRATEGIES))
         for flag in flags:
             (self.stand_in / f"flag_{flag}").write_text("")
         if host_values is not None:
@@ -300,6 +422,10 @@ class ReleaseSandbox:
         )
         log = (self.stand_in / "log").read_text().splitlines() if (self.stand_in / "log").exists() else []
         return result.returncode, result.stdout + result.stderr, [line for line in log if not line.startswith("status")]
+
+    def pod_events(self) -> list[str]:
+        """The events of the pods in order: the old pod of a deployment exiting and the new one starting."""
+        return (self.stand_in / "pods.log").read_text().splitlines() if (self.stand_in / "pods.log").exists() else []
 
     def configmap(self) -> str:
         return (self.stand_in / "configmap").read_text()
@@ -335,19 +461,19 @@ class ReleaseRecoveryTest(unittest.TestCase):
     def test_a_release_with_an_upgrade_pending_is_rolled_back_to_its_last_deployed_revision_before_the_install(self) -> None:
         code, output, log = self.run_release("pending-upgrade", history("superseded", "deployed", "pending-upgrade"), recorded="other")
         self.assertEqual(0, code, output)
-        self.assertEqual(["history airbyte", "rollback airbyte 2", *UPGRADE_AND_RESTART], self.commands(log))
+        self.assertEqual(["history airbyte", *SCALE_DOWN, "rollback airbyte 2", *UPGRADE_AND_RESTART], self.commands(log))
         self.assertIn(f"rollback airbyte 2 --namespace airbyte --wait --timeout {DEADLINE}s", log)
 
     def test_a_release_with_a_rollback_pending_is_rolled_back_to_the_last_deployed_revision_and_not_to_a_failed_one(self) -> None:
         past = history("superseded", "deployed", "failed", "pending-rollback")
         code, output, log = self.run_release("pending-rollback", past, recorded="other")
         self.assertEqual(0, code, output)
-        self.assertEqual(["history airbyte", "rollback airbyte 2", *UPGRADE_AND_RESTART], self.commands(log))
+        self.assertEqual(["history airbyte", *SCALE_DOWN, "rollback airbyte 2", *UPGRADE_AND_RESTART], self.commands(log))
 
     def test_with_two_deployed_revisions_in_the_history_the_later_one_is_the_target(self) -> None:
         code, output, log = self.run_release("pending-upgrade", history("deployed", "deployed", "pending-upgrade"), recorded="other")
         self.assertEqual(0, code, output)
-        self.assertEqual(["history airbyte", "rollback airbyte 2", *UPGRADE_AND_RESTART], self.commands(log))
+        self.assertEqual(["history airbyte", *SCALE_DOWN, "rollback airbyte 2", *UPGRADE_AND_RESTART], self.commands(log))
 
     def test_a_first_install_that_is_pending_is_uninstalled_before_the_install_with_the_same_deadline(self) -> None:
         code, output, log = self.run_release("pending-install", history("pending-install"), recorded="none")
@@ -411,8 +537,13 @@ class ReleaseRecoveryTest(unittest.TestCase):
         # A rollback leaves a deployed release whose pods keep their settings, so the upgrade restarts them; an uninstall leaves none, so the install
         # starts every pod new and nothing restarts.
         for status, past, recovery, restart in (
-            ("pending-upgrade", history("deployed", "pending-upgrade"), ["history airbyte", "rollback airbyte 1"], UPGRADE_AND_RESTART),
-            ("pending-rollback", history("superseded", "deployed", "pending-rollback"), ["history airbyte", "rollback airbyte 2"], UPGRADE_AND_RESTART),
+            ("pending-upgrade", history("deployed", "pending-upgrade"), ["history airbyte", *SCALE_DOWN, "rollback airbyte 1"], UPGRADE_AND_RESTART),
+            (
+                "pending-rollback",
+                history("superseded", "deployed", "pending-rollback"),
+                ["history airbyte", *SCALE_DOWN, "rollback airbyte 2"],
+                UPGRADE_AND_RESTART,
+            ),
             ("pending-install", history("pending-install"), ["uninstall airbyte"], [UPGRADE]),
             ("uninstalling", history("superseded", "uninstalling"), ["uninstall airbyte"], [UPGRADE]),
         ):
@@ -454,44 +585,153 @@ class ReleaseRecoveryTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertEqual([*UPGRADE_AND_RESTART], self.commands(log))
 
-    def test_each_deployment_that_holds_connections_is_set_to_recreate_with_a_merge_patch_and_the_release_name_in_front_of_its_name(self) -> None:
-        """A rolling update starts the new pod while the old one holds its connections: Temporal alone holds 24 of the 97 slots for ordinary accounts."""
-        code, output, log = self.run_release("deployed", history("deployed"), recorded="other", airbyte_release="other")
-        self.assertEqual(0, code, output)
-        patches = [line for line in log if line.startswith("kubectl patch deployment")]
-        self.assertEqual(2 * len(RECREATE_DEPLOYMENTS), len(patches), log)
-        for line, name in zip(patches, [*RECREATE_DEPLOYMENTS, *RECREATE_DEPLOYMENTS], strict=True):
-            self.assertTrue(line.startswith(f"kubectl patch deployment other-{name} --namespace airbyte --type merge --patch "), line)
-            self.assertTrue(line.endswith("""{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}"""), line)
-
-    def test_the_strategy_is_set_before_the_upgrade_that_rolls_a_changed_pod_and_again_before_the_restart(self) -> None:
-        code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
-        self.assertEqual(0, code, output)
-        names = self.commands(log)
-        upgrade = names.index(UPGRADE)
-        self.assertEqual(NO_SURGE, names[upgrade - len(NO_SURGE) : upgrade])
-        self.assertEqual(NO_SURGE, names[upgrade + 1 : upgrade + 1 + len(NO_SURGE)])
-        self.assertEqual("kubectl rollout restart deployment", names[upgrade + 1 + len(NO_SURGE)])
-
-    def test_a_deployment_that_is_absent_is_skipped_and_any_other_patch_failure_stops_the_run_before_the_upgrade_with_fixed_text(self) -> None:
+    def test_the_upgrade_is_post_rendered_with_the_release_and_the_deployments_that_hold_connections_and_no_patch_follows_it(self) -> None:
+        """A patch after the upgrade comes too late: Helm reapplies the chart's rolling update (a surge of 1 for the workload API server) in the upgrade."""
         with tempfile.TemporaryDirectory() as scratch:
-            box = ReleaseSandbox(scratch, "failed", history("failed"), "match", {})
-            code, output, log = box.run(flags=("patch_missing",))
-            self.assertEqual(0, code, output)
-            self.assertEqual(2 * len(RECREATE_DEPLOYMENTS), len([line for line in commands(log) if line.startswith("kubectl patch")]))
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {"airbyte_release": "other"})
+            code, output, log = box.run()
+            script = box.directory / POST_RENDERER
+        self.assertEqual(0, code, output)
+        upgrade = next(line for line in log if line.startswith(UPGRADE + " "))
+        self.assertIn(f"--post-renderer {script} --post-renderer-args other --post-renderer-args {','.join(RECREATE_DEPLOYMENTS)}", upgrade)
+        self.assertEqual([], [line for line in log if line.startswith("kubectl patch")])
+
+    def test_the_old_pod_of_each_deployment_that_holds_connections_exits_before_the_new_pod_starts_in_an_upgrade(self) -> None:
+        """The stand-in applies the post-rendered manifests as the Deployment controller does: the pod of a Recreate deployment exits first, a rolling
+        update starts the new pod first. The deployments that hold connections are all Recreate, and a deployment that the role leaves alone keeps what the
+        chart states."""
         with tempfile.TemporaryDirectory() as scratch:
             box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {})
-            code, output, log = box.run(flags=("fail_patch",))
-            self.assertNotEqual(0, code)
-            self.assertIn("could not set the strategy", output)
-            self.assertNotIn(LEAK, output)
-            self.assertNotIn(UPGRADE, commands(log))
-            self.assertFalse(box.record().exists())
-
-    def test_a_first_install_patches_nothing_and_a_release_in_any_other_state_patches_before_and_after_the_upgrade(self) -> None:
-        code, output, log = self.run_release(NOT_INSTALLED, recorded="none")
+            code, output, _ = box.run()
+            events = box.pod_events()
         self.assertEqual(0, code, output)
-        self.assertEqual([], [line for line in log if line.startswith("kubectl patch")])
+        for name in RECREATE_DEPLOYMENTS:
+            with self.subTest(name=name):
+                self.assertLess(events.index(f"old exits airbyte-{name}"), events.index(f"new starts airbyte-{name}"), events)
+        self.assertLess(
+            events.index("new starts airbyte-manifest-server"), events.index("old exits airbyte-manifest-server"), "the role leaves this one to the chart"
+        )
+
+    def test_the_chart_manifests_without_the_post_renderer_start_the_new_pod_first_so_the_check_above_can_fail(self) -> None:
+        """The same stand-in applied to the manifests that the chart renders: Temporal, the cron and the worker (no strategy) and the workload API server
+        (a surge of 1) start the new pod beside the old one, which is the failure that the post-renderer removes."""
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {})
+            result = run_command(
+                str(ROOT / ".venv" / "bin" / "python"), [str(box.stand_in / "rollout.py"), str(box.stand_in / "manifests.yaml")], cwd=box.folder, timeout=30
+            )
+            events = box.pod_events()
+        self.assertEqual(0, result.returncode, result.stderr)
+        for name in RECREATE_DEPLOYMENTS:
+            with self.subTest(name=name):
+                self.assertLess(events.index(f"new starts airbyte-{name}"), events.index(f"old exits airbyte-{name}"), events)
+
+    def test_a_post_renderer_that_fails_stops_the_upgrade_before_any_pod_changes_with_fixed_text_and_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {})
+            (box.stand_in / "manifests.yaml").write_text(
+                MANIFESTS.replace(
+                    "spec:\n  replicas: 1\n  selector:\n    matchLabels:\n      airbyte: temporal",
+                    "not_spec:\n  selector:\n    matchLabels:\n      airbyte: temporal",
+                )
+            )
+            code, output, log = box.run()
+            self.assertNotEqual(0, code)
+            self.assertIn("could not install or upgrade", output)
+            self.assertNotIn(LEAK, output)
+            self.assertEqual([], box.pod_events())
+            self.assertFalse(box.record().exists())
+            self.assertNotIn("kubectl rollout restart deployment", commands(log))
+
+    def test_a_release_with_an_upgrade_pending_first_loses_the_pods_of_each_deployment_that_holds_connections_so_the_old_manifests_cannot_surge(self) -> None:
+        """Helm's rollback has no post-renderer and applies the manifests of an older revision, which the chart shaped: the old pod of each deployment is
+        gone, by the deployment's own selector, before the rollback starts the new one."""
+        for status, past in (("pending-upgrade", history("deployed", "pending-upgrade")), ("pending-rollback", history("deployed", "pending-rollback"))):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as scratch:
+                box = ReleaseSandbox(scratch, status, past, "other", {})
+                code, output, log = box.run(flags=("pods_linger",))
+                events = box.pod_events()
+                self.assertEqual(0, code, output)
+                scale = [line for line in log if line.startswith("kubectl scale deployment")]
+                self.assertEqual([f"kubectl scale deployment airbyte-{name} --namespace airbyte --replicas=0" for name in RECREATE_DEPLOYMENTS], scale)
+                reads = [line for line in log if line.startswith("kubectl get deployment airbyte-")]
+                self.assertEqual(len(RECREATE_DEPLOYMENTS), len(reads))
+                for name in RECREATE_DEPLOYMENTS:
+                    self.assertLess(events.index(f"old exits airbyte-{name}"), events.index(f"new starts airbyte-{name}"), events)
+                steps = commands(log)
+                pairs = SCALE_DOWN[: 2 * len(RECREATE_DEPLOYMENTS)]
+                polls = steps[1 + len(pairs) : steps.index("rollback airbyte 1")]
+                self.assertEqual(["history airbyte", *pairs], steps[: 1 + len(pairs)])
+                self.assertEqual({"kubectl get pods"}, set(polls))
+                self.assertGreater(len(polls), len(RECREATE_DEPLOYMENTS), "a pod that lingers is polled again before the rollback")
+
+    def test_the_rollback_is_not_run_while_a_pod_of_a_deployment_that_holds_connections_is_still_there_and_the_wait_ends_at_its_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "pending-upgrade", history("deployed", "pending-upgrade"), "other", {"airbyte_scale_down_deadline_seconds": 3})
+            started = time.monotonic()
+            code, output, log = box.run(flags=("pods_stay",))
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(0, code)
+        self.assertLess(elapsed, 60, "the wait is bounded by its deadline")
+        self.assertIn("still had pods", output)
+        self.assertIn("3 seconds", output)
+        self.assertNotIn(LEAK, output)
+        self.assertEqual(
+            [], [line for line in log if line.startswith("rollback") or line.startswith(UPGRADE)], "no Helm command changes the release while the pods stay"
+        )
+
+    def test_a_deployment_that_is_absent_is_skipped_by_the_scale_down_and_any_other_failure_stops_the_run_before_the_rollback_with_fixed_text(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "pending-upgrade", history("deployed", "pending-upgrade"), "other", {})
+            code, output, log = box.run(flags=("scale_missing",))
+            self.assertEqual(0, code, output)
+            self.assertEqual([], [line for line in log if line.startswith("kubectl scale")], "an absent deployment has no pod to take away")
+            self.assertIn("rollback airbyte 1", commands(log))
+        for flag in ("fail_scale", "fail_scale_read", "empty_selector"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as scratch:
+                box = ReleaseSandbox(scratch, "pending-upgrade", history("deployed", "pending-upgrade"), "other", {})
+                code, output, log = box.run(flags=(flag,))
+                self.assertNotEqual(0, code)
+                self.assertIn("could not take the pods", output)
+                self.assertNotIn(LEAK, output)
+                self.assertEqual([], [line for line in commands(log) if line.startswith("rollback") or line == UPGRADE])
+                self.assertEqual(
+                    [], [line for line in log if line.startswith("kubectl get pods")], "an empty selector would match every pod, so no pod is listed with it"
+                )
+
+    def test_a_release_that_needs_no_rollback_scales_nothing_down(self) -> None:
+        for status, past, recorded in (
+            ("deployed", history("deployed"), "other"),
+            ("failed", history("deployed", "failed"), "other"),
+            (NOT_INSTALLED, None, "none"),
+        ):
+            with self.subTest(status=status or "not installed"):
+                code, output, log = self.run_release(status, past, recorded=recorded)
+                self.assertEqual(0, code, output)
+                self.assertEqual([], [line for line in log if line.startswith("kubectl scale") or line.startswith("kubectl get pods")])
+        for status, past in (("pending-install", history("pending-install")), ("uninstalling", history("superseded", "uninstalling"))):
+            with self.subTest(status=status):
+                code, output, log = self.run_release(status, past, recorded="none")
+                self.assertEqual(0, code, output)
+                self.assertEqual(
+                    [], [line for line in log if line.startswith("kubectl scale")], "an uninstall removes the deployments, so no pod needs to go first"
+                )
+
+    def test_a_changed_post_renderer_or_deployment_list_is_a_changed_input_and_upgrades_the_release_once(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "match", {})
+            code, output, log = box.run()
+            self.assertEqual((0, []), (code, log), output)
+            (box.directory / POST_RENDERER).write_text((box.directory / POST_RENDERER).read_text() + "# a changed script\n")
+            code, output, log = box.run()
+            self.assertEqual(0, code, output)
+            self.assertEqual(UPGRADE_AND_RESTART, commands(log))
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "match", {})
+            box.variables["airbyte_recreate_deployments"] = [*RECREATE_DEPLOYMENTS, "server"]
+            code, output, log = box.run()
+            self.assertEqual(0, code, output)
+            self.assertEqual(UPGRADE_AND_RESTART, commands(log), "the list is part of the inputs")
 
     def test_a_rollout_that_does_not_finish_or_finds_no_deployment_stops_the_run_and_leaves_no_record(self) -> None:
         """The new pods must be ready before the inputs are recorded: an Available condition can still hold on an old replica alone."""
@@ -640,7 +880,7 @@ class ReleaseRecoveryTest(unittest.TestCase):
             self.assertFalse(box.record().exists())
             code, output, log = box.run(host_values="host.values.yaml\n")
             self.assertEqual(0, code, output)
-            self.assertEqual(["history airbyte", "rollback airbyte 1", *UPGRADE_AND_RESTART], commands(log))
+            self.assertEqual(["history airbyte", *SCALE_DOWN, "rollback airbyte 1", *UPGRADE_AND_RESTART], commands(log))
             self.assertEqual(CONFIGMAP_A, box.configmap())
             self.assertEqual(f"{box.inputs}\n", box.record().read_text())
 
@@ -650,11 +890,11 @@ class ReleaseRecoveryTest(unittest.TestCase):
             box.run(flags=("interrupt",), host_values=HOST_VALUES_B)
             code, _, log = box.run(flags=("interrupt",), host_values="host.values.yaml\n")
             self.assertNotEqual(0, code)
-            self.assertEqual(["history airbyte", "rollback airbyte 1", *NO_SURGE, UPGRADE, "kubectl get pods"], commands(log))
+            self.assertEqual(["history airbyte", *SCALE_DOWN, "rollback airbyte 1", UPGRADE, "kubectl get pods"], commands(log))
             self.assertFalse(box.record().exists())
             code, output, log = box.run()
             self.assertEqual(0, code, output)
-            self.assertEqual(["history airbyte", "rollback airbyte 3", *UPGRADE_AND_RESTART], commands(log))
+            self.assertEqual(["history airbyte", *SCALE_DOWN, "rollback airbyte 3", *UPGRADE_AND_RESTART], commands(log))
             self.assertEqual(CONFIGMAP_A, box.configmap())
 
     def test_the_inputs_are_recorded_only_after_the_install_succeeded(self) -> None:
@@ -681,6 +921,7 @@ class ReleaseRecoveryStructureTest(unittest.TestCase):
             "Stop when the release's status cannot be read",
             "Read the release's history",
             "Forget the recorded inputs before the recovery",
+            "Take the pods of the deployments that hold database connections away before the rollback",
             "Roll the release back to its last deployed revision",
             "Uninstall the release that never finished its first install or its uninstall",
             "Read the release's status again",
@@ -790,6 +1031,34 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual(8001, host["server"]["service"]["port"])
         self.assertEqual(0, again_code, again)
         self.assertRegex(again, CHANGED_NONE)
+
+    def test_the_post_renderer_is_placed_beside_the_values_as_a_root_program_and_a_second_run_changes_nothing(self) -> None:
+        """Helm runs it as the user of the run (root on the host), so it is placed with the role's owner and group and no write bit for anyone else."""
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            variables = values(folder) | {"airbyte_bridge_address": "10.42.5.1"}
+            code, output = run_tasks(["place_files.yml"], variables)
+            placed = folder / "airbyte" / POST_RENDERER
+            mode = stat.S_IMODE(placed.stat().st_mode)
+            text = placed.read_text()
+            again_code, again = run_tasks(["place_files.yml"], variables)
+        self.assertEqual(0, code, output)
+        self.assertEqual((ROLE / "files" / POST_RENDERER).read_text(), text)
+        self.assertEqual(0o755, mode)
+        self.assertEqual(0, again_code, again)
+        self.assertRegex(again, CHANGED_NONE)
+
+    def test_the_release_step_runs_after_the_placement_and_both_name_the_same_script_path(self) -> None:
+        main = (ROLE / "tasks" / "main.yml").read_text()
+        self.assertLess(main.index("place_files.yml"), main.index("release.yml"))
+        upgrade = next(task for task in role_tasks()["release.yml"] if "ansible.builtin.command" in task and "upgrade" in str(task["ansible.builtin.command"]))
+        argv = [str(item) for item in upgrade["ansible.builtin.command"]["argv"]]
+        self.assertEqual(f"{{{{ airbyte_directory }}}}/{POST_RENDERER}", argv[argv.index("--post-renderer") + 1])
+        placed = next(
+            task for task in role_tasks()["place_files.yml"] if "ansible.builtin.copy" in task and POST_RENDERER in str(task["ansible.builtin.copy"]["dest"])
+        )
+        self.assertEqual(f"{{{{ airbyte_directory }}}}/{POST_RENDERER}", placed["ansible.builtin.copy"]["dest"])
+        self.assertEqual("0755", placed["ansible.builtin.copy"]["mode"])
 
     def test_every_database_key_the_chart_reads_with_the_placed_values_is_a_key_the_role_writes(self) -> None:
         """Chart 2.5.0 reads the database account from the secret that ``global.database.secretName`` names, under keys that each values file may set: the
