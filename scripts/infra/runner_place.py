@@ -6,6 +6,10 @@ Run from the repository root under the project profile in ``.env``, through ``ma
 ``/opt/platform/runner/<commit>/<the same path>`` and prints and records its SHA-256 (``runs/<run id>/runner_files.json``). The deploy (``make host-up``)
 makes the folder from ``git archive`` of the commit, which holds no Git-ignored file; this places the runners that it cannot.
 
+The hashes of every runner placed in the folder are also written on the host, in ``placed_runners.json`` in the folder's root (``{"commit": ..., "files":
+{path: sha256}}``, read-only to its owner), so that a runner on the host can check its own file. The deploy's source manifest ``runner_manifest.json`` lists
+the files of ``git archive`` only and is never touched here: no command names it and no path of its name passes the path form.
+
 Only one kind of file goes: a Python file directly under ``tests/e2e/`` that the deployed commit does not hold, that is a plain file (no link), is text of
 at most 1 MiB and that the privacy scan passes. Nothing else is uploaded, and the host's folder must be the finished folder of the commit (its marker
 file). A new deploy of another commit removes the folder and so every placed runner: place them again after it. A second deploy of the same commit keeps
@@ -37,9 +41,12 @@ from scripts.quality.repo_checks import PRIVACY_PATTERNS, env_values, line_priva
 # The runner folder and marker of the Ansible role runner_checkout (ansible/group_vars/all.yml); a fast test holds them equal.
 RUNNER_DIRECTORY = "/opt/platform/runner"
 MARKER = ".runner_checkout.json"
+MANIFEST_NAME = "runner_manifest.json"
+PLACED_RECORD = "placed_runners.json"
 RECORD_FILE = "runner_files.json"
 RUNNER_FORM = re.compile(r"tests/e2e/[a-z][a-z0-9_]*\.py")
 COMMIT_FORM = re.compile(r"[0-9a-f]{40}")
+DIGEST_FORM = re.compile(r"[0-9a-f]{64}")
 MAX_BYTES = 1024 * 1024
 SSH_SECONDS = 60
 GIT_SECONDS = 30
@@ -96,12 +103,55 @@ def runner_text(relative: str, commit: str, root: Path = ROOT, env: Mapping[str,
 
 def remote_command(commit: str, relative: str) -> str:
     """The one command that receives a file on its standard input: in the commit's finished folder only, to a private temporary name, then the final name."""
-    folder = f"{RUNNER_DIRECTORY}/{commit}"
     name, parent = shlex.quote(relative), shlex.quote(relative.rsplit("/", 1)[0])
-    return (
-        f"set -eu; test -f {folder}/{MARKER} || {{ echo {NO_FOLDER_WORD}; exit {NO_FOLDER_CODE}; }}; cd {folder}; umask 077; mkdir -p -- {parent}; "
-        f"cat > {name}.part; mv -f -- {name}.part {name}; sha256sum -- {name}"
-    )
+    return f"{folder_guard(commit)}umask 077; mkdir -p -- {parent}; cat > {name}.part; mv -f -- {name}.part {name}; sha256sum -- {name}"
+
+
+def folder_guard(commit: str) -> str:
+    """The start of every remote command: stop with a fixed word when the commit's folder has no finished marker, then work in the folder."""
+    folder = f"{RUNNER_DIRECTORY}/{commit}"
+    return f"set -eu; test -f {folder}/{MARKER} || {{ echo {NO_FOLDER_WORD}; exit {NO_FOLDER_CODE}; }}; cd {folder}; "
+
+
+def read_record_command(commit: str) -> str:
+    return f"{folder_guard(commit)}if test -f {PLACED_RECORD}; then cat -- {PLACED_RECORD}; fi"
+
+
+def write_record_command(commit: str) -> str:
+    """Receive the record on standard input: a private temporary name made read-only by the umask, then the final name, then its hash."""
+    return f"{folder_guard(commit)}umask 277; cat > {PLACED_RECORD}.part; mv -f -- {PLACED_RECORD}.part {PLACED_RECORD}; sha256sum -- {PLACED_RECORD}"
+
+
+def ssh_call(run: Run, options: Sequence[str], address: str, command: str, input_text: str | None, what: str) -> str:
+    """One command on the host: its output, or a refusal with fixed text for a deadline, a missing folder or a failure."""
+    try:
+        result = run("ssh", [*options, f"{host.HOST_USER}@{address}", command], timeout=SSH_SECONDS, input_text=input_text)
+    except TimeoutExpired:
+        raise FixedHostError(f"{what} did not finish within its deadline of 60 seconds") from None
+    if result.returncode == NO_FOLDER_CODE and result.stdout.strip() == NO_FOLDER_WORD:
+        raise FixedHostError("the host has no runner folder for this commit: run make host-up for this commit first")
+    if result.returncode != 0:
+        raise FixedHostError(f"{what} failed: exit status {result.returncode}")
+    return result.stdout
+
+
+def placed_before(text: str, commit: str) -> dict[str, str]:
+    """The hashes in the host's record of this commit, or none when there is no record or it names another commit. Anything else is refused."""
+    if not text.strip():
+        return {}
+    not_valid = FixedHostError("the host's placed_runners.json is not valid: remove it on the host and place the runners again")
+    try:
+        document = json.loads(text)
+    except ValueError:
+        raise not_valid from None
+    if not isinstance(document, dict) or sorted(document) != ["commit", "files"] or not isinstance(document["files"], dict):
+        raise not_valid
+    if document["commit"] != commit:
+        return {}
+    files: dict[str, str] = document["files"]
+    if any(RUNNER_FORM.fullmatch(name) is None or not isinstance(digest, str) or DIGEST_FORM.fullmatch(digest) is None for name, digest in files.items()):
+        raise not_valid
+    return dict(files)
 
 
 def place(
@@ -115,28 +165,26 @@ def place(
     run: Run = run_command,
     ssh_options: Sequence[str] | None = None,
 ) -> dict[str, str]:
-    """Send each named file and return its SHA-256 as the host computed it. Every file is checked before the first is sent."""
+    """Send each named file and return its SHA-256 as the host computed it, then write the host's record of every placed runner.
+    Every file is checked before the first is sent, and the host's earlier record is read and checked before the first is sent too."""
     if not relatives:
         raise FixedHostError("the call names no runner file")
     if len(set(relatives)) != len(relatives):
         raise FixedHostError("a runner file is named twice")
     texts = {relative: runner_text(relative, commit, root, env) for relative in relatives}
     options = list(ssh_options) if ssh_options is not None else host.ssh_arguments(run_id)
+    earlier = placed_before(ssh_call(run, options, address, read_record_command(commit), None, "reading the host's record of placed runners"), commit)
     hashes: dict[str, str] = {}
     for relative, text in texts.items():
-        try:
-            result = run("ssh", [*options, f"{host.HOST_USER}@{address}", remote_command(commit, relative)], timeout=SSH_SECONDS, input_text=text)
-        except TimeoutExpired:
-            raise FixedHostError("sending a runner file did not finish within its deadline of 60 seconds") from None
-        if result.returncode == NO_FOLDER_CODE and result.stdout.strip() == NO_FOLDER_WORD:
-            raise FixedHostError("the host has no runner folder for this commit: run make host-up for this commit first")
-        if result.returncode != 0:
-            raise FixedHostError(f"sending a runner file failed: exit status {result.returncode}")
-        words = result.stdout.split()
+        words = ssh_call(run, options, address, remote_command(commit, relative), text, "sending a runner file").split()
         local = hashlib.sha256(text.encode()).hexdigest()
         if len(words) != 2 or words[0] != local or words[1] != relative:
             raise FixedHostError("the host's copy of a runner file differs from the one sent: remove it on the host and place it again")
         hashes[relative] = local
+    record = json.dumps({"commit": commit, "files": dict(sorted((earlier | hashes).items()))}, indent=2) + "\n"
+    words = ssh_call(run, options, address, write_record_command(commit), record, "writing the host's record of placed runners").split()
+    if words != [hashlib.sha256(record.encode()).hexdigest(), PLACED_RECORD]:
+        raise FixedHostError("the host's record of placed runners differs from the one sent: remove it on the host and place the runners again")
     return hashes
 
 

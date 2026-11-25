@@ -226,6 +226,9 @@ runner_checkout_marker_text: "{{ runner_checkout_expected | to_json(sort_keys=Tr
 # provenance with it, and a deploy of a finished folder checks the files against it and builds the folder again when one changed, is gone or the manifest is not there.
 runner_checkout_manifest: "{{ runner_checkout_folder }}/runner_manifest.json"
 runner_checkout_manifest_mode: "0400"
+# The hashes of the runner files that the launcher places (make host-runners-place), written on the host by the launcher so that a runner can check its own file. It is
+# not in the manifest, which is written before any placement, and the deploy never touches it: a finished folder keeps it, a new folder starts without it.
+runner_checkout_placed_runners: "{{ runner_checkout_folder }}/placed_runners.json"
 # Each deadline is in seconds. The install deadline covers every package of the lock file.
 runner_checkout_download_deadline_seconds: 120
 runner_checkout_unpack_deadline_seconds: 120
