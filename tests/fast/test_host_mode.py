@@ -21,13 +21,20 @@ Failure modes covered here:
 - The host check counted the services' limits only and not the host's reserve in ``compose/limits.yml``.
 - A given Spark image with the recorded ID was taken as the tested build though the files in it were not the files of the reviewed commit (the ID alone binds
   nothing to a revision), or the check passed on a listing that held no file.
+- On the host the checkout has no Git history (``git ls-tree`` and ``git show`` exit 128), so the image check failed closed on every run. It reads the
+  commit's files from the deploy's source manifest instead: a file that differs from its manifest digest, a file that the manifest does not list or that is
+  gone, a link, a path that could forge a listing line and a Dockerfile or ignore file that is not checked must never give a listing.
 - A call to Nessie got its own 30 seconds with only seconds of the run left, because the rest of the run was read before the call and not at its start.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import io
+import os
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -790,6 +797,142 @@ class DockerIgnoreTest(unittest.TestCase):
             answered = run_command(sys.executable, ["-I", "-c", script], timeout=30, check=True).stdout
         git_id = "7d4290a117a4ddcc11daae7ea675841033830c8f"  # git hash-object of the file content "x = 1\n"
         self.assertEqual(f"{git_id} spark/a.py\n", answered)
+
+
+def blob_of(data: bytes) -> str:
+    """The Git blob ID of the content (``git hash-object``)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+
+
+def manifest_of(files: dict[str, bytes]) -> dict[str, str]:
+    """The ``files`` map of a source manifest: the SHA-256 of each file."""
+    return {path: hashlib.sha256(data).hexdigest() for path, data in files.items()}
+
+
+MANIFEST_FILES = {
+    "spark/Dockerfile": b"COPY spark /opt/jobs/spark\nCOPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py\n",
+    "spark/Dockerfile.dockerignore": b"*\n!spark\n!scripts/stack/nessie.py\n",
+    "spark/jobs/x.py": b"x = 1\n",
+    "spark/silver/y.py": b"y = 2\n",
+    "scripts/stack/nessie.py": b"z = 3\n",
+    "scripts/stack/other.py": b"other = 4\n",
+    "README.md": b"readme\n",
+}
+
+
+def image_listing(files: dict[str, bytes], *paths: str) -> str:
+    """What ``SOURCE_SCRIPT`` prints in an image that holds the given files under /opt/jobs."""
+    return "".join(f"{blob_of(files[path])} {path}\n" for path in sorted(paths))
+
+
+class ManifestSourceTest(unittest.TestCase):
+    """The host has no Git history: the files that the image is compared with come from the deploy's source manifest, each one checked against its digest."""
+
+    def source(
+        self, files: dict[str, bytes] = MANIFEST_FILES, listed: dict[str, str] | None = None, on_disk: dict[str, bytes] | None = None
+    ) -> tuple[str, str, str] | None:
+        disk = files if on_disk is None else on_disk
+        return host_mode.manifest_source(manifest_of(files) if listed is None else listed, disk.get)
+
+    def test_the_listing_has_the_blob_id_of_each_file_that_a_copy_names_and_the_image_that_holds_those_files_is_the_tested_build(self) -> None:
+        found = self.source()
+        self.assertIsNotNone(found)
+        tree, dockerfile, dockerignore = found or ("", "", "")
+        self.assertEqual(MANIFEST_FILES["spark/Dockerfile"].decode(), dockerfile)
+        self.assertEqual(MANIFEST_FILES["spark/Dockerfile.dockerignore"].decode(), dockerignore)
+        self.assertIn(f"100644 blob {blob_of(MANIFEST_FILES['spark/jobs/x.py'])}\tspark/jobs/x.py\n", tree)
+        self.assertNotIn("README.md", tree)
+        listing = image_listing(MANIFEST_FILES, "spark/jobs/x.py", "spark/silver/y.py", "scripts/stack/nessie.py")
+        self.assertIsNone(source_problem(listing, tree, dockerfile, dockerignore))
+        self.assertEqual("image_source_differs", source_problem(listing.replace(blob_of(b"x = 1\n"), blob_of(b"x = 9\n")), tree, dockerfile, dockerignore))
+        self.assertEqual("image_source_differs", source_problem(listing + f"{SHA_X} spark/jobs/extra.py\n", tree, dockerfile, dockerignore))
+        self.assertEqual(
+            "image_source_missing", source_problem(listing.replace(f"{blob_of(b'y = 2\n')} spark/silver/y.py\n", ""), tree, dockerfile, dockerignore)
+        )
+
+    def test_a_file_that_differs_from_its_manifest_digest_gives_no_listing(self) -> None:
+        for path in ("spark/Dockerfile", "spark/Dockerfile.dockerignore", "spark/jobs/x.py", "scripts/stack/nessie.py"):
+            with self.subTest(path=path):
+                self.assertIsNone(self.source(on_disk={**MANIFEST_FILES, path: MANIFEST_FILES[path] + b"# changed\n"}))
+
+    def test_a_file_that_is_gone_gives_no_listing_and_a_file_that_the_manifest_does_not_list_is_not_in_it_so_the_image_is_refused(self) -> None:
+        listing = image_listing(MANIFEST_FILES, "spark/jobs/x.py", "spark/silver/y.py", "scripts/stack/nessie.py")
+        for path in ("spark/Dockerfile", "spark/Dockerfile.dockerignore", "spark/jobs/x.py", "scripts/stack/nessie.py"):
+            with self.subTest(path=path, case="gone"):
+                self.assertIsNone(self.source(on_disk={name: data for name, data in MANIFEST_FILES.items() if name != path}))
+            with self.subTest(path=path, case="not listed"):
+                found = self.source(listed={name: digest for name, digest in manifest_of(MANIFEST_FILES).items() if name != path})
+                if path.startswith("spark/Dockerfile"):
+                    self.assertIsNone(found)
+                else:
+                    self.assertIsNotNone(found)
+                    self.assertIn(
+                        source_problem(listing, *(found or ("", "", ""))), ("image_source_differs", "image_source_missing", "image_source_unreadable")
+                    )
+
+    def test_a_file_that_the_docker_ignore_file_leaves_out_is_never_read_and_is_not_in_the_listing(self) -> None:
+        files = {**MANIFEST_FILES, "spark/Dockerfile.dockerignore": MANIFEST_FILES["spark/Dockerfile.dockerignore"] + b"spark/silver\n"}
+        read: list[str] = []
+
+        def reading(path: str) -> bytes | None:
+            read.append(path)
+            return files.get(path)
+
+        found = host_mode.manifest_source(manifest_of(files), reading)
+        self.assertIsNotNone(found)
+        self.assertNotIn("spark/silver/y.py", read)
+        self.assertNotIn("scripts/stack/other.py", read)
+        self.assertNotIn("README.md", read)
+        self.assertNotIn("spark/silver/y.py", (found or ("", "", ""))[0])
+        self.assertIn("spark/jobs/x.py", read)
+        self.assertEqual(len(read), len(set(read)))
+
+    def test_a_path_that_could_forge_a_listing_line_gives_no_listing(self) -> None:
+        for name in ("spark/a\nb.py", "spark/a\rb.py", "spark/a\tb.py", "spark/a\x00b.py", "spark/a\x7fb.py"):
+            with self.subTest(name=repr(name)):
+                files = {**MANIFEST_FILES, name: b"forged = 1\n"}
+                self.assertIsNone(self.source(files))
+
+    def test_a_dockerfile_or_ignore_file_that_the_check_cannot_read_gives_no_listing(self) -> None:
+        for path, text in (
+            ("spark/Dockerfile", b"COPY spark/*.py /opt/jobs/spark/\n"),
+            ("spark/Dockerfile", b"RUN true\n"),
+            ("spark/Dockerfile", b"\xff\xfe"),
+            ("spark/Dockerfile.dockerignore", b"*\n!spark/*.py\n"),
+            ("spark/Dockerfile.dockerignore", b"\xff"),
+        ):
+            with self.subTest(path=path, text=text):
+                files = {**MANIFEST_FILES, path: text}
+                self.assertIsNone(self.source(files))
+
+    def test_a_manifest_that_lists_none_of_the_copied_files_refuses_every_image(self) -> None:
+        only = {"spark/Dockerfile": MANIFEST_FILES["spark/Dockerfile"], "spark/Dockerfile.dockerignore": MANIFEST_FILES["spark/Dockerfile.dockerignore"]}
+        found = self.source(only)
+        self.assertIsNotNone(found)
+        listing = image_listing(MANIFEST_FILES, "spark/jobs/x.py", "spark/silver/y.py", "scripts/stack/nessie.py")
+        self.assertEqual("image_source_unreadable", source_problem(listing, *(found or ("", "", ""))))
+
+    def test_the_listing_of_the_real_checkout_gives_the_same_files_as_the_listing_of_git(self) -> None:
+        sources = ("spark", "scripts", "features", "casefile", "replay", "tests/fixtures/vitaldb")
+        done = run_command("git", ["-C", str(ROOT), "archive", "--format=tar", "HEAD", "--", *sources], timeout=120, check=True, keep_newlines=True)
+        archive = os.fsencode(done.stdout)
+        files: dict[str, bytes] = {}
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            for member in tar:
+                handle = tar.extractfile(member) if member.isreg() else None
+                if handle is not None:
+                    files[member.name] = handle.read()
+        found = host_mode.manifest_source(manifest_of(files), files.get)
+        self.assertIsNotNone(found)
+        tree, dockerfile, dockerignore = found or ("", "", "")
+        by_git = host_mode.image_source_files(
+            committed("show", "HEAD:spark/Dockerfile"), committed("ls-tree", "-r", "HEAD"), committed("show", "HEAD:spark/Dockerfile.dockerignore")
+        )
+        by_manifest = host_mode.image_source_files(dockerfile, tree, dockerignore)
+        self.assertEqual(171, len(by_git or {}))
+        self.assertEqual(by_git, by_manifest)
+        listing = "".join(f"{blob} {path}\n" for path, blob in sorted((by_manifest or {}).items()))
+        self.assertIsNone(source_problem(listing, tree, dockerfile, dockerignore))
 
 
 if __name__ == "__main__":

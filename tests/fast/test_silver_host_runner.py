@@ -29,6 +29,8 @@ Failure modes covered here:
   could start with a cap longer than the rest of the run.
 - A given image with the recorded ID was taken as the tested build though the Python files in it were not the files of the reviewed commit; the record held
   the ID or a file name; the header of a runner promised a raw ``spark_image_id`` that the record does not hold.
+- A host run asked Git for the commit's files (``git ls-tree``, ``git show``), which exits 128 in a checkout with no history, so its image check failed on every
+  run; or it read the files from the source manifest without checking each one against its digest; or a run that is not on the host stopped asking Git.
 - The memory was read before the password file and the warehouse volume were made, so their seconds were not between the reading and the first service.
 - A fast test bound a real loopback port, and the scratch folder was left when the setup failed before the first service.
 """
@@ -37,7 +39,9 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -77,6 +81,24 @@ IMAGE_FILES = f"{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n{SHA_Z} scri
 DOCKERFILE = "COPY spark /opt/jobs/spark\nCOPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py\n"
 # Its Docker ignore file: what the build leaves out of the context before ``COPY`` reads it.
 DOCKERIGNORE = "*\n!spark\n!scripts/stack/nessie.py\n"
+
+
+def blob_of(data: bytes) -> str:
+    """The Git blob ID of the content (``git hash-object``)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+
+
+# A host checkout has no Git history: its files and the source manifest that lists them stand in for ``git ls-tree`` and ``git show``.
+CHECKOUT_FILES = {
+    "spark/Dockerfile": DOCKERFILE.encode(),
+    "spark/Dockerfile.dockerignore": DOCKERIGNORE.encode(),
+    "spark/jobs/x.py": b"x = 1\n",
+    "spark/silver/y.py": b"y = 2\n",
+    "scripts/stack/nessie.py": b"z = 3\n",
+    "README.md": b"readme\n",
+}
+CHECKOUT_IMAGE_FILES = "".join(f"{blob_of(CHECKOUT_FILES[path])} {path}\n" for path in ("scripts/stack/nessie.py", "spark/jobs/x.py", "spark/silver/y.py"))
+
 # Settings of the deployed stack and of Compose that a caller may have exported. None of them may reach a call of the run.
 BOUND = {"WAREHOUSE_LOCATION", "NESSIE_URI", "AWS_REGION", "POSTGRES_HOST_PORT", "MEM_LIMIT_SPARK"}
 DEPLOYED = {
@@ -1021,6 +1043,7 @@ class HostRunnerCase(unittest.TestCase):
         dockerfile: str = DOCKERFILE,
         dockerignore: str = DOCKERIGNORE,
         image_settings: dict[str, str] | None = None,
+        host: bool = False,
     ) -> tuple[tuple[bool, bool], Calls, Record]:
         def with_source(args: list[str]) -> Any:
             """The answers of the four source calls (the commit's tree, its Dockerfile, its Docker ignore file and the Python files in the image) beside the
@@ -1040,7 +1063,7 @@ class HostRunnerCase(unittest.TestCase):
             mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **settings), clear=True),
             tempfile.TemporaryDirectory(prefix="host_runner_") as folder,
             calls.patches(module),
-            mock.patch.object(module, "HOST", given or image_settings is not None),
+            mock.patch.object(module, "HOST", host),
         ):
             module.select_settings()
             stack = self.stack(module, folder)
@@ -1208,6 +1231,108 @@ class HostRunnerCase(unittest.TestCase):
                 self.assertFalse(any(words.startswith("image tag") for words in calls.words()))
                 self.assertFalse(self.passed(record, "image source"))
 
+    def checkout_with(self, folder: str, files: dict[str, bytes] | None = None, *, listed: dict[str, bytes] | None = None, manifest: bool = True) -> Path:
+        """A host checkout: the files on disk (``files``), the files that the source manifest lists with their SHA-256 (``listed``, the files on disk by
+        default), and no Git history."""
+        root = Path(folder) / "checkout"
+        disk = CHECKOUT_FILES if files is None else files
+        for name, data in disk.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_bytes(data)
+        if manifest:
+            digests = {name: hashlib.sha256(data).hexdigest() for name, data in (disk if listed is None else listed).items()}
+            (root / "runner_manifest.json").write_text(json.dumps({"commit": "a" * 40, "files": digests}))
+        return root
+
+    def host_image_run(self, module: ModuleType, build_checkout: Any, files: str = CHECKOUT_IMAGE_FILES) -> tuple[tuple[bool, bool], Calls, Record]:
+        """``prepare_image`` of a host run whose checkout has no Git history: every ``git`` call exits 128, and the checkout is the one that ``build_checkout``
+        makes in a scratch folder."""
+        record = Record(feature="f", slug="s", rerun="r")
+
+        def answer(args: list[str]) -> Any:
+            if args[:2] == ["image", "inspect"]:
+                return f"{IMAGE_ID}\n"
+            return files if args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT else ""
+
+        calls = Calls(answer, lambda args: 128 if args[:1] == ["-C"] else 0)
+        with (
+            mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **self.given_image()), clear=True),
+            tempfile.TemporaryDirectory(prefix="host_runner_") as folder,
+            calls.patches(module),
+            mock.patch.object(module, "HOST", True),
+        ):
+            root = build_checkout(folder)
+            module.select_settings()
+            stack = self.stack(module, folder)
+            with mock.patch.object(module, "ROOT", root):
+                result = (module.prepare_image(stack, record), stack.image_created)
+        return result, calls, record
+
+    def test_a_host_checkout_with_no_git_history_gives_the_files_of_the_commit_from_its_manifest_and_the_image_that_holds_them_is_tagged(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        result, calls, record = self.host_image_run(module, self.checkout_with)
+        self.assertEqual((True, True), result)
+        self.assertEqual([], [program for program, _, _ in calls.items if program == "git"])
+        self.assertTrue(self.passed(record, "image source"))
+        self.assertTrue(any(words.startswith("image tag") for words in calls.words()))
+        self.assertEqual(1, len([args for _, args, _ in calls.items if args[:1] == ["run"]]))
+
+    def test_a_host_checkout_whose_files_or_manifest_do_not_agree_gives_no_image_and_nothing_is_tagged(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        changed = {**CHECKOUT_FILES, "spark/jobs/x.py": b"x = 'edited on the host'\n"}
+        cases = {
+            "a file differs from its manifest digest": lambda folder: self.checkout_with(folder, changed, listed=CHECKOUT_FILES),
+            "the Dockerfile differs from its manifest digest": lambda folder: self.checkout_with(
+                folder, {**CHECKOUT_FILES, "spark/Dockerfile": CHECKOUT_FILES["spark/Dockerfile"] + b"# x\n"}, listed=CHECKOUT_FILES
+            ),
+            "a copied file is not listed": lambda folder: self.checkout_with(
+                folder, listed={name: data for name, data in CHECKOUT_FILES.items() if name != "spark/silver/y.py"}
+            ),
+            "the Dockerfile is not listed": lambda folder: self.checkout_with(
+                folder, listed={n: d for n, d in CHECKOUT_FILES.items() if n != "spark/Dockerfile"}
+            ),
+            "a listed file is gone": lambda folder: self.checkout_with(
+                folder, {n: d for n, d in CHECKOUT_FILES.items() if n != "spark/silver/y.py"}, listed=CHECKOUT_FILES
+            ),
+            "there is no manifest": lambda folder: self.checkout_with(folder, manifest=False),
+        }
+        for label, build in cases.items():
+            with self.subTest(case=label):
+                result, calls, record = self.host_image_run(module, build)
+                self.assertEqual((False, False), result)
+                self.assertEqual([], [program for program, _, _ in calls.items if program == "git"])
+                self.assertFalse(any(words.startswith("image tag") for words in calls.words()))
+                self.assertFalse(self.passed(record, "image source"))
+
+    def test_a_file_of_the_host_checkout_that_is_a_link_gives_no_image(self) -> None:
+        module = self.module(**{self.flag: "1"})
+
+        def build(folder: str) -> Path:
+            root = self.checkout_with(folder)
+            outside = Path(folder) / "outside.py"
+            outside.write_bytes(CHECKOUT_FILES["spark/jobs/x.py"])
+            (root / "spark" / "jobs" / "x.py").unlink()
+            (root / "spark" / "jobs" / "x.py").symlink_to(outside)
+            return root
+
+        result, _, record = self.host_image_run(module, build)
+        self.assertEqual((False, False), result)
+        self.assertFalse(self.passed(record, "image source"))
+
+    def test_a_host_image_that_holds_other_files_than_the_manifest_lists_is_refused_whatever_the_checkout_says(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        for label, files in (
+            ("a file that differs", CHECKOUT_IMAGE_FILES.replace(blob_of(CHECKOUT_FILES["spark/jobs/x.py"]), SHA_X)),
+            ("a file that the commit does not hold", CHECKOUT_IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n"),
+            ("a file that is missing", "".join(line for line in CHECKOUT_IMAGE_FILES.splitlines(keepends=True) if "nessie" not in line)),
+            ("no listing", ""),
+        ):
+            with self.subTest(case=label):
+                result, calls, record = self.host_image_run(module, self.checkout_with, files)
+                self.assertEqual((False, False), result)
+                self.assertFalse(any(words.startswith("image tag") for words in calls.words()))
+                self.assertFalse(self.passed(record, "image source"))
+
     def test_the_record_holds_only_booleans_of_the_image_check_and_never_the_id_a_file_name_or_a_file_id(self) -> None:
         module = self.module(**{self.flag: "1"})
         for files in (IMAGE_FILES, IMAGE_FILES.replace(SHA_Y, "f6" * 20)):
@@ -1282,7 +1407,7 @@ class HostRunnerCase(unittest.TestCase):
                     mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **settings), clear=True),
                     tempfile.TemporaryDirectory(prefix="host_runner_") as folder,
                     calls.patches(module),
-                    mock.patch.object(module, "HOST", given),
+                    mock.patch.object(module, "HOST", False),
                 ):
                     module.select_settings()
                     stack = self.stack(module, folder)

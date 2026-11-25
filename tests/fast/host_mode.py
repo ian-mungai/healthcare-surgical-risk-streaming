@@ -18,6 +18,8 @@ A given Spark image is bound to the reviewed commit by its content and not by it
 image holds under ``/opt/jobs``, and ``source_problem`` compares the listing with the files that the commit's own Dockerfile copies there (every ``COPY`` into
 ``/opt/jobs``, read from the Dockerfile at run time, from the files of ``git ls-tree -r HEAD`` that the commit's Docker ignore file
 ``spark/Dockerfile.dockerignore`` does not leave out): a missing, extra or changed file refuses the image. The record keeps the Boolean only.
+A checkout with no Git history (the host's) has no ``git ls-tree``: ``manifest_source`` builds the same inputs from the deploy's ``runner_manifest.json``,
+checking each file that it uses against the manifest's SHA-256 and computing its blob ID from the checked bytes.
 
 Every Compose and Docker call of a run gets an explicit environment (``docker_environment``): the path, the home folder, what Docker itself needs and the run's
 own binding, never the caller's other settings. Compose lets a variable of the environment beat the env file, so a caller's ``WAREHOUSE_LOCATION`` or
@@ -26,8 +28,9 @@ own binding, never the caller's other settings. Compose lets a variable of the e
 
 from __future__ import annotations
 
+import hashlib
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +43,9 @@ IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 IMAGE_SOURCE_LINE = re.compile(r"([0-9a-f]{40}) (\S.*)")
 TREE_LINE = re.compile(r"[0-7]{6} blob ([0-9a-f]{40})\t(.+)")
 JOBS_FOLDER = "/opt/jobs"
+DOCKERFILE = "spark/Dockerfile"
+DOCKERIGNORE_FILE = "spark/Dockerfile.dockerignore"
+CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 # Run in the given image (``python -c``): the Git blob ID (SHA-1 of ``blob <size>`` and a zero byte before the content) and the path of each Python file under
 # /opt/jobs, one per line, sorted. The Dockerfile copies files there from ``spark``, ``scripts``, ``features``, ``casefile`` and ``replay``.
 SOURCE_SCRIPT = (
@@ -325,6 +331,52 @@ def source_problem(image_output: str, tree_output: str, dockerfile: str, dockeri
     if any(expected.get(path) != blob for path, blob in image.items()):
         return "image_source_differs"
     return "image_source_missing" if set(expected) - set(image) else None
+
+
+def blob_id(data: bytes) -> str:
+    """The Git blob ID of the content: the SHA-1 of ``blob <size>``, a zero byte and the content (what ``git hash-object`` prints)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+
+
+def manifest_source(files: Mapping[str, str], read: Callable[[str], bytes | None]) -> tuple[str, str, str] | None:
+    """The three inputs of ``source_problem`` for a checkout with no Git history, read from the deploy's source manifest, or None when any of them cannot be
+    trusted: ``(tree_output, dockerfile, dockerignore)``, with the same form as ``git ls-tree -r HEAD``, ``git show HEAD:spark/Dockerfile`` and
+    ``git show HEAD:spark/Dockerfile.dockerignore``.
+
+    ``files`` is the manifest's ``files`` map (path to SHA-256) and ``read`` gives the bytes of a path of the checkout, or None when it cannot be read. Each
+    file that is used (the Dockerfile, its Docker ignore file and every file that a ``COPY`` source of the Dockerfile names and the Docker ignore file does
+    not leave out) must be listed in the manifest and its bytes must have the listed SHA-256, so an edited, missing or unlisted file gives None. The listing
+    holds the Git blob ID that is computed from those verified bytes (the manifest holds no blob ID). A path with a control character (it could forge a line
+    of the listing) gives None. A file that the manifest does not list is not in the listing, as a file that the commit does not hold is not in the tree of
+    Git: ``source_problem`` then refuses the image (a copied file that is not in the listing is unreadable, an image file that it lacks is another build)."""
+
+    verified: dict[str, bytes | None] = {}
+
+    def checked(path: str) -> bytes | None:
+        if path not in verified:
+            data = read(path) if path in files else None
+            verified[path] = data if data is not None and hashlib.sha256(data).hexdigest() == files[path] else None
+        return verified[path]
+
+    try:
+        dockerfile = (checked(DOCKERFILE) or b"").decode()
+        dockerignore = (checked(DOCKERIGNORE_FILE) or b"").decode()
+    except UnicodeDecodeError:
+        return None
+    copies = dockerfile_copies(dockerfile)
+    rules = dockerignore_rules(dockerignore)
+    if not dockerfile or not dockerignore or not copies or rules is None:
+        return None
+    sources = {source.rstrip("/") for names, _ in copies for source in names}
+    lines: list[str] = []
+    for path in sorted(files):
+        if not any(path == source or path.startswith(f"{source}/") for source in sources) or dockerignored(path, rules):
+            continue
+        data = checked(path)
+        if data is None or CONTROL_CHARACTER.search(path):
+            return None
+        lines.append(f"100644 blob {blob_id(data)}\t{path}\n")
+    return ("".join(lines), dockerfile, dockerignore) if lines else None
 
 
 def read_env_file(text: str) -> dict[str, str]:
