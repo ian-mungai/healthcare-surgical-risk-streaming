@@ -11,7 +11,11 @@ which is the open diagnostic of the signals card). The host runs the same images
 limit, and a stalled step is stopped after half of the local wait. The run has a deadline of its own, and every active wait (a build, a job, a health wait, a
 Docker command) gets the shorter of its own limit and the rest of the run (``active_cap``), so that no wait goes past the deadline. The cleanup has a budget of
 its own (``cleanup_seconds``, ``cleanup_cap``). The whole run therefore ends within ``ceiling_seconds``, however many jobs it holds, apart from the seconds
-that a stopped command takes to leave (``KILL_WAIT_SECONDS`` in ``scripts/process.py``) and one call to Nessie (``call_seconds``) that straddles the deadline.
+that a stopped command takes to leave (``KILL_WAIT_SECONDS`` in ``scripts/process.py``). A call to Nessie reads the rest of the run at its own start
+(``remaining_seconds``): it gets the shorter of ``call_seconds`` and the rest, and it is not sent when nothing is left.
+
+A given Spark image is bound to the reviewed commit by its content and not by its ID alone: ``SOURCE_SCRIPT`` lists the Git blob ID of each Python file that the
+image holds under ``/opt/jobs``, and ``source_problem`` compares the listing with ``git ls-tree -r HEAD`` of the checkout. The record keeps the Boolean only.
 
 Every Compose and Docker call of a run gets an explicit environment (``docker_environment``): the path, the home folder, what Docker itself needs and the run's
 own binding, never the caller's other settings. Compose lets a variable of the environment beat the env file, so a caller's ``WAREHOUSE_LOCATION`` or
@@ -31,6 +35,18 @@ FOLDER_SETTINGS = ("LANDED_CACHE", "SIGNAL_CASE_CACHE")
 # settings that choose the daemon. Nothing else: no deployment setting and no ``COMPOSE_*`` setting.
 DOCKER_PASSTHROUGH = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY", "XDG_RUNTIME_DIR", "TMPDIR")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+IMAGE_SOURCE_LINE = re.compile(r"([0-9a-f]{40}) (\S.*)")
+TREE_LINE = re.compile(r"[0-7]{6} blob ([0-9a-f]{40})\t(.+)")
+JOB_SOURCES = "spark/"
+# Run in the given image (``python -c``): the Git blob ID (SHA-1 of ``blob <size>`` and a zero byte before the content) and the path of each Python file under
+# /opt/jobs, one per line, sorted. The Dockerfile copies ``spark``, and a part of ``scripts`` and ``features``, there.
+SOURCE_SCRIPT = (
+    "import hashlib, pathlib\n"
+    "root = pathlib.Path('/opt/jobs')\n"
+    "for path in sorted(root.rglob('*.py')):\n"
+    "    data = path.read_bytes()\n"
+    "    print(hashlib.sha1(b'blob %d\\0' % len(data) + data).hexdigest(), path.relative_to(root).as_posix())\n"
+)
 IMAGE_REFERENCE = re.compile(
     r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
 )
@@ -153,6 +169,30 @@ def image_id_problem(actual: str, expected: str) -> str | None:
     return None if actual == expected else "image_id_mismatch"
 
 
+def source_problem(image_output: str, tree_output: str) -> str | None:
+    """A fixed code when the Python files that the given image holds are not the files of the reviewed commit, or None when they are.
+
+    ``image_output`` is what ``SOURCE_SCRIPT`` printed in the image and ``tree_output`` is ``git ls-tree -r HEAD`` of the checkout. Every file of the image must
+    be a file of the commit with the same Git blob ID, and every ``spark/`` Python file of the commit must be in the image (the Dockerfile copies the whole
+    folder). A listing with no file, a line that is not a listing line and a commit with no ``spark/`` file are never a match.
+    """
+    image: dict[str, str] = {}
+    for line in image_output.splitlines():
+        if not line.strip():
+            continue
+        found = IMAGE_SOURCE_LINE.fullmatch(line)
+        if found is None:
+            return "image_source_unreadable"
+        image[found.group(2)] = found.group(1)
+    committed = {found.group(2): found.group(1) for line in tree_output.splitlines() if (found := TREE_LINE.fullmatch(line)) and found.group(2).endswith(".py")}
+    jobs = {path for path in committed if path.startswith(JOB_SOURCES)}
+    if not image or not jobs:
+        return "image_source_unreadable"
+    if any(committed.get(path) != blob for path, blob in image.items()):
+        return "image_source_differs"
+    return "image_source_missing" if jobs - set(image) else None
+
+
 def read_env_file(text: str) -> dict[str, str]:
     """The ``NAME=value`` lines of a Compose env file. A blank line, a comment and a line without a name or without ``=`` are skipped."""
     values: dict[str, str] = {}
@@ -196,6 +236,14 @@ def active_cap(started: float, now: float, limits: Limits, step_seconds: float) 
         return step_seconds
     remaining = limits.run_seconds - max(0.0, now - started)
     return None if remaining <= 0 else min(step_seconds, remaining)
+
+
+def remaining_seconds(started: float, now: float, limits: Limits) -> float | None:
+    """The seconds of the run that are left at ``now``, never below zero, or None when the run has no deadline. A caller reads it at the start of each call
+    (never earlier), so that the call gets the shorter of its own limit and the rest of the run."""
+    if limits.run_seconds is None:
+        return None
+    return max(0.0, limits.run_seconds - max(0.0, now - started))
 
 
 def cleanup_cap(cleanup_started: float | None, now: float, limits: Limits, step_seconds: float) -> float | None:

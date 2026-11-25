@@ -19,14 +19,20 @@ Failure modes covered here:
   own, or the job's own deadline was longer than the cap that it was given.
 - A given Spark image was taken by its tag only (the tag moved, or named another build than the tested one) and nothing recorded its immutable ID.
 - The host check counted the services' limits only and not the host's reserve in ``compose/limits.yml``.
+- A given Spark image with the recorded ID was taken as the tested build though the files in it were not the files of the reviewed commit (the ID alone binds
+  nothing to a revision), or the check passed on a listing that held no file.
+- A call to Nessie got its own 30 seconds with only seconds of the run left, because the rest of the run was read before the call and not at its start.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.process import run_command
 from tests.fast import host_mode
 from tests.fast.host_mode import (
     HOST_LIMITS,
@@ -44,6 +50,8 @@ from tests.fast.host_mode import (
     memory_problem,
     pinned_folders,
     read_env_file,
+    remaining_seconds,
+    source_problem,
 )
 
 LANDED_DEFAULT, EXTRA_DEFAULT = Path("/default/landed"), Path("/default/extra")
@@ -356,6 +364,69 @@ class JobDeadlineTest(unittest.TestCase):
         self.assertIsNone(job_deadline_for(margin, HOST_LIMITS))
         self.assertIsNone(job_deadline_for(0.5, HOST_LIMITS))
         self.assertEqual(1, job_deadline_for(margin + 1, HOST_LIMITS))
+
+
+class RemainingTest(unittest.TestCase):
+    def test_a_run_with_a_deadline_has_the_rest_of_it_left_at_every_reading(self) -> None:
+        self.assertEqual(5400.0, remaining_seconds(100.0, 100.0, HOST_LIMITS))
+        self.assertEqual(5300.0, remaining_seconds(100.0, 200.0, HOST_LIMITS))
+        self.assertEqual(20.0, remaining_seconds(0.0, 5380.0, HOST_LIMITS))
+
+    def test_a_run_past_its_deadline_has_nothing_left_never_a_negative_figure(self) -> None:
+        self.assertEqual(0.0, remaining_seconds(0.0, 5400.0, HOST_LIMITS))
+        self.assertEqual(0.0, remaining_seconds(0.0, 10.0**6, HOST_LIMITS))
+
+    def test_a_clock_that_goes_back_does_not_lengthen_the_run(self) -> None:
+        self.assertEqual(5400.0, remaining_seconds(100.0, 50.0, HOST_LIMITS))
+
+    def test_a_local_run_has_no_deadline_so_nothing_is_left_to_count(self) -> None:
+        self.assertIsNone(remaining_seconds(0.0, 10.0**6, LOCAL_LIMITS))
+
+
+SHA_X, SHA_Y, SHA_Z = "a1" * 20, "b2" * 20, "c3" * 20
+TREE = (
+    f"100644 blob {SHA_X}\tspark/jobs/x.py\n100644 blob {SHA_Y}\tspark/silver/y.py\n100644 blob {SHA_Z}\tscripts/stack/nessie.py\n"
+    f"100644 blob {'d4' * 20}\tspark/Dockerfile\n100644 blob {'e5' * 20}\tREADME.md\n"
+)
+IMAGE_FILES = f"{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n{SHA_Z} scripts/stack/nessie.py\n"
+
+
+class SourceProblemTest(unittest.TestCase):
+    def test_an_image_that_holds_exactly_the_committed_files_it_copies_is_the_tested_build(self) -> None:
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE))
+
+    def test_an_image_file_that_differs_from_the_committed_file_is_another_build(self) -> None:
+        changed = IMAGE_FILES.replace(SHA_Y, "f6" * 20)
+        self.assertEqual("image_source_differs", source_problem(changed, TREE))
+
+    def test_an_image_file_that_the_commit_does_not_hold_is_another_build(self) -> None:
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n", TREE))
+
+    def test_a_committed_job_file_that_the_image_lacks_is_another_build(self) -> None:
+        self.assertEqual("image_source_missing", source_problem(f"{SHA_X} spark/jobs/x.py\n{SHA_Z} scripts/stack/nessie.py\n", TREE))
+
+    def test_a_committed_file_outside_the_jobs_folder_that_the_image_does_not_copy_is_not_missing(self) -> None:
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE + f"100644 blob {'a9' * 20}\tscripts/other.py\n"))
+
+    def test_a_listing_with_no_file_is_unreadable_and_never_a_match(self) -> None:
+        for listing in ("", "\n", "not a listing line\n", f"{SHA_X}  spark/jobs/x.py\n"):
+            with self.subTest(listing=listing):
+                self.assertEqual("image_source_unreadable", source_problem(listing, TREE))
+
+    def test_a_tree_without_any_job_file_is_unreadable_and_never_a_match(self) -> None:
+        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, ""))
+        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, f"100644 blob {SHA_Z}\tscripts/stack/nessie.py\n"))
+
+    def test_the_script_that_the_image_runs_prints_the_git_id_and_the_path_of_each_python_file_under_the_jobs_folder(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="host_mode_source_") as folder:
+            jobs = Path(folder) / "jobs"
+            (jobs / "spark").mkdir(parents=True)
+            (jobs / "spark" / "a.py").write_bytes(b"x = 1\n")
+            (jobs / "spark" / "note.txt").write_text("not python")
+            script = host_mode.SOURCE_SCRIPT.replace("/opt/jobs", str(jobs))
+            answered = run_command(sys.executable, ["-I", "-c", script], timeout=30, check=True).stdout
+        git_id = "7d4290a117a4ddcc11daae7ea675841033830c8f"  # git hash-object of the file content "x = 1\n"
+        self.assertEqual(f"{git_id} spark/a.py\n", answered)
 
 
 if __name__ == "__main__":

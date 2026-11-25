@@ -22,6 +22,15 @@ Failure modes covered here:
   record passing.
 - A build, a job, a health wait or a Docker command got its full limit with only seconds of the run left, so the run went past its deadline; the cleanup had no
   budget of its own; a job's own deadline was longer than its cap, so the runner stopped a job that was still inside its own deadline.
+- The cleanup deleted the run's Nessie references one by one before it removed a container, so a slow Nessie spent the cleanup budget and the containers, the
+  volumes and the image were left; a container listing that failed was followed by the removal of the volumes and networks that the container still held; a
+  container that the last listing found was not removed.
+- A call to Nessie and the launch of a job took the rest of the run before the steps that come first (the scratch folder, the container listing), so a step
+  could start with a cap longer than the rest of the run.
+- A given image with the recorded ID was taken as the tested build though the Python files in it were not the files of the reviewed commit; the record held
+  the ID or a file name; the header of a runner promised a raw ``spark_image_id`` that the record does not hold.
+- The memory was read before the password file and the warehouse volume were made, so their seconds were not between the reading and the first service.
+- A fast test bound a real loopback port, and the scratch folder was left when the setup failed before the first service.
 """
 
 from __future__ import annotations
@@ -34,6 +43,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -45,6 +55,7 @@ from scripts.process import TimeoutExpired
 from scripts.sample.candidates import CANDIDATES_FILE, read_candidates
 from scripts.stack.limits import load_limits
 from tests.e2e.run_record import Record
+from tests.fast import host_mode
 from tests.fast.host_mode import HOST_LIMITS, LOCAL_LIMITS
 from tests.fast.test_runner_gold_sealed import runner
 
@@ -54,6 +65,13 @@ GIB = 1024**3
 SETTING_NAMES = ("LANDED_CACHE", "SIGNAL_CASE_CACHE", "SPARK_IMAGE", "SPARK_IMAGE_ID", *FLAGS.values())
 IMAGE_ID = "sha256:" + "ab" * 32
 OTHER_ID = "sha256:" + "cd" * 32
+SHA_X, SHA_Y, SHA_Z = "a1" * 20, "b2" * 20, "c3" * 20
+# What ``git ls-tree -r HEAD`` says of the reviewed commit, and what the image's own listing says of the Python files under /opt/jobs.
+TREE = (
+    f"100644 blob {SHA_X}\tspark/jobs/x.py\n100644 blob {SHA_Y}\tspark/silver/y.py\n100644 blob {SHA_Z}\tscripts/stack/nessie.py\n"
+    f"100644 blob {'d4' * 20}\tspark/Dockerfile\n100644 blob {'e5' * 20}\tREADME.md\n"
+)
+IMAGE_FILES = f"{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n{SHA_Z} scripts/stack/nessie.py\n"
 # Settings of the deployed stack and of Compose that a caller may have exported. None of them may reach a call of the run.
 BOUND = {"WAREHOUSE_LOCATION", "NESSIE_URI", "AWS_REGION", "POSTGRES_HOST_PORT", "MEM_LIMIT_SPARK"}
 DEPLOYED = {
@@ -297,6 +315,63 @@ class HostRunnerCase(unittest.TestCase):
         self.assertLessEqual(deadline, given["timeout"] - (HOST_LIMITS.job_seconds - HOST_LIMITS.job_deadline_seconds))
         self.assertGreater(deadline, 350)
 
+    def test_a_job_takes_the_rest_of_the_run_when_it_launches_and_not_before_its_scratch_folder_is_made(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls = Calls()
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module), mock.patch.object(module, "read_result", lambda *_: None):
+            stack = self.stack(module, folder)
+            self.left(stack, 600)
+            made = module.tempfile.mkdtemp
+
+            def slow(*args: Any, **given: Any) -> str:
+                stack.started -= 200
+                return str(made(*args, **given))
+
+            with mock.patch.object(module.tempfile, "mkdtemp", slow):
+                stack.job(["-m", "spark.jobs.x", "build"])
+        ((_, command, given),) = calls.items
+        self.assertLessEqual(given["timeout"], 400)
+        deadline = int(command[command.index("--env") + 1].split("=")[1])
+        self.assertLessEqual(deadline, given["timeout"] - (HOST_LIMITS.job_seconds - HOST_LIMITS.job_deadline_seconds))
+
+    def test_a_job_whose_rest_of_the_run_is_spent_while_its_scratch_folder_is_made_is_not_started(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls = Calls()
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module):
+            stack = self.stack(module, folder)
+            self.left(stack, 600)
+            made = module.tempfile.mkdtemp
+
+            def slow(*args: Any, **given: Any) -> str:
+                stack.started -= 590
+                return str(made(*args, **given))
+
+            with mock.patch.object(module.tempfile, "mkdtemp", slow), self.assertRaises(RuntimeError):
+                stack.job(["-m", "spark.jobs.x", "build"])
+        self.assertEqual([], calls.items)
+
+    def test_the_stack_gives_the_rest_of_the_run_to_a_call_to_nessie_and_a_local_run_has_no_rest_to_give(self) -> None:
+        host, local = self.module(**{self.flag: "1"}), self.module()
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder:
+            stack = self.stack(host, folder)
+            self.left(stack, 40)
+            left = stack.run_left()
+            self.assertIsNotNone(left)
+            self.assertLessEqual(left or 0, 40)
+            self.assertGreater(left or 0, 30)
+            self.left(stack, -5)
+            self.assertEqual(0, stack.run_left())
+            self.assertIsNone(self.stack(local, folder).run_left())
+
+    def test_the_client_of_the_run_asks_the_stack_for_the_rest_of_the_run_at_the_start_of_each_call(self) -> None:
+        function = next(
+            node for node in ast.walk(ast.parse((E2E / f"{self.NAME}.py").read_text())) if isinstance(node, ast.FunctionDef) and node.name == "run_local"
+        )
+        clients = [node for node in ast.walk(function) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "NessieClient"]
+        self.assertEqual(1, len(clients))
+        (remaining,) = [keyword.value for keyword in clients[0].keywords if keyword.arg == "remaining"]
+        self.assertEqual("stack.run_left", ast.unparse(remaining))
+
     def test_a_host_job_with_no_more_than_its_margin_left_is_not_started(self) -> None:
         module = self.module(**{self.flag: "1"})
         calls = Calls()
@@ -438,14 +513,20 @@ class HostRunnerCase(unittest.TestCase):
                 found.append((name, node.lineno))
         return found
 
-    def test_the_memory_is_read_after_the_image_step_and_before_the_first_service_starts(self) -> None:
+    def test_the_memory_is_read_after_the_image_the_warehouse_volume_and_the_password_file_and_right_before_the_first_service_starts(self) -> None:
         module = self.module()
         found = self.run_local_calls(module)
-        image = min(line for name, line in found if name == "prepare_image")
+        first = {
+            name: min(line for found_name, line in found if found_name == name) for name in ("prepare_image", "prepare_warehouse", "place_nessie_password")
+        }
         memory = min(line for name, line in found if name == "memory_before_start")
         first_start = min(line for name, line in found if name == "up")
-        self.assertLess(image, memory)
+        for name, line in first.items():
+            with self.subTest(step=name):
+                self.assertLess(line, memory)
         self.assertLess(memory, first_start)
+        between = [name for name, line in found if memory < line < first_start and name not in ("memory_before_start", "up")]
+        self.assertEqual([], between, "a step runs between the memory reading and the first service")
 
     def deployed(self) -> Any:
         return mock.patch.dict(os.environ, {**clean_environment(), **DEPLOYED, "PATH": os.environ.get("PATH", "/usr/bin")}, clear=True)
@@ -568,13 +649,56 @@ class HostRunnerCase(unittest.TestCase):
         self.assertTrue(confirmed)
         self.assertEqual(3, sum(1 for words in calls.words() if words.startswith(("rm ", "volume rm", "network rm"))))
 
-    def test_a_timeout_of_one_cleanup_command_does_not_skip_the_rest_and_the_removal_is_not_confirmed(self) -> None:
+    def test_a_container_listing_that_times_out_is_tried_again_a_bounded_number_of_times_and_no_dependent_resource_is_removed(self) -> None:
         module = self.module(**{self.flag: "1"})
         confirmed, calls = self.removal(module, lambda args: TimeoutExpired("docker", 1) if args[0] == "ps" else "")
         self.assertFalse(confirmed)
         words = calls.words()
-        self.assertTrue(any(line.startswith("volume ls") for line in words))
-        self.assertTrue(any(line.startswith("network ls") for line in words))
+        self.assertEqual(module.CLEANUP_ROUNDS, sum(1 for line in words if line.startswith("ps -aq")))
+        self.assertFalse(
+            any(line.startswith(("volume rm", "network rm", "rm ")) for line in words), "a volume or a network was removed while a container may hold it"
+        )
+
+    def test_a_container_listing_that_fails_once_is_tried_again_and_the_removal_goes_on(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        steps = {"ps": [(1, ""), (0, "abc\n"), (0, "")], "volume": [(0, "vol\n"), (0, "")], "network": [(0, "net\n"), (0, "")]}
+        last = {"code": 0}
+
+        def answer(args: list[str]) -> str:
+            if "--filter" in args and args[0] in steps:
+                last["code"], output = steps[args[0]].pop(0)
+                return output
+            last["code"] = 0
+            return ""
+
+        confirmed, calls = self.removal(module, answer, lambda _: last["code"])
+        words = calls.words()
+        self.assertTrue(confirmed)
+        self.assertEqual(3, sum(1 for line in words if line.startswith("ps -aq")))
+        self.assertLess(
+            max(i for i, line in enumerate(words) if line.startswith("ps -aq")), min(i for i, line in enumerate(words) if line.startswith("volume rm"))
+        )
+
+    def test_a_container_that_the_last_listing_finds_is_removed_too(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        listings = {"ps": ["abc\n", "def\n", ""], "volume": [""], "network": [""]}
+        confirmed, calls = self.removal(module, lambda args: listings[args[0]].pop(0) if "--filter" in args and args[0] in listings else "")
+        self.assertTrue(confirmed)
+        removed = [line for line in calls.words() if line.startswith("rm -f")]
+        self.assertEqual(["rm -f --volumes abc", "rm -f --volumes def"], removed)
+
+    def test_containers_that_keep_coming_back_are_removed_each_time_but_the_removal_stays_bounded_and_unconfirmed(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        counter = iter(range(100))
+        confirmed, calls = self.removal(module, lambda args: f"c{next(counter)}\n" if args[0] == "ps" and "--filter" in args else "")
+        words = calls.words()
+        self.assertFalse(confirmed)
+        self.assertEqual(module.CLEANUP_ROUNDS, sum(1 for line in words if line.startswith("ps -aq")))
+        self.assertEqual(module.CLEANUP_ROUNDS, sum(1 for line in words if line.startswith("rm -f")), "the container of the last listing was not removed")
+        self.assertFalse(any(line.startswith(("volume rm", "network rm")) for line in words))
+
+    def test_the_cleanup_is_bounded_by_a_few_rounds(self) -> None:
+        self.assertLessEqual(self.module(**{self.flag: "1"}).CLEANUP_ROUNDS, 3)
 
     def test_a_removal_that_fails_and_leaves_the_object_in_the_listing_is_not_confirmed(self) -> None:
         module = self.module(**{self.flag: "1"})
@@ -595,11 +719,11 @@ class HostRunnerCase(unittest.TestCase):
         def code(args: list[str]) -> int:
             if args[:2] == ["network", "ls"]:
                 seen.append("ls")
-                return 1 if len(seen) == 2 else 0
+                return 0 if len(seen) == 1 else 1
             return 0
 
-        confirmed, _ = self.removal(module, lambda _: "", code)
-        self.assertEqual(2, len(seen))
+        confirmed, _ = self.removal(module, lambda args: "net\n" if args[:2] == ["network", "ls"] else "", code)
+        self.assertEqual(module.CLEANUP_ROUNDS, len(seen))
         self.assertFalse(confirmed)
 
     def cleaned(
@@ -622,6 +746,29 @@ class HostRunnerCase(unittest.TestCase):
     def passed(self, record: Any, case: str) -> bool:
         (observation,) = [item for item in record.observations if item.case == case]
         return bool(observation.passed)
+
+    def test_the_cleanup_removes_the_containers_first_then_the_volumes_the_networks_and_the_image_tag(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        listings = {"ps": ["abc\n", ""], "volume": ["vol\n", ""], "network": ["net\n", ""]}
+        record, calls, _ = self.cleaned(
+            module, created=True, answer=lambda args: listings[args[0]].pop(0) if "--filter" in args and args[0] in listings else ""
+        )
+        words = calls.words()
+        order = [next(i for i, line in enumerate(words) if line.startswith(prefix)) for prefix in ("rm -f --volumes", "volume rm", "network rm", "rmi ")]
+        self.assertEqual(sorted(order), order)
+        self.assertTrue(all(item.passed for item in record.observations))
+
+    def test_the_run_deletes_no_reference_one_by_one_because_its_own_nessie_goes_with_the_project_and_still_keeps_its_facts(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        nessie = mock.Mock()
+        stack = types.SimpleNamespace(stalls=[], cleanup_left=forbidden)
+        run = types.SimpleNamespace(tags=[("tag", "hash")], made=["branch", "other"], nessie=nessie, facts={"kept": "fact"}, stack=stack)
+        record = Record(feature="f", slug="s", rerun="r")
+        with mock.patch.object(module, "run_command", forbidden), mock.patch.object(module, "run_discarding_output", forbidden):
+            self.assertTrue(module.finish(run, record))
+        self.assertEqual([], nessie.mock_calls)
+        self.assertEqual("fact", record.environment["kept"])
+        self.assertNotIn("delete_reference", (E2E / f"{self.NAME}.py").read_text())
 
     def test_a_cleanup_step_that_raises_does_not_skip_the_image_the_scratch_folder_or_the_record(self) -> None:
         module = self.module(**{self.flag: "1"})
@@ -667,9 +814,19 @@ class HostRunnerCase(unittest.TestCase):
         self.assertNotEqual(module.IMAGE_TAG, tag)
         self.assertNotIn("surgical-risk-spark:4.1.4", [word for args in removed for word in args])
 
-    def image_run(self, module: ModuleType, *, given: bool, answer: Any, code: Any = None) -> tuple[tuple[bool, bool], Calls, Record]:
+    def image_run(
+        self, module: ModuleType, *, given: bool, answer: Any, code: Any = None, files: str = IMAGE_FILES, tree: str = TREE
+    ) -> tuple[tuple[bool, bool], Calls, Record]:
+        def with_source(args: list[str]) -> Any:
+            """The answers of the two source calls (the commit's tree and the Python files in the image) beside the test's own."""
+            if "ls-tree" in args:
+                return tree
+            if args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT:
+                return files
+            return answer(args)
+
         record = Record(feature="f", slug="s", rerun="r")
-        calls = Calls(answer, code)
+        calls = Calls(with_source, code)
         settings = self.given_image() if given else {}
         with (
             mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **settings), clear=True),
@@ -733,6 +890,75 @@ class HostRunnerCase(unittest.TestCase):
         self.assertEqual((False, False), result)
         self.assertFalse(any(words.startswith("image tag") for words in calls.words()))
 
+    def test_a_given_image_with_the_recorded_id_is_read_for_its_files_by_its_id_in_a_container_that_carries_the_project_label_and_has_no_network(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        result, calls, record = self.image_run(module, given=True, answer=lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else "")
+        self.assertEqual((True, True), result)
+        (probe,) = [args for _, args, _ in calls.items if args[:1] == ["run"]]
+        self.assertIn("com.docker.compose.project=project", probe)
+        self.assertEqual("--label", probe[probe.index("com.docker.compose.project=project") - 1])
+        self.assertEqual("none", probe[probe.index("--network") + 1])
+        self.assertIn(IMAGE_ID, probe)
+        self.assertNotIn("surgical-risk-spark:4.1.4", probe)
+        (tree,) = [args for _, args, _ in calls.items if "ls-tree" in args]
+        self.assertEqual("HEAD", tree[tree.index("ls-tree") + 2])
+        self.assertTrue(self.passed(record, "image source"))
+
+    def test_a_given_image_with_the_recorded_id_but_other_files_than_the_commit_is_refused_and_nothing_is_tagged(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        for label, files in (
+            ("a file that differs", IMAGE_FILES.replace(SHA_Y, "f6" * 20)),
+            ("a file that the commit does not hold", IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n"),
+            ("a job file that is missing", f"{SHA_X} spark/jobs/x.py\n"),
+            ("no listing", ""),
+        ):
+            with self.subTest(case=label):
+                result, calls, record = self.image_run(
+                    module, given=True, answer=lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else "", files=files
+                )
+                self.assertEqual((False, False), result)
+                self.assertFalse(any(words.startswith(("build", "image tag")) for words in calls.words()))
+                self.assertFalse(self.passed(record, "image source"))
+
+    def test_a_given_image_whose_files_cannot_be_read_or_whose_commit_cannot_be_listed_is_refused(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        for failing in ("probe", "tree"):
+            with self.subTest(failing=failing):
+
+                def code(args: list[str], failing: str = failing) -> int:
+                    probed = args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT
+                    return 1 if (failing == "probe" and probed) or (failing == "tree" and "ls-tree" in args) else 0
+
+                result, calls, record = self.image_run(
+                    module, given=True, answer=lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else "", code=code
+                )
+                self.assertEqual((False, False), result)
+                self.assertFalse(any(words.startswith("image tag") for words in calls.words()))
+                self.assertFalse(self.passed(record, "image source"))
+
+    def test_the_record_holds_only_booleans_of_the_image_check_and_never_the_id_a_file_name_or_a_file_id(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        for files in (IMAGE_FILES, IMAGE_FILES.replace(SHA_Y, "f6" * 20)):
+            _, _, record = self.image_run(module, given=True, answer=lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else "", files=files)
+            text = " ".join(item.observed for item in record.observations) + " " + str(record.environment)
+            for private in (IMAGE_ID, "ab" * 32, SHA_X, SHA_Y, SHA_Z, "f6" * 20, "spark/jobs", "x.py", "nessie.py"):
+                self.assertNotIn(private, text)
+        self.assertIn("the image files are the files of the commit", observed(record, "image source"))
+
+    def test_a_run_that_builds_the_image_reads_no_source_listing_because_the_build_is_from_the_checkout(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        _, calls, _ = self.image_run(module, given=False, answer=lambda _: "")
+        self.assertFalse(any("ls-tree" in args or args[:1] == ["run"] for _, args, _ in calls.items))
+
+    def test_the_header_of_the_runner_promises_no_raw_image_id_and_names_the_check_of_the_files(self) -> None:
+        text = (E2E / f"{self.NAME}.py").read_text()
+        header = text[: text.index("from __future__")]
+        self.assertNotIn("spark_image_id", header)
+        self.assertNotIn("spark_image_id", text)
+        self.assertIn("SPARK_IMAGE_ID", header)
+        self.assertIn("/opt/jobs", header)
+        self.assertIn("Boolean", header)
+
     def test_a_tag_that_could_not_be_made_from_the_verified_id_is_not_counted_as_created_by_a_success(self) -> None:
         module = self.module(**{self.flag: "1"})
         result, _, record = self.image_run(
@@ -754,6 +980,10 @@ class HostRunnerCase(unittest.TestCase):
                 def answer(args: list[str], given: bool = given, command: str = command) -> Any:
                     if args[:2] == ["image", "inspect"]:
                         return f"{IMAGE_ID}\n"
+                    if "ls-tree" in args:
+                        return TREE
+                    if args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT:
+                        return IMAGE_FILES
                     if args[:1] == [command] and (args[:2] == ["image", "tag"] or not given):
                         return TimeoutExpired("docker", 1)
                     return ""
@@ -770,18 +1000,52 @@ class HostRunnerCase(unittest.TestCase):
                         module.prepare_image(stack, record)
                 self.assertTrue(stack.image_created)
 
-    def run_refused_at_preflight(self, module: ModuleType) -> Calls:
+    def extra(self) -> tuple[Any, ...]:
+        return (read_candidates(CANDIDATES_FILE),) if self.NAME == "silver_signals" else (Path("/no/such/extra"),)
+
+    def run_local_with(self, module: ModuleType, record: Record, *patches: Any) -> Calls:
+        """Run ``run_local`` with the host settings, no process, no real port (the allocation is a stand-in, any socket fails the test) and the patches."""
         calls = Calls(lambda _: "")
-        record = Record(feature="f", slug="s", rerun="r")
-        extra = (read_candidates(CANDIDATES_FILE),) if self.NAME == "silver_signals" else (Path("/no/such/extra"),)
+        ports = iter(range(60001, 60100))
         with (
             mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **self.given_image()), clear=True),
             calls.patches(module),
-            mock.patch.object(module, "preflight", lambda *_, **__: None),
+            mock.patch.object(module, "free_port", lambda taken: next(ports)),
+            mock.patch.object(module.socket, "socket", forbidden),
+            contextlib.ExitStack() as stack,
         ):
+            for patch in patches:
+                stack.enter_context(patch)
             module.select_settings()
-            module.run_local(record, [], Path("/no/such/cache"), *extra)
+            module.run_local(record, [], Path("/no/such/cache"), *self.extra())
         return calls
+
+    def run_refused_at_preflight(self, module: ModuleType) -> Calls:
+        return self.run_local_with(module, Record(feature="f", slug="s", rerun="r"), mock.patch.object(module, "preflight", lambda *_, **__: None))
+
+    def test_a_fast_run_of_the_setup_binds_no_port_of_its_own(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        self.run_refused_at_preflight(module)
+
+    def test_the_scratch_folder_is_removed_when_the_setup_fails_before_the_first_service(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        failures = {
+            "no free port": mock.patch.object(module, "free_port", mock.Mock(side_effect=RuntimeError("no free port"))),
+            "no compose copy": mock.patch.object(module.shutil, "copytree", mock.Mock(side_effect=OSError("disk"))),
+        }
+        for label, failure in failures.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix="host_runner_") as parent:
+                scratch = Path(parent) / "scratch"
+                record = Record(feature="f", slug="s", rerun="r")
+
+                def made(*_: Any, scratch: Path = scratch, **__: Any) -> str:
+                    scratch.mkdir()
+                    return str(scratch)
+
+                with mock.patch.object(module.tempfile, "mkdtemp", made), self.assertRaises((RuntimeError, OSError)):
+                    self.run_local_with(module, record, failure)
+                self.assertFalse(scratch.exists(), "the scratch folder was left")
+                self.assertTrue(self.passed(record, "scratch folder removed"))
 
     def test_a_preflight_refusal_removes_no_image_and_builds_none_and_every_call_has_the_environment(self) -> None:
         module = self.module(**{self.flag: "1"})
