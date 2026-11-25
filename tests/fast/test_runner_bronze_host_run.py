@@ -17,6 +17,8 @@ Failure modes covered here:
 - The private trunk is tagged without a check of the checked hash and of the four snapshot IDs (an extra Bronze table included), the default-branch rule of the
   shared tag step refuses it, a tag that existed before the run is adopted, the record is saved late (an interrupt leaves a tag without it), the retained tag is
   not checked against the saved record, or a pass is printed with no tag evidence in the run's folder.
+- An interrupt right after Nessie accepted the tag post leaves a tag that no file of the run's folder names: the pending tag record is not saved before
+  the post, is not kept on every outcome, is marked complete before the tag is verified, or a pass is printed while it is not complete.
 - A case file is read before the whole run's object versions are confirmed, or before the Spark workload's own access is proved.
 """
 
@@ -40,7 +42,7 @@ from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.ingestion.manifest import ManifestRef
-from scripts.stack.nessie import NessieConflict, NessieError
+from scripts.stack.nessie import NessieConflict, NessieError, Reference
 from scripts.stack.tags import NotOnTrunk, TagConflict, tag_and_record
 from tests.e2e import run_record
 from tests.e2e.run_record import Record
@@ -747,6 +749,15 @@ class TagProof(Hosted):
         self.assertFalse(passed)
         self.assertIn("no saved record", text)
 
+    def test_a_tag_whose_pending_record_is_not_complete_is_a_failure_that_names_the_record(self) -> None:
+        (self.run_folder / "data_version.json").unlink()
+        pending = json.loads((self.run_folder / "tag_pending.json").read_text())
+        (self.run_folder / "tag_pending.json").write_text(json.dumps({**pending, "state": "pending"}))
+        passed, text = self.module.prove_tag(self.host)
+        self.assertFalse(passed)
+        self.assertIn("tag_pending.json", text)
+        self.assertIn(self.tag, text)
+
     def test_a_saved_record_with_no_tag_is_a_failure(self) -> None:
         del self.nessie.references[self.tag]
         passed, text = self.module.prove_tag(self.host)
@@ -944,6 +955,79 @@ class PrivateTrunk(Hosted):
         self.assertEqual(SNAPSHOTS, {item["table"]: item["snapshot_id"] for item in saved["tables"]})
         self.assertEqual([], [item.name for item in self.folder.iterdir() if item.name.startswith(".writing_")])
 
+    def pending_file(self) -> dict[str, Any]:
+        return json.loads((self.folder / "tag_pending.json").read_text())  # type: ignore[no-any-return]
+
+    def test_a_pending_record_is_saved_before_the_tag_is_posted(self) -> None:
+        seen: list[dict[str, Any]] = []
+        original = self.nessie.create_reference
+
+        def watched(kind: str, name: str, source: Any) -> Any:
+            if kind == "TAG":
+                seen.append(self.pending_file() if (self.folder / "tag_pending.json").exists() else {})
+            return original(kind, name, source)
+
+        with mock.patch.object(self.nessie, "create_reference", side_effect=watched):
+            self.tag()
+        self.assertEqual(1, len(seen))
+        self.assertEqual(("pending", f"run-{PREFIX}", CHECKED), (seen[0].get("state"), seen[0].get("tag"), seen[0].get("hash")))
+        self.assertEqual(SNAPSHOTS, {item["table"]: item["snapshot_id"] for item in seen[0].get("tables", [])})
+
+    def test_an_interrupt_right_after_the_post_is_accepted_keeps_a_pending_record_that_names_the_tag(self) -> None:
+        tag = f"run-{PREFIX}"
+        original = self.nessie.create_reference
+
+        def accepted_then_interrupted(kind: str, name: str, source: Any) -> Any:
+            original(kind, name, source)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(self.nessie, "create_reference", side_effect=accepted_then_interrupted), self.assertRaises(KeyboardInterrupt):
+            self.tag()
+        self.assertEqual(("TAG", CHECKED), self.nessie.references[tag])
+        held = self.pending_file()
+        self.assertEqual(("pending", tag, CHECKED, PREFIX), (held["state"], held["tag"], held["hash"], held["run_id"]))
+        self.assertEqual(SNAPSHOTS, {item["table"]: item["snapshot_id"] for item in held["tables"]})
+        self.assertEqual([], [item.name for item in self.folder.iterdir() if item.name.startswith((".writing_", ".pending_"))])
+
+    def test_the_pending_record_is_marked_complete_after_the_tag_is_verified(self) -> None:
+        _, record = self.tag()
+        held = self.pending_file()
+        self.assertEqual("complete", held["state"])
+        self.assertEqual(record, {key: value for key, value in held.items() if key != "state"})
+
+    def test_a_failed_check_after_the_post_leaves_the_pending_record_not_complete(self) -> None:
+        tag = f"run-{PREFIX}"
+        original = self.nessie.reference
+
+        def moved(name: str) -> Any:
+            result = original(name)
+            return Reference("TAG", name, HASH_ONE) if name == tag and result.kind == "TAG" else result
+
+        with mock.patch.object(self.nessie, "reference", side_effect=moved), self.assertRaises(self.module.TagProblem) as caught:
+            self.tag()
+        self.assertEqual("tag_not_at_hash", caught.exception.code)
+        self.assertEqual(("pending", tag, CHECKED), (self.pending_file()["state"], self.pending_file()["tag"], self.pending_file()["hash"]))
+
+    def test_a_refusal_before_the_post_writes_no_pending_record(self) -> None:
+        self.nessie.references[TRUNK] = ("BRANCH", HASH_TWO)
+        with self.assertRaises(self.module.TagProblem):
+            self.tag()
+        self.assertFalse((self.folder / "tag_pending.json").exists())
+
+    def test_a_pending_record_that_cannot_be_saved_stops_the_step_before_the_post(self) -> None:
+        (self.folder / "tag_pending.json").mkdir()
+        with self.assertRaises(self.module.TagProblem) as caught:
+            self.tag()
+        self.assertEqual("pending_not_saved", caught.exception.code)
+        self.assertEqual([], self.nessie.writes())
+        self.assertFalse((self.folder / "data_version.json").exists())
+        self.assertEqual([], [item.name for item in self.folder.iterdir() if item.name.startswith((".writing_", ".pending_"))])
+
+    def test_a_second_tag_step_leaves_the_pending_record_complete(self) -> None:
+        self.tag()
+        self.tag()
+        self.assertEqual("complete", self.pending_file()["state"])
+
     def test_a_second_tag_step_with_the_same_facts_changes_nothing(self) -> None:
         first = self.tag()[1]
         again = self.tag()[1]
@@ -1000,6 +1084,22 @@ class Evidence(unittest.TestCase):
         self.assertEqual("pass", self.outcome(folder))
         self.assertEqual(CHECKED, json.loads((folder / "run_notes.json").read_text())["merged_hash"])
         self.assertTrue((folder / "bronze_host.py").is_file())
+
+    def test_a_pending_tag_record_that_is_not_complete_is_not_a_pass(self) -> None:
+        folder = self.record.write(["log"])
+        (folder / "data_version.json").write_text(json.dumps(self.version, indent=2) + "\n")
+        (folder / "tag_pending.json").write_text(json.dumps({**self.version, "state": "pending"}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = self.module.finish(self.record, ["log"], self.notes, "", folder, self.script)
+        self.assertEqual((1, "fail"), (code, self.outcome(folder)))
+
+    def test_a_complete_pending_tag_record_is_a_pass(self) -> None:
+        folder = self.record.write(["log"])
+        (folder / "data_version.json").write_text(json.dumps(self.version, indent=2) + "\n")
+        (folder / "tag_pending.json").write_text(json.dumps({**self.version, "state": "complete"}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = self.module.finish(self.record, ["log"], self.notes, "", folder, self.script)
+        self.assertEqual((0, "pass"), (code, self.outcome(folder)))
 
     def test_a_record_that_the_tag_step_did_not_save_in_the_folder_is_not_a_pass_and_is_not_written_by_the_finish(self) -> None:
         code, folder = self.finish(saved=False)
