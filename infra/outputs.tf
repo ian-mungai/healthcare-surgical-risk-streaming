@@ -14,11 +14,6 @@ output "host_image_id" {
   }
 }
 
-output "host_public_ip" {
-  description = "Public address of the host, which admits no inbound connection."
-  value       = one(module.host[*].public_ip)
-}
-
 output "host_role_arn" {
   description = "ARN of the host's instance role."
   value       = one(module.host[*].role_arn)
