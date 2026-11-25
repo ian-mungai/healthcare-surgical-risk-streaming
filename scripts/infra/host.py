@@ -34,10 +34,10 @@ from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import describe_error
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
-from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
+from scripts.project_config import ENVIRONMENTS, PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
 
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
@@ -45,6 +45,7 @@ HOST_TAG = "tag:surgical-host"
 HOST_USER = "ubuntu"
 INSTANCE_ID_COMMAND = "cat /var/lib/cloud/data/instance-id"
 INSTANCE_ID_FORM = re.compile(r"i-[0-9a-f]{8,17}")
+HOST_NAME_FORM = re.compile("platform-(?:" + "|".join(ENVIRONMENTS) + ")")
 RECAP_LINE = re.compile(r"platform +: ok=\d+( +\w+=\d+)+ *")
 INSTANCE_DEADLINE_SECONDS = 600
 PEER_DEADLINE_SECONDS = 600
@@ -101,10 +102,16 @@ STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the o
 
 
 class HostError(RuntimeError):
-    """A host command refused to continue, a wait passed its deadline or a call failed."""
+    """A host command refused to continue, a wait passed its deadline or a call failed. Its text can hold a value of the state, a plan or a reply, so a
+    command shows its type name."""
 
 
-class NoPeerError(HostError):
+class FixedHostError(HostError, FixedTextError):
+    """A host refusal whose whole text is fixed advice: constants, the host's name and counts, and never the run's ID or a value of the state, a plan, a
+    file or a reply. A command shows it."""
+
+
+class NoPeerError(FixedHostError):
     """The Tailscale network shows no online peer with the host's name and tag yet."""
 
 
@@ -132,13 +139,13 @@ def wait_for[T](
     while True:
         remaining = deadline - clock()
         if remaining <= 0:
-            raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
+            raise FixedHostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
         try:
             found = probe(remaining)
         except TimeoutExpired, PermissionError:
             found = None
         if clock() > deadline:
-            raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
+            raise FixedHostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
         if found is not None:
             sys.stdout.write(f"ready: {what}\n")
             return found
@@ -153,7 +160,7 @@ def select_peer(status: dict[str, Any], host_name: str, tag: str) -> Peer:
     if not peers:
         raise NoPeerError(f"no online peer named {host_name} with {tag} in the Tailscale network")
     if len(peers) > 1:
-        raise HostError(
+        raise FixedHostError(
             f"{len(peers)} online peers are named {host_name} with {tag}: remove the extra devices in the Tailscale console, then run the command again"
         )
     return Peer(str(peers[0]["DNSName"]).rstrip("."), str(peers[0]["ID"]))
@@ -164,11 +171,11 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
     except FileNotFoundError:
-        raise HostError("the Tailscale client is not installed on this computer") from None
+        raise FixedHostError("the Tailscale client is not installed on this computer") from None
     except TimeoutExpired:
         raise NoPeerError(timeout_text("tailscale status", min(timeout, SSH_ATTEMPT_SECONDS))) from None
     if result.returncode != 0:
-        raise HostError(f"tailscale status failed: exit status {result.returncode}")
+        raise FixedHostError(f"tailscale status failed: exit status {result.returncode}")
     status: dict[str, Any] = json.loads(result.stdout)
     return status
 
@@ -194,7 +201,7 @@ def record_tailscale_device(run_id: str, host_name: str, device_id: str) -> Path
 def require_connected(status: dict[str, Any]) -> None:
     """Refuse a status from a client that is not running and connected: its peer list says nothing about the host's device."""
     if status.get("BackendState") != "Running":
-        raise HostError("the Tailscale client on this computer is not running and connected, so the host's device cannot be checked")
+        raise FixedHostError("the Tailscale client on this computer is not running and connected, so the host's device cannot be checked")
 
 
 def device_gone(status: dict[str, Any], host_name: str, device_id: str) -> bool:
@@ -224,7 +231,7 @@ def release_tailscale_device(run_id: str, host_name: str, device_id: str, instan
         keep_host_keys_of(run_id, instance_id)
         found = ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, SSH_ATTEMPT_SECONDS)
         if found is None:
-            raise HostError(f"the Tailscale peer {host_name} did not tell its instance over SSH: no logout was sent")
+            raise FixedHostError(f"the Tailscale peer {host_name} did not tell its instance over SSH: no logout was sent")
         require_instance(found, instance_id, host_name)
         ssh_output(run_id, peer.address, "sudo -n tailscale logout", SSH_ATTEMPT_SECONDS)
 
@@ -278,7 +285,7 @@ def instance_id(state: dict[str, Any]) -> str:
         if item["mode"] == "managed" and item["type"] == "aws_instance"
     ]
     if len(found) != 1:
-        raise HostError("the run's state does not hold exactly one host instance: run make host-up first")
+        raise FixedHostError("the run's state does not hold exactly one host instance: run make host-up first")
     return str(found[0])
 
 
@@ -300,7 +307,9 @@ def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -
 def require_instance(found: str, expected: str, host_name: str) -> None:
     """Refuse a peer that answered with another instance ID. The message names no ID."""
     if found.strip() != expected:
-        raise HostError(f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again")
+        raise FixedHostError(
+            f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again"
+        )
 
 
 def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
@@ -325,7 +334,7 @@ def saved_plan(run_id: str, *, applied: bool) -> dict[str, Any]:
     folder = ROOT / "runs" / run_id / "plans"
     found = [folder / name for name in (("apply.json",) if applied else ("apply.json", "apply_check.json")) if (folder / name).is_file()]
     if not found:
-        raise HostError(f"no saved plan JSON of run {run_id} gives the planned heavy_memory_mib: run make host-up again to plan first")
+        raise FixedHostError("no saved plan JSON of the run gives the planned heavy_memory_mib: run make host-up again to plan first")
     document: dict[str, Any] = json.loads(max(found, key=lambda path: path.stat().st_mtime_ns).read_text())
     return document
 
@@ -354,7 +363,7 @@ def heavy_memory_variables(state: dict[str, Any], planned: object) -> dict[str, 
     """
     outputs = state.get("values", {}).get("outputs", {})
     if "heavy_memory_mib" not in outputs:
-        raise HostError("the run's state has no heavy_memory_mib output: it is missing, so run make host-up to plan and apply the current Terraform first")
+        raise FixedHostError("the run's state has no heavy_memory_mib output: it is missing, so run make host-up to plan and apply the current Terraform first")
     figure = outputs["heavy_memory_mib"].get("value")
     if not isinstance(figure, int) or isinstance(figure, bool) or figure <= 0:
         raise HostError(f"the heavy_memory_mib output of the run's state is {figure!r}, not a positive whole number of MiB")
@@ -401,11 +410,11 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any], playbook: 
     except TimeoutExpired as error:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
         note = f"; {kept_note(run_id, output_name, partial, 'partial output')}" if partial else ""
-        raise HostError(timeout_text(f"ansible-playbook {playbook}", budget) + note) from None
+        raise FixedHostError(timeout_text(f"ansible-playbook {playbook}", budget) + note) from None
     kept = kept_note(run_id, output_name, result.stdout + result.stderr, "full output")
     sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:
-        raise HostError(f"the Ansible {label} failed; {kept}")
+        raise FixedHostError(f"the Ansible {label} failed; {kept}")
     sys.stdout.write(f"the Ansible {label} passed; {kept}\n")
 
 
@@ -414,28 +423,28 @@ def exported_key(profile: str) -> dict[str, str]:
     try:
         result = run_command("aws", ["configure", "export-credentials", "--profile", profile, "--format", "process"], timeout=KEY_EXPORT_SECONDS)
     except TimeoutExpired:
-        raise HostError(KEY_MESSAGES["export_timeout"].format(seconds=KEY_EXPORT_SECONDS)) from None
+        raise FixedHostError(KEY_MESSAGES["export_timeout"].format(seconds=KEY_EXPORT_SECONDS)) from None
     except FileNotFoundError:
-        raise HostError(KEY_MESSAGES["no_aws"]) from None
+        raise FixedHostError(KEY_MESSAGES["no_aws"]) from None
     if result.returncode != 0:
-        raise HostError(KEY_MESSAGES["export_failed"].format(status=result.returncode))
+        raise FixedHostError(KEY_MESSAGES["export_failed"].format(status=result.returncode))
     if not result.stdout.strip():
-        raise HostError(KEY_MESSAGES["empty"])
+        raise FixedHostError(KEY_MESSAGES["empty"])
     try:
         document = json.loads(result.stdout)
     except ValueError:
         document = None
     if not isinstance(document, dict):
-        raise HostError(KEY_MESSAGES["not_a_static_key"])
+        raise FixedHostError(KEY_MESSAGES["not_a_static_key"])
     if any("token" in str(name).lower() for name in document):
-        raise HostError(KEY_MESSAGES["session_token"])
+        raise FixedHostError(KEY_MESSAGES["session_token"])
     key_id, value = document.get("AccessKeyId"), document.get("SecretAccessKey")
     if not isinstance(key_id, str) or not isinstance(value, str):
-        raise HostError(KEY_MESSAGES["not_a_static_key"])
+        raise FixedHostError(KEY_MESSAGES["not_a_static_key"])
     if not key_id or not value:
-        raise HostError(KEY_MESSAGES["empty"])
+        raise FixedHostError(KEY_MESSAGES["empty"])
     if KEY_ID_FORM.fullmatch(key_id) is None or KEY_VALUE_FORM.fullmatch(value) is None:
-        raise HostError(KEY_MESSAGES["not_a_static_key"])
+        raise FixedHostError(KEY_MESSAGES["not_a_static_key"])
     return {"aws_access_key_id": key_id, "aws_secret_access_key": value}
 
 
@@ -452,14 +461,14 @@ def check_sudo_policy(run_id: str, address: str) -> None:
             "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", SUDOERS_FILE], timeout=KEY_SEND_SECONDS
         )
     except TimeoutExpired:
-        raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
+        raise FixedHostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
     if result.returncode == 255:
-        raise HostError(KEY_MESSAGES["ssh_failed"].format(status=255))
+        raise FixedHostError(KEY_MESSAGES["ssh_failed"].format(status=255))
     if result.returncode != 0:
-        raise HostError(KEY_MESSAGES["policy_missing"])
+        raise FixedHostError(KEY_MESSAGES["policy_missing"])
     words = result.stdout.split()
     if not words or words[0] != expected:
-        raise HostError(KEY_MESSAGES["policy_differs"])
+        raise FixedHostError(KEY_MESSAGES["policy_differs"])
 
 
 def place_project_key(run_id: str, address: str, profile: str) -> None:
@@ -470,13 +479,13 @@ def place_project_key(run_id: str, address: str, profile: str) -> None:
     file on this computer, an output or an error text. Every failure is a fixed message from ``KEY_MESSAGES``. The script's one-line answer is the
     only output read."""
     if PATTERNS["AWS_PROFILE"].fullmatch(profile) is None:
-        raise HostError("AWS_PROFILE is not a profile name")
+        raise FixedHostError("AWS_PROFILE is not a profile name")
     check_sudo_policy(run_id, address)
     document = json.dumps(exported_key(profile))
     try:
         sent = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *KEY_COMMAND], input_text=document, timeout=KEY_SEND_SECONDS)
     except TimeoutExpired:
-        raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
+        raise FixedHostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
     code = sent.stdout.strip()
     if sent.returncode == 0 and code in ("placed", "unchanged"):
         sys.stdout.write(
@@ -486,17 +495,17 @@ def place_project_key(run_id: str, address: str, profile: str) -> None:
         )
         return
     if sent.returncode == 3 and code in SCRIPT_REFUSALS:
-        raise HostError(KEY_MESSAGES[f"script_{code}"])
+        raise FixedHostError(KEY_MESSAGES[f"script_{code}"])
     if sent.returncode not in (0, 3):
-        raise HostError(KEY_MESSAGES["ssh_failed"].format(status=sent.returncode))
-    raise HostError(KEY_MESSAGES["script_unknown"])
+        raise FixedHostError(KEY_MESSAGES["ssh_failed"].format(status=sent.returncode))
+    raise FixedHostError(KEY_MESSAGES["script_unknown"])
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
     existing = load_run(binding) if binding.is_file() else None
     backend, provision_host = (existing.backend, existing.provision_host) if existing else ("s3", True)
     if state_bootstrap.create(aws, configuration, binding, backend, provision_host) != 0:
-        raise HostError("the state bootstrap step failed")
+        raise FixedHostError("the state bootstrap step failed")
     run = load_run(binding)
     if confirm:
         apply_plan(run, confirm)
@@ -565,8 +574,8 @@ def main() -> int:
     parser.add_argument("--confirm", default="", help="up: the confirmation code of the reviewed plan")
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()
-    if arguments.command == "check" and not arguments.host_name:
-        parser.error("check needs --host-name")
+    if arguments.command == "check" and HOST_NAME_FORM.fullmatch(arguments.host_name) is None:
+        parser.error("check needs --host-name, the host's Tailscale name: platform- and the environment")
     if arguments.command == "check" and INSTANCE_ID_FORM.fullmatch(arguments.instance_id) is None:
         parser.error("check needs --instance-id, an EC2 instance ID: the letters i- and 8 to 17 hexadecimal digits")
     try:

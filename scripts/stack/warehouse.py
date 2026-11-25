@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import sys
 
-from scripts.ingestion.notice import describe_error
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.project_config import PATTERNS, ConfigurationError, load_configuration
 
 WAREHOUSE_PREFIX = "warehouse"
 BUCKET_NAME = PATTERNS["S3_BUCKET"]
 
 
-class WarehouseError(ValueError):
+class WarehouseError(ValueError, FixedTextError):
     """The bucket name is not one that S3 accepts."""
 
 

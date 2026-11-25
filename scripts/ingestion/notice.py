@@ -405,8 +405,8 @@ class ClosedError(Exception):
 class FixedTextError(Exception):
     """An exception whose whole text is fixed advice that its raising module builds from constants and the configured project names, never from a value of
     the command line, a path, an input or a reply. ``describe_error`` shows its text. A class is marked only where the text is operator advice that a command
-    must show (a retry that could create a second access key is one). ``tests/fast/test_error_formatter.py`` lists every marked class, so a new one shows
-    in review."""
+    must show (a retry that could create a second access key is one, and so is the refusal of a launcher). ``tests/fast/test_error_formatter.py`` lists every
+    marked class and scans every raise of the launcher's marked classes, so a new one shows in review."""
 
 
 def describe_error(error: BaseException) -> str:

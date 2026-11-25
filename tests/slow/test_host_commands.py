@@ -1091,7 +1091,7 @@ class AnsibleRunTest(unittest.TestCase):
 
     def test_a_failed_setup_names_only_the_failure_and_the_file_that_keeps_the_output(self) -> None:
         printed, message, raw = self.run_it(exit_code=2)
-        self.assertEqual("the Ansible host setup failed; its full output is in runs/run-one/raw/ansible_output.txt", message)
+        self.assertEqual("the Ansible host setup failed; its full output is in the run's raw folder as ansible_output.txt", message)
         self.assertIn(f"fatal: [platform]: FAILED! {PRIVATE_TEXT}", raw)
         self.assertIn(f"stderr line: {PRIVATE_TEXT}", raw)
         self.assertNotIn("example-private-bucket", printed)
@@ -1109,7 +1109,7 @@ class AnsibleRunTest(unittest.TestCase):
     def test_output_with_no_recap_prints_nothing_and_still_names_the_file(self) -> None:
         printed, message, _ = self.run_it(exit_code=2, recap="")
         self.assertEqual("", printed)
-        self.assertEqual("the Ansible host setup failed; its full output is in runs/run-one/raw/ansible_output.txt", message)
+        self.assertEqual("the Ansible host setup failed; its full output is in the run's raw folder as ansible_output.txt", message)
 
     def test_a_recap_line_that_is_not_the_counts_of_the_platform_host_is_not_printed(self) -> None:
         printed, _, _ = self.run_it(exit_code=2, recap=f"platform : {PRIVATE_TEXT}")
@@ -1126,7 +1126,7 @@ class AnsibleRunTest(unittest.TestCase):
 
     def test_a_successful_setup_names_the_file_that_keeps_the_output(self) -> None:
         printed, _, _ = self.run_it(exit_code=0)
-        self.assertIn("the Ansible host setup passed; its full output is in runs/run-one/raw/ansible_output.txt", printed)
+        self.assertIn("the Ansible host setup passed; its full output is in the run's raw folder as ansible_output.txt", printed)
 
 
 class TailscaleStatusFailureTest(unittest.TestCase):
@@ -1204,6 +1204,13 @@ class HostCheckArgumentsTest(unittest.TestCase):
         code, errors = self.run_main("check", "--instance-id", INSTANCE)
         self.assertEqual(2, code)
         self.assertIn(render(Notice(Code.USAGE)), errors)
+
+    def test_a_host_name_that_is_not_the_name_of_an_environments_host_is_refused_without_naming_it(self) -> None:
+        for value in ("planted_name", "platform", "platform-staging", "platform-dev extra", "other-dev"):
+            with self.subTest(value=value):
+                code, errors = self.run_main("check", "--host-name", value, "--instance-id", INSTANCE)
+                self.assertEqual(2, code)
+                self.assertNotIn(value, errors)
 
 
 class DeployWorkflowTest(unittest.TestCase):
