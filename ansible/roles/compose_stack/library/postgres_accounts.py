@@ -204,8 +204,9 @@ class Server:
         script = PSQL_SCRIPT.replace("@PASSWORD_FILE@", ADMINISTRATOR_FILE_IN_CONTAINER).replace("@ACCOUNT@", ADMINISTRATOR).replace("@OPTIONS@", options)
         code, output, error = self.run([*self.compose_command, "exec", "-T", SERVICE, "sh", "-c", script], sql)
         if code != 0:
-            shown = re.sub(r"SCRAM-SHA-256\$\S+", "<verifier>", error.strip())[:ERROR_CHARACTERS]
-            raise AccountError(f"service {SERVICE}: psql exited with {code}: {shown}")
+            if "PASSWORD" in sql:
+                raise AccountError(f"service {SERVICE}: psql exited with {code}; its error text is not shown because the statements carry password verifiers")
+            raise AccountError(f"service {SERVICE}: psql exited with {code}: {error.strip()[:ERROR_CHARACTERS]}")
         return output
 
 

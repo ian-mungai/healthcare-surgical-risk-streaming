@@ -222,6 +222,15 @@ class GeneratedTest(StepCase):
         self.assertNotIn("another-text-marker", str(caught.exception))
         self.assertFalse(target.exists())
 
+    def test_a_server_error_that_repeats_the_generated_value_shows_no_value(self) -> None:
+        target = self.folder / "admin.password"
+        target.write_text("password-of-an-older-host-marker\n")
+        self.server.fail_next("POST", "/v1/secret/data/services/", 400, "invalid value password-of-an-older-host-marker")
+        with self.assertRaises(bootstrap.BootstrapError) as caught:
+            self.generated(target)
+        self.assertIn("HTTP 400", str(caught.exception))
+        self.assertNotIn("password-of-an-older-host-marker", str(caught.exception))
+
     def test_a_check_run_makes_nothing(self) -> None:
         target = self.folder / "admin.password"
         self.assertTrue(self.generated(target, check_only=True)["changed"])

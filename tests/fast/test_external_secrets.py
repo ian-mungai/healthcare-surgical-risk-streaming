@@ -59,6 +59,39 @@ class ParseTest(unittest.TestCase):
         self.assertIn("no external secret", self.refused("# nothing\n"))
 
 
+class MalformedRowTest(unittest.TestCase):
+    """A row that cannot be used is reported by its line number alone: any word of it can be a secret that was pasted into the list by mistake."""
+
+    MARKER = "dckr_pat_" + "MarkerThatMustNotLeak0123"
+
+    def refused(self, text: str) -> str:
+        with self.assertRaises(library().ExternalSecretError) as caught:
+            library().parse_external(text)
+        return str(caught.exception)
+
+    def test_each_kind_of_malformed_row_is_named_by_its_line_and_holds_no_word_of_the_row(self) -> None:
+        marker = self.MARKER
+        rows = {
+            "one word": f"{marker}\n",
+            "three words": f"alpha deploy {marker}\n",
+            "five words": f"alpha deploy secret/data/external/alpha dockerhub_token {marker}\n",
+            "a name that is not in the form": f"{marker.upper()} deploy secret/data/external/alpha dockerhub_token\n",
+            "a consumer that is not in the form": f"alpha {marker.upper()} secret/data/external/alpha dockerhub_token\n",
+            "a path that is not the name's path": f"alpha deploy {marker} dockerhub_token\n",
+            "a check that is not named": f"alpha deploy secret/data/external/alpha {marker}\n",
+        }
+        for label, row in rows.items():
+            with self.subTest(row=label):
+                message = self.refused("# comment\n\n" + row)
+                self.assertIn("line 3", message)
+                self.assertNotIn(marker, message)
+                self.assertNotIn(marker.upper(), message)
+
+    def test_a_repeated_name_is_named_by_the_line_of_the_second_row(self) -> None:
+        line = "alpha deploy secret/data/external/alpha dockerhub_token\n"
+        self.assertIn("line 2", self.refused(line + line))
+
+
 class FormCheckTest(unittest.TestCase):
     def accepts(self, value: str) -> bool:
         return bool(library().form_ok("dockerhub_token", value))

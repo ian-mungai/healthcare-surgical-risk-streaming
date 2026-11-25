@@ -34,25 +34,27 @@ class ExternalSecret:
 
 
 def parse_external(text: str) -> list[ExternalSecret]:
-    """The declarations of the list: one for each line of four words (name, consumer, path, check), with comments and blank lines ignored."""
+    """The declarations of the list: one for each line of four words (name, consumer, path, check), with comments and blank lines ignored.
+
+    A line that cannot be used is reported by its number alone, because any word of it can be a secret that was pasted into the list by mistake."""
     found: list[ExternalSecret] = []
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         words = line.split("#", 1)[0].split()
         if not words:
             continue
         if len(words) != 4:
-            raise ExternalSecretError(f"the line of {words[0]!r} must hold four words: name, consumer, path and check")
+            raise ExternalSecretError(f"line {number} of the list must hold four words: name, consumer, path and check")
         name, consumer, path, check = words
         if not NAME_FORM.fullmatch(name):
-            raise ExternalSecretError(f"external secret name {name!r} must be 1 to 31 lower case letters, digits or underscores and start with a letter")
+            raise ExternalSecretError(f"line {number}: the name must be 1 to 31 lower case letters, digits or underscores and start with a letter")
         if not NAME_FORM.fullmatch(consumer):
-            raise ExternalSecretError(f"the consumer of {name!r} is not a service name")
+            raise ExternalSecretError(f"line {number}: the consumer is not a service name")
         if path != f"{PATH_PREFIX}{name}":
-            raise ExternalSecretError(f"the path of {name!r} must be {PATH_PREFIX}{name}")
+            raise ExternalSecretError(f"line {number}: the path must be {PATH_PREFIX}<the name>")
         if check not in FORM_CHECKS:
-            raise ExternalSecretError(f"the check of {name!r} is not one of the named checks: {', '.join(sorted(FORM_CHECKS))}")
+            raise ExternalSecretError(f"line {number}: the check is not one of the named checks: {', '.join(sorted(FORM_CHECKS))}")
         if name in [item.name for item in found]:
-            raise ExternalSecretError(f"external secret {name!r} is listed more than once")
+            raise ExternalSecretError(f"line {number}: the name is listed more than once")
         found.append(ExternalSecret(name, consumer, path, check))
     if not found:
         raise ExternalSecretError("the list names no external secret")

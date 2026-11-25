@@ -53,7 +53,6 @@ ADMIN_ID_FILE = "bootstrap.secret_id"
 SECRET_BYTES = 32
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
-ERROR_CHARACTERS = 300
 # The form of a token that goes into a header: the characters of OpenBao's tokens and of a bearer token (RFC 6750, b64token), and nothing else. A control
 # character such as a line break makes the HTTP library's header error carry the token's text.
 TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
@@ -218,8 +217,7 @@ class Api:
     def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
         status, document = self.call(method, path, token, body)
         if status not in (200, 204):
-            errors = " ".join(str(item) for item in document.get("errors") or [])[:ERROR_CHARACTERS]
-            raise BootstrapError(f"{method} {path}: HTTP {status}: {errors}")
+            raise BootstrapError(f"{method} {path}: HTTP {status}")
         return document
 
     def wait_ready(self, deadline_seconds: int) -> None:

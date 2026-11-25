@@ -328,5 +328,30 @@ class StateTest(unittest.TestCase):
         self.assertEqual(1, accounts.STATE_QUERY.count(":'databases'"))
 
 
+class ServerErrorTest(unittest.TestCase):
+    """A failed ``psql`` run never shows the server's error text when the statements carry a password verifier: the text can repeat a part of the statement."""
+
+    FRAGMENT = "b6XFM3jOXIKRGszgsSSbt0ahRBPMegngJx/ydQrhm40=:bSQil7LYTkLF1VD90t0B4"
+
+    def failing(self, sql: str) -> str:
+        def run(args: list[str], data: str) -> tuple[int, str, str]:
+            return 1, "", f"ERROR: role \"x\" does not exist\nLINE 1: ...PASSWORD '...{self.FRAGMENT}'\n"
+
+        server = accounts.Server(run, ["docker", "compose"])
+        with self.assertRaises(accounts.AccountError) as caught:
+            server.psql(sql, TOOLS)
+        return str(caught.exception)
+
+    def test_a_statement_that_carries_a_verifier_is_reported_by_the_exit_status_only_even_when_the_text_shows_a_cut_piece_of_it(self) -> None:
+        text = self.failing(f"CREATE ROLE \"nessie\" PASSWORD '{SERVER_VERIFIER}';\n")
+        self.assertIn("psql exited with 1", text)
+        self.assertNotIn(self.FRAGMENT, text)
+        self.assertNotIn("does not exist", text)
+
+    def test_a_statement_without_a_password_keeps_the_server_text_for_the_owner_to_read(self) -> None:
+        text = self.failing('CREATE DATABASE "nessie" OWNER "nessie";\n')
+        self.assertIn('role "x" does not exist', text)
+
+
 if __name__ == "__main__":
     unittest.main()

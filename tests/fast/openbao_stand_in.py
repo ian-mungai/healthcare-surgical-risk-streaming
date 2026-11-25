@@ -69,6 +69,8 @@ class StandIn:
         self.calls: list[tuple[str, str]] = []
         self.drops: list[list[Any]] = []
         self.tamper: list[str] = []
+        self.failures: list[list[Any]] = []
+        self.ignore_deletes = False
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
 
@@ -88,6 +90,10 @@ class StandIn:
     def drop_next(self, method: str, prefix: str, after: int = 0) -> None:
         """Drop the connection of the first call that matches, after ``after`` matching calls were answered."""
         self.drops.append([method, prefix, after])
+
+    def fail_next(self, method: str, prefix: str, status: int, text: str) -> None:
+        """Answer the first call that matches with this status and an error list that holds ``text`` (a real server can repeat a rejected value there)."""
+        self.failures.append([method, prefix, status, text])
 
     def tamper_next_write(self, stored: str) -> None:
         self.tamper.append(stored)
@@ -133,6 +139,10 @@ class StandIn:
                         outer.drops.remove(drop)
                         self.connection.close()
                         return
+                for failure in list(outer.failures):
+                    if failure[0] == method and path.startswith(failure[1]):
+                        outer.failures.remove(failure)
+                        return self.answer(failure[2], {"errors": [failure[3]]})
                 token = self.headers.get("X-Vault-Token", "")
                 if path == "/v1/sys/seal-status":
                     return self.answer(200, {"initialized": True, "sealed": False})
@@ -166,7 +176,7 @@ class StandIn:
                     if method == "DELETE":
                         if not outer.can(holder, full, "delete"):
                             return self.answer(403, {"errors": ["permission denied"]})
-                        if outer.versions.get(name):
+                        if outer.versions.get(name) and not outer.ignore_deletes:
                             outer.versions[name].append(None)
                         return self.answer(204)
                     versions = outer.versions.setdefault(name, [])
