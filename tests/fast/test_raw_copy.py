@@ -4,7 +4,10 @@ Failure modes covered here, each against a stand-in of Airbyte's API (the real A
 
 - A sync starts on a connection that selects more or other files than the fixed sample (the full release on a dev host, a missing file, a repeated file),
   which would copy the full release or an incomplete sample.
+- A sync starts on a connection whose destination is another bucket or another prefix than the project's landing prefix, which would copy into the wrong place.
 - A sync starts while a job of the connection is active, which would make two copies at once.
+- A cancel, a wait that cancels or a cancel of everything owned acts on a job that this tool did not start (another connection's, or one that a person started).
+- A job's success that is read after its deadline passes for a success in time.
 - A job that passes its deadline is left running, or a job whose cancellation is not confirmed is reported as stopped.
 - The job record shows more than the closed set of facts, or a field of another type passes for a count.
 - A command writes a glob, an ID of Airbyte, a credential or the text of an exception.
@@ -15,26 +18,42 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import tempfile
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from scripts.ingestion import raw_copy
 from scripts.ingestion.airbyte_api import AirbyteError
 from scripts.ingestion.connection import CONNECTION_NAME, fixed_sample_selection
-from scripts.ingestion.raw_copy import HttpRawCopyApi, RawConnection, RawCopyError, cancel, job_record, start, wait
+from scripts.ingestion.landing import LANDING_PREFIX
+from scripts.ingestion.raw_copy import HttpRawCopyApi, JobLedger, RawConnection, RawCopyError, cancel, cancel_owned, job_record, start, wait
 from tests.fast.record_support import FakeClock
 
 WANTED = tuple(sorted(fixed_sample_selection().source_keys))
 CONNECTION = "connection_1"
+BUCKET = "example-bucket"
+LANDING_PATH = LANDING_PREFIX.rstrip("/")
+
+
+def ledger_in(test: unittest.TestCase) -> JobLedger:
+    folder = tempfile.TemporaryDirectory()
+    test.addCleanup(folder.cleanup)
+    return JobLedger(Path(folder.name))
 
 
 class StandIn:
     """Airbyte's job calls for one connection, with a switch for each fault."""
 
-    def __init__(self, globs: tuple[str, ...] = WANTED, *, active: tuple[int, ...] = ()) -> None:
+    def __init__(self, globs: tuple[str, ...] = WANTED, *, active: tuple[int, ...] = (), bucket: str = BUCKET, path: str = LANDING_PATH) -> None:
         self.globs = globs
+        self.bucket = bucket
+        self.path = path
+        self.job_connection_id = CONNECTION
+        self.clock: Any = None
+        self.read_takes = 0.0
         self.active = list(active)
         self.log: list[str] = []
         self.statuses: dict[int, list[str]] = {}
@@ -45,7 +64,7 @@ class StandIn:
 
     def raw_connection(self) -> RawConnection:
         self.log.append("raw_connection")
-        return RawConnection(CONNECTION, self.globs)
+        return RawConnection(CONNECTION, self.globs, self.bucket, self.path)
 
     def running_jobs(self, connection_id: str) -> list[int]:
         self.log.append(f"running_jobs {connection_id}")
@@ -56,8 +75,14 @@ class StandIn:
         self.started += 1
         return 7
 
+    def job_connection(self, job: int, *, timeout: float | None = None) -> str:
+        self.log.append(f"job_connection {job}")
+        return self.job_connection_id
+
     def job_status(self, job: int, *, timeout: float | None = None) -> str:
         self.log.append(f"job_status {job}")
+        if self.clock is not None:
+            self.clock.now += self.read_takes
         if self.status_error:
             raise AirbyteError("GET jobs/7 did not finish within its deadline")
         queue = self.statuses.get(job, ["running"])
@@ -74,19 +99,37 @@ class StandIn:
 
 
 class StartTest(unittest.TestCase):
+    def start(self, api: StandIn, ledger: JobLedger | None = None) -> int:
+        return start(api, WANTED, ledger or ledger_in(self), BUCKET)
+
     def test_a_connection_that_selects_exactly_the_fixed_sample_starts_one_sync_and_returns_its_job(self) -> None:
         api = StandIn()
-        self.assertEqual(7, start(api, WANTED))
+        self.assertEqual(7, self.start(api))
         self.assertEqual(["raw_connection", f"running_jobs {CONNECTION}", f"start_sync {CONNECTION}"], api.log)
+
+    def test_the_job_and_its_connection_are_kept_from_the_start_answer_before_the_job_is_returned(self) -> None:
+        ledger = ledger_in(self)
+        self.assertEqual(7, self.start(StandIn(), ledger))
+        self.assertEqual(CONNECTION, ledger.connection_of(7))
+        self.assertEqual([7], ledger.jobs())
+        self.assertIsNone(ledger.connection_of(8))
+
+    def test_a_job_that_cannot_be_kept_is_cancelled_at_once_and_the_start_is_refused(self) -> None:
+        api = StandIn()
+        ledger = ledger_in(self)
+        with mock.patch.object(ledger, "record", side_effect=OSError("disk full")), self.assertRaises(RawCopyError) as caught:
+            self.start(api, ledger)
+        self.assertEqual("state_unwritable", caught.exception.error_code)
+        self.assertIn("cancel_job 7", api.log)
 
     def test_the_order_of_the_globs_is_not_a_difference(self) -> None:
         api = StandIn(tuple(reversed(WANTED)))
-        self.assertEqual(7, start(api, WANTED))
+        self.assertEqual(7, self.start(api))
 
     def test_a_connection_that_selects_the_full_release_is_refused_before_any_job_call(self) -> None:
         api = StandIn((*WANTED, "vital_files/0001.vital"))
         with self.assertRaises(RawCopyError) as caught:
-            start(api, WANTED)
+            self.start(api)
         self.assertEqual("selection_differs", caught.exception.error_code)
         self.assertEqual(0, api.started)
         self.assertEqual(["raw_connection"], api.log)
@@ -94,29 +137,42 @@ class StartTest(unittest.TestCase):
     def test_a_connection_that_lacks_one_file_of_the_sample_is_refused(self) -> None:
         api = StandIn(WANTED[1:])
         with self.assertRaises(RawCopyError) as caught:
-            start(api, WANTED)
+            self.start(api)
         self.assertEqual("selection_differs", caught.exception.error_code)
         self.assertEqual(0, api.started)
 
     def test_a_connection_whose_list_holds_the_whole_sample_and_one_file_twice_is_refused(self) -> None:
         api = StandIn((*WANTED, WANTED[0]))
         with self.assertRaises(RawCopyError) as caught:
-            start(api, WANTED)
+            self.start(api)
         self.assertEqual("selection_differs", caught.exception.error_code)
         self.assertEqual(0, api.started)
+
+    def test_a_destination_in_another_bucket_or_under_another_prefix_is_refused_before_any_job_call(self) -> None:
+        for bucket, path in (("another-bucket", LANDING_PATH), (BUCKET, "other"), (BUCKET, f"{LANDING_PATH}/sub"), (BUCKET, "")):
+            with self.subTest(bucket=bucket, path=path):
+                api = StandIn(bucket=bucket, path=path)
+                with self.assertRaises(RawCopyError) as caught:
+                    self.start(api)
+                self.assertEqual("destination_differs", caught.exception.error_code)
+                self.assertEqual(0, api.started)
+                self.assertEqual(["raw_connection"], api.log)
 
     def test_an_active_job_of_the_connection_stops_the_start_and_names_no_second_sync(self) -> None:
         api = StandIn(active=(3,))
         with self.assertRaises(RawCopyError) as caught:
-            start(api, WANTED)
+            self.start(api)
         self.assertEqual("job_active", caught.exception.error_code)
         self.assertEqual(0, api.started)
 
 
 class WaitTest(unittest.TestCase):
-    def wait(self, api: StandIn, deadline: float = 100.0) -> tuple[str, FakeClock]:
-        clock = FakeClock()
-        return wait(api, 7, deadline_seconds=deadline, poll_seconds=5.0, cancel_confirm_seconds=30.0, clock=clock.time, sleep=clock.sleep), clock
+    def wait(self, api: StandIn, deadline: float = 100.0, *, owned: bool = True, clock: FakeClock | None = None) -> tuple[str, FakeClock]:
+        clock = clock or FakeClock()
+        ledger = ledger_in(self)
+        if owned:
+            ledger.record(7, CONNECTION)
+        return wait(api, 7, ledger, deadline_seconds=deadline, poll_seconds=5.0, cancel_confirm_seconds=30.0, clock=clock.time, sleep=clock.sleep), clock
 
     def test_a_job_that_ends_in_time_gives_its_terminal_status_and_is_not_cancelled(self) -> None:
         api = StandIn()
@@ -139,6 +195,15 @@ class WaitTest(unittest.TestCase):
         self.assertEqual(1, api.log.count("cancel_job 7"))
         self.assertEqual(["cancelled"], api.statuses[7])
 
+    def test_a_success_that_is_read_after_the_deadline_is_a_deadline_and_not_a_success(self) -> None:
+        clock = FakeClock()
+        api = StandIn()
+        api.clock, api.read_takes = clock, 60.0
+        api.statuses[7] = ["succeeded"]
+        with self.assertRaises(RawCopyError) as caught:
+            self.wait(api, deadline=20.0, clock=clock)
+        self.assertEqual("deadline", caught.exception.error_code)
+
     def test_a_job_that_a_cancellation_does_not_stop_is_reported_as_still_active(self) -> None:
         api = StandIn()
         api.cancel_stops = False
@@ -154,29 +219,99 @@ class WaitTest(unittest.TestCase):
         self.assertEqual("job_still_active", caught.exception.error_code)
         self.assertIn("cancel_job 7", api.log)
 
+    def test_a_job_that_this_tool_did_not_start_is_never_waited_for_or_cancelled(self) -> None:
+        api = StandIn()
+        with self.assertRaises(RawCopyError) as caught:
+            self.wait(api, deadline=20.0, owned=False)
+        self.assertEqual("job_not_owned", caught.exception.error_code)
+        self.assertEqual([], [line for line in api.log if line.startswith(("cancel_job", "job_status"))])
+
 
 class CancelTest(unittest.TestCase):
+    def cancel(self, api: StandIn, ledger: JobLedger | None = None) -> str:
+        clock = FakeClock()
+        if ledger is None:
+            ledger = ledger_in(self)
+            ledger.record(7, CONNECTION)
+        return cancel(api, 7, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
+
     def test_a_running_job_is_cancelled_and_its_terminal_status_is_returned(self) -> None:
         api = StandIn()
-        clock = FakeClock()
-        status = cancel(api, 7, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
-        self.assertEqual("cancelled", status)
-        self.assertEqual(["job_status 7", "cancel_job 7"], api.log[:2])
+        self.assertEqual("cancelled", self.cancel(api))
+        self.assertEqual(["raw_connection", "job_connection 7", "job_status 7", "cancel_job 7"], api.log[:4])
 
     def test_a_job_that_ended_before_the_cancellation_keeps_its_own_status(self) -> None:
         api = StandIn()
         api.statuses[7] = ["succeeded"]
-        clock = FakeClock()
-        self.assertEqual("succeeded", cancel(api, 7, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep))
+        self.assertEqual("succeeded", self.cancel(api))
         self.assertNotIn("cancel_job 7", api.log)
 
     def test_a_job_that_stays_active_after_the_cancellation_is_reported(self) -> None:
         api = StandIn()
         api.cancel_stops = False
-        clock = FakeClock()
         with self.assertRaises(RawCopyError) as caught:
-            cancel(api, 7, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
+            self.cancel(api)
         self.assertEqual("job_still_active", caught.exception.error_code)
+
+    def test_a_job_that_is_not_in_the_ledger_is_refused_and_nothing_is_cancelled(self) -> None:
+        api = StandIn()
+        with self.assertRaises(RawCopyError) as caught:
+            self.cancel(api, ledger_in(self))
+        self.assertEqual("job_not_owned", caught.exception.error_code)
+        self.assertNotIn("cancel_job 7", api.log)
+
+    def test_a_job_that_airbyte_says_belongs_to_another_connection_is_refused(self) -> None:
+        api = StandIn()
+        api.job_connection_id = "connection_2"
+        with self.assertRaises(RawCopyError) as caught:
+            self.cancel(api)
+        self.assertEqual("job_not_owned", caught.exception.error_code)
+        self.assertNotIn("cancel_job 7", api.log)
+
+    def test_a_job_that_the_ledger_ties_to_another_connection_is_refused(self) -> None:
+        api = StandIn()
+        ledger = ledger_in(self)
+        ledger.record(7, "connection_2")
+        with self.assertRaises(RawCopyError) as caught:
+            self.cancel(api, ledger)
+        self.assertEqual("job_not_owned", caught.exception.error_code)
+        self.assertNotIn("cancel_job 7", api.log)
+
+
+class CancelOwnedTest(unittest.TestCase):
+    def test_every_active_job_of_the_ledger_is_cancelled_and_an_ended_one_is_left_alone(self) -> None:
+        api = StandIn()
+        api.statuses[7] = ["running"]
+        api.statuses[8] = ["succeeded"]
+        ledger = ledger_in(self)
+        ledger.record(7, CONNECTION)
+        ledger.record(8, CONNECTION)
+        clock = FakeClock()
+        found = cancel_owned(api, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
+        self.assertEqual({"jobs": 2, "still_active": 0}, found)
+        self.assertIn("cancel_job 7", api.log)
+        self.assertNotIn("cancel_job 8", api.log)
+
+    def test_a_job_that_stays_active_is_counted_and_never_hidden(self) -> None:
+        api = StandIn()
+        api.cancel_stops = False
+        ledger = ledger_in(self)
+        ledger.record(7, CONNECTION)
+        clock = FakeClock()
+        found = cancel_owned(api, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
+        self.assertEqual({"jobs": 1, "still_active": 1}, found)
+
+    def test_an_empty_ledger_cancels_nothing(self) -> None:
+        api = StandIn()
+        self.assertEqual({"jobs": 0, "still_active": 0}, cancel_owned(api, ledger_in(self)))
+        self.assertEqual([], api.log)
+
+    def test_the_ledger_keeps_the_latest_jobs_only_and_survives_a_reopen(self) -> None:
+        ledger = ledger_in(self)
+        for job in range(1, 40):
+            ledger.record(job, CONNECTION)
+        self.assertEqual(list(range(20, 40)), ledger.jobs())
+        self.assertEqual(CONNECTION, JobLedger(ledger.directory).connection_of(39))
 
 
 class RecordTest(unittest.TestCase):
@@ -231,19 +366,32 @@ def source_document(globs: list[Any]) -> dict[str, Any]:
     return {"sourceId": "source_1", "configuration": {"streams": [{"name": "vitaldb_files", "globs": globs}]}}
 
 
+def destination_document(bucket: Any = BUCKET, path: Any = LANDING_PATH) -> dict[str, Any]:
+    return {"destinationId": "destination_1", "configuration": {"s3_bucket_name": bucket, "s3_bucket_path": path}}
+
+
 class ConnectionReadTest(unittest.TestCase):
     def api(self, connections: list[dict[str, Any]] | None = None, globs: list[Any] | None = None) -> Fake:
-        found = connections if connections is not None else [{"name": CONNECTION_NAME, "connectionId": CONNECTION, "sourceId": "source_1"}]
-        return Fake(found, {"/sources/source_1": source_document(list(WANTED) if globs is None else globs)})
+        found = (
+            connections
+            if connections is not None
+            else [{"name": CONNECTION_NAME, "connectionId": CONNECTION, "sourceId": "source_1", "destinationId": "destination_1"}]
+        )
+        return Fake(
+            found, {"/sources/source_1": source_document(list(WANTED) if globs is None else globs), "/destinations/destination_1": destination_document()}
+        )
 
     def test_the_connection_is_found_by_its_name_and_its_globs_are_read_from_its_source(self) -> None:
         found = self.api(
-            [{"name": "another", "connectionId": "x", "sourceId": "y"}, {"name": CONNECTION_NAME, "connectionId": CONNECTION, "sourceId": "source_1"}]
+            [
+                {"name": "another", "connectionId": "x", "sourceId": "y", "destinationId": "z"},
+                {"name": CONNECTION_NAME, "connectionId": CONNECTION, "sourceId": "source_1", "destinationId": "destination_1"},
+            ]
         ).raw_connection()
-        self.assertEqual(RawConnection(CONNECTION, WANTED), found)
+        self.assertEqual(RawConnection(CONNECTION, WANTED, BUCKET, LANDING_PATH), found)
 
     def test_no_connection_of_the_name_and_two_connections_of_the_name_are_refused(self) -> None:
-        for connections in ([], [{"name": CONNECTION_NAME, "connectionId": "a", "sourceId": "source_1"}] * 2):
+        for connections in ([], [{"name": CONNECTION_NAME, "connectionId": "a", "sourceId": "source_1", "destinationId": "destination_1"}] * 2):
             with self.subTest(count=len(connections)), self.assertRaises(AirbyteError):
                 self.api(connections).raw_connection()
 
@@ -258,6 +406,30 @@ class ConnectionReadTest(unittest.TestCase):
         with self.assertRaises(AirbyteError):
             api.raw_connection()
 
+    def test_a_destination_without_a_bucket_name_or_a_path_as_text_is_refused(self) -> None:
+        for bucket, path in ((None, LANDING_PATH), (BUCKET, None), (7, LANDING_PATH), ("", "")):
+            with self.subTest(bucket=bucket, path=path):
+                api = self.api()
+                api.sources["/destinations/destination_1"] = destination_document(bucket, path)
+                if bucket == "" and path == "":
+                    self.assertEqual(("", ""), (api.raw_connection().bucket, api.raw_connection().landing_path))
+                else:
+                    with self.assertRaises(AirbyteError):
+                        api.raw_connection()
+
+    def test_the_connection_of_a_job_is_read_from_the_job_route_and_only_a_sync_counts(self) -> None:
+        api = Fake([], {"/jobs/7": {"jobId": 7, "status": "running", "connectionId": CONNECTION, "jobType": "sync"}})
+        self.assertEqual(CONNECTION, api.job_connection(7))
+        for document in (
+            {"jobId": 7, "status": "running", "connectionId": CONNECTION, "jobType": "reset"},
+            {"jobId": 8, "status": "running", "connectionId": CONNECTION, "jobType": "sync"},
+            {"jobId": 7, "status": "running", "jobType": "sync"},
+        ):
+            with self.subTest(document=document):
+                other = Fake([], {"/jobs/7": document})
+                with self.assertRaises(AirbyteError):
+                    other.job_connection(7)
+
     def test_the_job_document_is_read_from_the_job_route(self) -> None:
         api = Fake([], {"/jobs/7": {"jobId": 7, "status": "running"}})
         self.assertEqual({"jobId": 7, "status": "running"}, api.job_document(7))
@@ -265,49 +437,86 @@ class ConnectionReadTest(unittest.TestCase):
 
 
 class CommandTest(unittest.TestCase):
-    def run_main(self, argv: list[str], api: StandIn | None = None, *, error: Exception | None = None) -> tuple[int, str, str]:
+    def run_main(self, argv: list[str], api: StandIn | None = None, *, error: Exception | None = None, owned: tuple[int, ...] = ()) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         factory: Callable[[], Any] = (lambda: api or StandIn()) if error is None else mock.Mock(side_effect=error)
-        with mock.patch.object(raw_copy, "open_api", factory), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        for job in owned:
+            JobLedger(Path(folder.name)).record(job, CONNECTION)
+        with (
+            mock.patch.object(raw_copy, "open_api", factory),
+            mock.patch.object(raw_copy, "open_ledger", lambda: JobLedger(Path(folder.name))),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
             code = raw_copy.main(argv)
+        self.last_ledger = JobLedger(Path(folder.name))
         return code, out.getvalue(), err.getvalue()
 
     def test_status_says_whether_the_selection_is_the_fixed_sample_and_how_many_jobs_are_active_and_writes_no_glob_or_id(self) -> None:
-        code, out, err = self.run_main(["status"], StandIn(active=(1, 2)))
+        code, out, err = self.run_main(["status", "--bucket", BUCKET], StandIn(active=(1, 2)))
         self.assertEqual(0, code)
-        self.assertEqual({"selection_is_fixed_sample": True, "files": len(WANTED), "active_jobs": 2}, json.loads(out))
+        self.assertEqual({"selection_is_fixed_sample": True, "destination_is_project_landing": True, "files": len(WANTED), "active_jobs": 2}, json.loads(out))
         self.assertEqual("", err)
         self.assertNotIn(CONNECTION, out)
 
     def test_status_of_the_full_release_says_false_and_exits_0(self) -> None:
-        code, out, _ = self.run_main(["status"], StandIn((*WANTED, "vital_files/0001.vital")))
+        code, out, _ = self.run_main(["status", "--bucket", BUCKET], StandIn((*WANTED, "vital_files/0001.vital")))
         self.assertEqual(0, code)
         self.assertEqual(False, json.loads(out)["selection_is_fixed_sample"])
 
+    def test_status_of_another_destination_says_false_and_exits_0(self) -> None:
+        code, out, _ = self.run_main(["status", "--bucket", BUCKET], StandIn(bucket="another-bucket"))
+        self.assertEqual((0, False), (code, json.loads(out)["destination_is_project_landing"]))
+
     def test_start_prints_the_job_id_only(self) -> None:
-        code, out, _ = self.run_main(["start"])
+        code, out, _ = self.run_main(["start", "--bucket", BUCKET])
         self.assertEqual((0, {"job": 7}), (code, json.loads(out)))
+        self.assertEqual(CONNECTION, self.last_ledger.connection_of(7))
+
+    def test_start_on_another_destination_exits_1_with_the_code_word_and_starts_nothing(self) -> None:
+        api = StandIn(path="other")
+        code, out, err = self.run_main(["start", "--bucket", BUCKET], api)
+        self.assertEqual((1, "", "raw_copy refused: destination_differs\n"), (code, out, err))
+        self.assertEqual(0, api.started)
 
     def test_start_on_the_full_release_exits_1_with_the_code_word_and_starts_nothing(self) -> None:
         api = StandIn((*WANTED, "vital_files/0001.vital"))
-        code, out, err = self.run_main(["start"], api)
+        code, out, err = self.run_main(["start", "--bucket", BUCKET], api)
         self.assertEqual((1, "", "raw_copy refused: selection_differs\n"), (code, out, err))
         self.assertEqual(0, api.started)
 
     def test_wait_prints_the_job_and_its_status_and_exits_1_for_a_failed_sync(self) -> None:
         api = StandIn()
         api.statuses[7] = ["failed"]
-        code, out, _ = self.run_main(["wait", "--job", "7", "--deadline-seconds", "60"], api)
+        code, out, _ = self.run_main(["wait", "--job", "7", "--deadline-seconds", "60"], api, owned=(7,))
         self.assertEqual((1, {"job": 7, "status": "failed"}), (code, json.loads(out)))
 
     def test_wait_exits_0_for_a_succeeded_sync(self) -> None:
         api = StandIn()
         api.statuses[7] = ["succeeded"]
-        code, out, _ = self.run_main(["wait", "--job", "7", "--deadline-seconds", "60"], api)
+        code, out, _ = self.run_main(["wait", "--job", "7", "--deadline-seconds", "60"], api, owned=(7,))
         self.assertEqual((0, {"job": 7, "status": "succeeded"}), (code, json.loads(out)))
 
+    def test_wait_and_cancel_of_a_job_that_was_not_started_by_this_tool_exit_1_with_the_code_word(self) -> None:
+        for command in (["wait", "--job", "7", "--deadline-seconds", "60"], ["cancel", "--job", "7"]):
+            with self.subTest(command=command[0]):
+                api = StandIn()
+                code, out, err = self.run_main(command, api)
+                self.assertEqual((1, "", "raw_copy refused: job_not_owned\n"), (code, out, err))
+                self.assertNotIn("cancel_job 7", api.log)
+
+    def test_cancel_owned_prints_two_counts_and_exits_1_when_a_job_stays_active(self) -> None:
+        code, out, _ = self.run_main(["cancel-owned"], StandIn(), owned=(7,))
+        self.assertEqual((0, {"jobs": 1, "still_active": 0}), (code, json.loads(out)))
+        stuck = StandIn()
+        stuck.cancel_stops = False
+        code, out, _ = self.run_main(["cancel-owned", "--confirm-seconds", "1", "--poll-seconds", "1"], stuck, owned=(7,))
+        self.assertEqual((1, {"jobs": 1, "still_active": 1}), (code, json.loads(out)))
+
     def test_cancel_prints_the_status_after_the_cancellation(self) -> None:
-        code, out, _ = self.run_main(["cancel", "--job", "7"])
+        code, out, _ = self.run_main(["cancel", "--job", "7"], owned=(7,))
         self.assertEqual((0, {"job": 7, "status": "cancelled"}), (code, json.loads(out)))
 
     def test_record_prints_the_closed_facts(self) -> None:
@@ -316,7 +525,7 @@ class CommandTest(unittest.TestCase):
         self.assertEqual({"jobId", "status", "rowsSynced", "bytesSynced"}, set(json.loads(out)))
 
     def test_an_error_of_another_kind_shows_its_type_and_never_its_text(self) -> None:
-        code, out, err = self.run_main(["status"], error=AirbyteError("secret marker_5521 in the text"))
+        code, out, err = self.run_main(["status", "--bucket", BUCKET], error=AirbyteError("secret marker_5521 in the text"))
         self.assertEqual((1, ""), (code, out))
         self.assertEqual("AirbyteError\n", err)
 
