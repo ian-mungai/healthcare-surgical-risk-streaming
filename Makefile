@@ -33,6 +33,9 @@ check-terraform:
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra init -backend=false -input=false
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra validate
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra test
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static_storage $(TERRAFORM) -chdir=infra/storage init -backend=false -input=false
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static_storage $(TERRAFORM) -chdir=infra/storage validate
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static_storage $(TERRAFORM) -chdir=infra/storage test
 	TFLINT_PLUGIN_DIR=$(CURDIR)/.tools/tflint_plugins .tools/bin/tflint --chdir=infra --recursive --config=$(CURDIR)/infra/.tflint.hcl
 	.tools/bin/trivy config --cache-dir $(CURDIR)/.tools/trivy_embedded_cache --skip-check-update --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .terraform --quiet infra
 
