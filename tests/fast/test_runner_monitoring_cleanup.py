@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import shlex
+import subprocess
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -224,6 +225,15 @@ class LabelledCleanup(unittest.TestCase):
         self.assertIn("p2m_retention_abc123", target.volumes)
 
 
+class RemovalTimesOut(HostDocker):
+    """The live host's Docker whose removal of a container does not answer in time: the call raises, as the SSH call does after its deadline."""
+
+    def run(self, args: list[str], *, stdin: str | None = None, timeout: float = 0) -> tuple[int, str]:
+        if args[1:2] == ["rm"]:
+            raise subprocess.TimeoutExpired("ssh", 60)
+        return super().run(args, stdin=stdin, timeout=timeout)
+
+
 class HostRunResult(unittest.TestCase):
     def run_host(self, module: ModuleType, target: HostDocker) -> Record:
         record = Record(feature="x", slug="x", rerun="x")
@@ -247,19 +257,28 @@ class HostRunResult(unittest.TestCase):
     def test_a_clean_host_gives_a_passing_cleanup(self) -> None:
         module = runner()
         record = self.run_host(module, HostDocker("abc123"))
-        self.assertIn("none left: True", record.cleanup)
+        self.assertIn("labelled test resources: True", record.cleanup)
         self.assertEqual([item.case for item in record.observations if not item.passed], [])
 
     def test_a_warning_of_ssh_does_not_change_the_result(self) -> None:
         module = runner()
         record = self.run_host(module, HostDocker("abc123", warning=WARNING))
-        self.assertIn("none left: True", record.cleanup)
+        self.assertIn("labelled test resources: True", record.cleanup)
         self.assertEqual([item.case for item in record.observations if not item.passed], [])
+
+    def test_a_removal_that_times_out_fails_the_run_and_the_cleanup_says_so(self) -> None:
+        module = runner()
+        record = self.run_host(module, RemovalTimesOut("abc123"))
+        self.assertEqual([item.case for item in record.observations if not item.passed], ["labelled test resources"])
+        self.assertTrue(record.cleanup.startswith("cleanup failed (labelled test resources)"), record.cleanup)
+        self.assertIn("TimeoutExpired", next(item.observed for item in record.observations if not item.passed))
+        record.settle()
+        self.assertEqual(record.outcome, "fail")
 
     def test_a_resource_left_on_the_host_fails_the_cleanup_text_and_the_run(self) -> None:
         module = runner()
         record = self.run_host(module, HostDocker("abc123", stubborn=True))
-        self.assertIn("none left: False", record.cleanup)
+        self.assertIn("labelled test resources: False", record.cleanup)
         self.assertEqual([item.case for item in record.observations if not item.passed], ["labelled test resources"])
 
 

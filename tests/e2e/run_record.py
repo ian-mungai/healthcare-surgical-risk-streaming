@@ -10,7 +10,7 @@ import shutil
 import socket
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -139,6 +139,44 @@ def remove_scratch(record: Record, scratch: Path) -> bool:
     shutil.rmtree(scratch, ignore_errors=True)
     gone = not os.path.lexists(scratch)
     return record.expect("scratch folder removed", "control", "the scratch folder of the run is gone", f"removed: {gone}", gone)
+
+
+def cleanup_step(record: Record, case: str, expected: str, label: str, action: Callable[[], bool]) -> bool:
+    """Run one clean-up step and record it as an assertion named ``case``. A step that returns False, or raises anything but an interrupt (a command that
+    timed out, a failed removal), fails the record with the error's type and never stops the steps after it."""
+    try:
+        done = action()
+        observed = f"{label}: {done}"
+    except Exception as error:
+        done, observed = False, f"{type(error).__name__} stopped the step: {str(error)[:200]}"
+    return record.expect(case, "control", expected, observed, done)
+
+
+def clean_up(record: Record, steps: Sequence[tuple[str, str, str, Callable[[], bool]]], scratch: Path | None = None) -> str:
+    """Run every clean-up step in order, then remove and verify the scratch folder in a ``finally`` path, also when a step is interrupted, and set and
+    return the record's clean-up text.
+
+    Each step is ``(case, expected, label, action)``. The text names each step and starts with ``cleanup failed`` and the failed steps when one did not work,
+    so a record never reads as clean (or stays ``pending``) after a step that failed or timed out.
+    """
+    results: list[tuple[str, bool]] = []
+    try:
+        for case, expected, label, action in steps:
+            results.append((case, cleanup_step(record, case, expected, label, action)))
+    finally:
+        if scratch is not None:
+            gone = cleanup_step(record, "scratch folder removed", "the scratch folder of the run is gone", "removed", lambda: _scratch_gone(scratch))
+            results.append(("scratch folder removed", gone))
+        text = "; ".join(f"{case}: {done}" for case, done in results)
+        failed = [case for case, done in results if not done]
+        record.cleanup = f"cleanup failed ({', '.join(failed)}): {text}" if failed else text
+    return record.cleanup
+
+
+def _scratch_gone(scratch: Path) -> bool:
+    """Remove the folder and check it: a link or a file left in its place counts as left (``lexists``)."""
+    shutil.rmtree(scratch, ignore_errors=True)
+    return not os.path.lexists(scratch)
 
 
 def listed_words(code: int, output: str) -> list[str] | Unread:

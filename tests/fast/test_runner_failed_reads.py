@@ -149,7 +149,7 @@ class MonitoringCleanup(unittest.TestCase):
     def test_a_clean_run_has_no_failed_assertion_and_names_each_result_in_the_cleanup_text(self) -> None:
         run = self.clean()
         self.assertEqual(failed(run), [])
-        self.assertIn("labelled test containers and volumes removed with none left: True", run.cleanup)
+        self.assertIn("labelled test resources: True", run.cleanup)
         self.assertIn("scratch folder removed: True", run.cleanup)
 
     def test_a_labelled_resource_that_is_left_fails_the_run(self) -> None:

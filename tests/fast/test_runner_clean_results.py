@@ -13,6 +13,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import contextlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from tests.e2e.run_record import Record
+from tests.e2e.run_record import Record, Unread
 from tests.fast.test_runner_failed_reads import DockerOfThisComputer, failed, record
 from tests.fast.test_runner_stdout_alone import runner
 
@@ -131,7 +132,7 @@ class LocalCleanup(unittest.TestCase):
     def test_a_network_that_cannot_be_removed_fails_the_caddy_run(self) -> None:
         run, _ = clean("stack_caddy", NetworkRefused())
         self.assertEqual(failed(run), ["network removed"])
-        self.assertIn(f"network {NETWORK} removed: False", run.cleanup)
+        self.assertIn("network removed: False", run.cleanup)
 
     def test_a_network_that_cannot_be_removed_does_not_skip_the_scratch_folder(self) -> None:
         run, scratch = clean("stack_caddy", NetworkRefused(), scratch_stays=True)
@@ -181,18 +182,47 @@ class NessieHostCleanup(unittest.TestCase):
 
 
 class CatalogFinish(unittest.TestCase):
-    def finish(self, *, restored: bool = True, trino: bool = True, refuses: tuple[str, ...] = (), file_removed: bool = True) -> tuple[Record, str]:
+    def setUp(self) -> None:
+        self.pins: list[str | None] = []
+        self.deleted: list[str] = []
+
+    def finish(
+        self,
+        *,
+        restored: bool = True,
+        trino: bool = True,
+        listing: bool = True,
+        refuses: tuple[str, ...] = (),
+        file_removed: bool = True,
+        pin_error: Exception | None = None,
+        delete_error: Exception | None = None,
+        remove_error: Exception | None = None,
+    ) -> tuple[Record, str]:
         module = runner("catalog_proof")
         run = record()
 
         def delete(name: str, hash_: str) -> None:
+            self.deleted.append(name)
+            if delete_error is not None:
+                raise delete_error
             if name in refuses:
                 raise module.NessieError("refused")
 
+        def pin(reference: str | None, scratch_file: str) -> float | None:
+            self.pins.append(reference)
+            if pin_error is not None:
+                raise pin_error
+            return 1.0 if restored else None
+
+        def remove(path: str) -> bool:
+            if remove_error is not None:
+                raise remove_error
+            return file_removed
+
         stack = SimpleNamespace(
-            container=lambda service: "abc" if trino else "",
-            pin_trino=lambda reference, scratch_file: 1.0 if restored else None,
-            target=SimpleNamespace(remove_file=lambda path: file_removed),
+            listed_container=lambda service: ("abc" if trino else "") if listing else Unread("exit 1"),
+            pin_trino=pin,
+            target=SimpleNamespace(remove_file=remove),
         )
         nessie = SimpleNamespace(reference=lambda name: SimpleNamespace(hash="h"), delete_reference=delete)
         proof = SimpleNamespace(stack=stack, nessie=nessie, made=["a", "b"], pin_file="/pin.env", facts={})
@@ -201,19 +231,61 @@ class CatalogFinish(unittest.TestCase):
     def test_a_finish_that_put_trino_back_deleted_the_references_and_removed_the_file_passes(self) -> None:
         run, text = self.finish()
         self.assertEqual(failed(run), [])
-        self.assertEqual([item.case for item in run.observations], ["Trino back on main", "references deleted", "pin file removed"])
+        self.assertEqual([item.case for item in run.observations], ["Trino back on main", "Trino container listed", "references deleted", "pin file removed"])
         self.assertIn("deleted: 2", text)
 
     def test_trino_that_did_not_come_back_fails_the_run(self) -> None:
         self.assertEqual(failed(self.finish(restored=False)[0]), ["Trino back on main"])
 
-    def test_a_stack_with_no_trino_container_has_nothing_to_put_back(self) -> None:
-        self.assertEqual(failed(self.finish(trino=False, restored=False)[0]), [])
+    def test_a_stack_with_no_trino_container_in_the_final_listing_fails_the_run(self) -> None:
+        self.assertEqual(failed(self.finish(trino=False)[0]), ["Trino container listed"])
 
     def test_a_reference_that_cannot_be_deleted_fails_the_run(self) -> None:
         for refused in ("a", "b"):
             with self.subTest(refused=refused):
                 self.assertEqual(failed(self.finish(refuses=(refused,))[0]), ["references deleted"])
+
+    def test_a_final_listing_that_fails_fails_the_run_and_the_restoration_still_runs(self) -> None:
+        run, text = self.finish(listing=False)
+        self.assertEqual(failed(run), ["Trino container listed"])
+        self.assertEqual(self.pins, [None])
+        self.assertTrue(text.startswith("cleanup failed (Trino container listed)"), text)
+        self.assertEqual(sorted(self.deleted), ["a", "b"])
+        self.assertEqual([item.case for item in run.observations], ["Trino back on main", "Trino container listed", "references deleted", "pin file removed"])
+        run.settle()
+        self.assertEqual(run.outcome, "fail")
+
+    def test_the_restoration_runs_whatever_the_final_listing_holds(self) -> None:
+        cases: tuple[tuple[str, dict[str, Any]], ...] = (("readable", {}), ("empty", {"trino": False}), ("failed", {"listing": False}))
+        for kind, arguments in cases:
+            with self.subTest(listing=kind):
+                self.pins.clear()
+                self.finish(**arguments)
+                self.assertEqual(self.pins, [None])
+
+    def test_a_restoration_that_fails_fails_the_run_and_names_the_step(self) -> None:
+        run, text = self.finish(restored=False, listing=False)
+        self.assertEqual(failed(run), ["Trino back on main", "Trino container listed"])
+        self.assertTrue(text.startswith("cleanup failed (Trino back on main, Trino container listed)"), text)
+
+    def test_a_restoration_that_times_out_fails_the_run_and_the_later_steps_still_run(self) -> None:
+        run, text = self.finish(pin_error=subprocess.TimeoutExpired("docker", 600))
+        self.assertEqual(failed(run), ["Trino back on main"])
+        self.assertIn("TimeoutExpired", next(item.observed for item in run.observations if not item.passed))
+        self.assertEqual(sorted(self.deleted), ["a", "b"])
+        self.assertEqual([item.case for item in run.observations][-2:], ["references deleted", "pin file removed"])
+        self.assertTrue(text.startswith("cleanup failed (Trino back on main)"), text)
+
+    def test_a_reference_that_fails_to_travel_fails_the_run_and_the_pin_file_is_still_removed(self) -> None:
+        for error in (OSError("curl exit 7"), TimeoutError("timed out")):
+            with self.subTest(error=type(error).__name__):
+                run, _ = self.finish(delete_error=error)
+                self.assertEqual(failed(run), ["references deleted"])
+                self.assertEqual([item.case for item in run.observations][-1], "pin file removed")
+
+    def test_a_pin_file_removal_that_raises_fails_the_run(self) -> None:
+        run, _ = self.finish(remove_error=OSError("ssh failed"))
+        self.assertEqual(failed(run), ["pin file removed"])
 
     def test_a_pin_file_that_cannot_be_removed_fails_the_run(self) -> None:
         self.assertEqual(failed(self.finish(file_removed=False)[0]), ["pin file removed"])
