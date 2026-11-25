@@ -242,7 +242,7 @@ class HostSetupBudgetTest(unittest.TestCase):
     def test_a_task_that_two_calls_reach_counts_twice_and_the_counts_come_from_the_calls_in_the_files(self) -> None:
         found = playbook_occurrences("host.yml")
         compose = (ROLES / "compose_stack" / "tasks" / "main.yml").read_text()
-        self.assertEqual(2, compose.count("include_tasks: start.yml"), "the Compose role starts PostgreSQL alone and then the remaining services")
+        self.assertEqual(3, compose.count("include_tasks: start.yml"), "the Compose role starts PostgreSQL alone, then the remaining services, then AIStor")
         self.assertEqual(compose.count("include_tasks: start.yml"), runs_of_file(found, "compose_stack", "start.yml"))
         k3s = "".join(path.read_text() for path in (ROLES / "k3s" / "tasks").glob("*.yml"))
         self.assertEqual(k3s.count("include_tasks: wait_ready.yml"), runs_of_file(found, "k3s", "wait_ready.yml"))
@@ -250,14 +250,14 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertEqual(1, runs_of_file(found, "airbyte", RELEASE_FILE))
         self.assertEqual(2, runs_of_file(found, "airbyte", "cluster.yml"), "the Compose role and the Airbyte role each include it")
 
-    def test_the_second_compose_recreation_across_the_two_start_calls_is_in_the_sum(self) -> None:
+    def test_the_compose_recreations_across_the_three_start_calls_are_in_the_sum(self) -> None:
         found = playbook_occurrences("host.yml")
         recreate = [item for item in found if item.file == "start.yml" and str(item.task.get("name")).startswith("Recreate the services")]
         start = [item for item in found if item.file == "start.yml" and item.task.get("name") == "Start the services"]
-        self.assertEqual(2, len(recreate))
-        self.assertEqual(2, len(start))
+        self.assertEqual(3, len(recreate))
+        self.assertEqual(3, len(start))
         deadline = int(group_variables()["compose_stack_start_deadline_seconds"])
-        self.assertEqual(4 * deadline, sum(task_seconds(item) for item in recreate + start))
+        self.assertEqual(6 * deadline, sum(task_seconds(item) for item in recreate + start))
 
     def test_an_until_task_counts_its_first_attempt_and_each_retry_with_its_delay(self) -> None:
         found = playbook_occurrences("host.yml")

@@ -23,6 +23,7 @@ MINIMUM_MARKER_CHARACTERS = 16
 FORMS = ("hex64", "hex20", "urlsafe", "aws_key_id", "aws_secret", "plain")
 SECRETS_REFERENCE = re.compile(r"\$\{SECRETS_DIR[^}]*\}/(.+)")
 UNLOCK_REFERENCE = re.compile(r"\$\{OPENBAO_UNLOCK_KEY_FILE[^}]*\}")
+LICENCE_REFERENCE = re.compile(r"\$\{AISTOR_LICENCE_FILE[^}]*\}")
 
 
 @dataclass(frozen=True)
@@ -136,7 +137,7 @@ def generated_names(path: Path) -> list[str]:
 
 
 def compose_secret_files(root: Path) -> set[str]:
-    """The file of every Compose secret, relative to the secrets folder (the unlock key file is ``.env``)."""
+    """The file of every Compose secret, relative to the secrets folder (the unlock key file is ``.env``, the AIStor licence file ``aistor/licence``)."""
     files: set[str] = set()
     for service_file in sorted((root / "compose" / "services").glob("*.yml")):
         document = load_yaml(service_file.read_text())
@@ -146,6 +147,8 @@ def compose_secret_files(root: Path) -> set[str]:
             reference = str(definition["file"])
             if UNLOCK_REFERENCE.fullmatch(reference):
                 files.add(".env")
+            elif LICENCE_REFERENCE.fullmatch(reference):
+                files.add("aistor/licence")
             elif (found := SECRETS_REFERENCE.fullmatch(reference)) is not None:
                 files.add(found[1])
             else:
@@ -255,6 +258,33 @@ INPUTS: tuple[SecretInput, ...] = (
         "the file under the secrets folder; the secret_file module keeps an existing file",
         "Grafana's administrator sign-in, through the $__file{} provider in its mounted configuration (compose/monitoring/grafana/grafana.ini)",
         "the Grafana API accepts the marker for the administrator and refuses another password",
+    ),
+    SecretInput(
+        "aistor_root_user",
+        ("aistor/root_user",),
+        "urlsafe",
+        "local",
+        "the file under the secrets folder; the secret_file module keeps an existing file",
+        "AIStor's root user, through MINIO_ROOT_USER_FILE, and the storage apply step, which reads the file over SSH into memory",
+        "the S3 API accepts the marker as the root user and refuses another name",
+    ),
+    SecretInput(
+        "aistor_root_password",
+        ("aistor/root_password",),
+        "urlsafe",
+        "local",
+        "the file under the secrets folder; the secret_file module keeps an existing file",
+        "AIStor's root password, through MINIO_ROOT_PASSWORD_FILE, and the storage apply step, which reads the file over SSH into memory",
+        "the S3 API accepts the marker as the root password and refuses another",
+    ),
+    SecretInput(
+        "aistor_licence",
+        ("aistor/licence",),
+        "plain",
+        "host",
+        "the owner places the key file by hand at the path that compose_stack_aistor_licence_file names; the deploy only checks it",
+        "AIStor's server, through its --license flag with the path of the mounted file",
+        "the deploy step refuses a missing or empty file by a fixed message and the server serves S3 calls with the file's licence",
     ),
     SecretInput(
         "project_key_id",

@@ -1,0 +1,46 @@
+# Reads compose_stack_aistor_licence_file and compose_stack_owner. AIStor serves no S3 call without a licence key, which the owner places by hand: one file on the
+# host that only compose_stack_owner reads (mode 0400). The deploy never creates the file and never prints its content. Its content is not read into a variable: a
+# search for a line with any character that is not white space answers by its exit status only. A missing, empty, white-space-only or linked file, a file of
+# another owner or any other mode stops the deploy with one fixed message, and the step that starts AIStor does not run. This step is for AIStor only.
+- name: Check the AIStor licence file
+  vars:
+    compose_stack_aistor_licence_message: >-
+      the AIStor licence file is missing, is empty or is not a plain file that only {{ compose_stack_owner }} reads (mode 0400): place the licence key at
+      compose_stack_aistor_licence_file
+  block:
+    - name: Stop when the licence file is not named
+      ansible.builtin.assert:
+        that: compose_stack_aistor_licence_file | default('') | length > 0
+        quiet: true
+        fail_msg: "{{ compose_stack_aistor_licence_message }}"
+
+    - name: Look at the licence file
+      ansible.builtin.stat:
+        path: "{{ compose_stack_aistor_licence_file }}"
+        follow: false
+      register: compose_stack_aistor_licence_stat
+
+    - name: Stop when the licence file is missing, empty, not a plain file or readable by anyone but its owner
+      ansible.builtin.assert:
+        that:
+          - compose_stack_aistor_licence_stat.stat.exists
+          - compose_stack_aistor_licence_stat.stat.isreg | default(false)
+          - compose_stack_aistor_licence_stat.stat.pw_name | default('') == compose_stack_owner
+          - compose_stack_aistor_licence_stat.stat.mode | default('') == '0400'
+        quiet: true
+        fail_msg: "{{ compose_stack_aistor_licence_message }}"
+
+    - name: Look for a character in the licence file that is not white space, by exit status only
+      ansible.builtin.command:
+        argv: [grep, --quiet, --extended-regexp, '[^[:space:]]', "{{ compose_stack_aistor_licence_file }}"]
+      register: compose_stack_aistor_licence_text
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      timeout: 30
+
+    - name: Stop when the licence file holds only white space
+      ansible.builtin.assert:
+        that: compose_stack_aistor_licence_text.rc == 0
+        quiet: true
+        fail_msg: "{{ compose_stack_aistor_licence_message }}"

@@ -59,6 +59,11 @@ compose_stack_tools_file: "{{ compose_stack_compose_directory }}/postgres_tools.
 # One line for each service that reads a secret. A numeric user and group at the end of a line name the owner of that service's files.
 compose_stack_services_file: "{{ compose_stack_compose_directory }}/openbao_services.txt"
 compose_stack_owner: root
+# The AIStor licence key file, a plain file that compose_stack_owner alone reads (mode 0400), which the owner places by hand. The Compose file mounts it read-only
+# as a Compose secret (render_environment.yml writes it as AISTOR_LICENCE_FILE), and aistor_licence.yml refuses the deploy of AIStor, and of nothing else, while it
+# is missing or empty. The services that start apart from the rest, after their own step: AIStor starts after the check of its licence file.
+compose_stack_aistor_licence_file: "{{ compose_stack_secrets_directory }}/aistor/licence"
+compose_stack_storage_services: [aistor]
 compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.

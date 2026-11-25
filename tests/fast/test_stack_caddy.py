@@ -123,12 +123,18 @@ class RouteTargetTest(unittest.TestCase):
 class RouteListTest(unittest.TestCase):
     def test_the_tracked_list_loads_and_holds_the_phase_2_interfaces(self) -> None:
         names = [route.name for route in load_routes(ROUTES_FILE)]
-        self.assertEqual(["openbao", "grafana", "prometheus", "trino", "nessie", "airbyte", "dagster", "apicurio"], names)
+        self.assertEqual(["openbao", "grafana", "prometheus", "trino", "nessie", "airbyte", "dagster", "apicurio", "aistor"], names)
 
     def test_dagster_and_the_registry_are_served_on_their_ports_with_the_health_paths_of_their_tools(self) -> None:
         routes = {route.name: (route.port, route.upstream, route.health_path) for route in load_routes(ROUTES_FILE)}
         self.assertEqual((9447, "127.0.0.1:3001", "/server_info"), routes["dagster"])
         self.assertEqual((9448, "127.0.0.1:8081", "/apis/registry/v3/system/info"), routes["apicurio"])
+
+    def test_the_storage_route_is_the_s3_port_with_the_live_health_path_and_is_held_to_the_port_its_file_publishes(self) -> None:
+        routes = {route.name: (route.port, route.upstream, route.health_path) for route in load_routes(ROUTES_FILE)}
+        self.assertEqual((9449, "127.0.0.1:9000", "/minio/health/live"), routes["aistor"])
+        self.assertEqual({9000}, published_ports(SERVICES / "aistor.yml"))
+        self.assertEqual(["aistor"], routes_off_their_service(parse_routes("aistor 9449 127.0.0.1:9001 /minio/health/live\n")))
 
     def test_the_dagster_route_is_held_to_the_port_that_the_web_servers_file_publishes(self) -> None:
         planted = parse_routes("dagster 9447 127.0.0.1:3000 /server_info\n")
@@ -194,7 +200,17 @@ class RouteListTest(unittest.TestCase):
 
     def test_the_health_paths_of_the_tracked_list_are_in_the_closed_set(self) -> None:
         self.assertEqual(
-            ["/v1/sys/health", "/api/health", "/-/healthy", "/v1/info", "/api/v2/config", "/api/v1/health", "/server_info", "/apis/registry/v3/system/info"],
+            [
+                "/v1/sys/health",
+                "/api/health",
+                "/-/healthy",
+                "/v1/info",
+                "/api/v2/config",
+                "/api/v1/health",
+                "/server_info",
+                "/apis/registry/v3/system/info",
+                "/minio/health/live",
+            ],
             [route.health_path for route in load_routes(ROUTES_FILE)],
         )
 

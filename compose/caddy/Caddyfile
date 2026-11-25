@@ -75,3 +75,11 @@
 		respond "Gateway error {err.status_code}: the service behind apicurio is not running or does not answer." {err.status_code}
 	}
 }
+
+{$TS_HOST_NAME}:9449 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:9000
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind aistor is not running or does not answer." {err.status_code}
+	}
+}

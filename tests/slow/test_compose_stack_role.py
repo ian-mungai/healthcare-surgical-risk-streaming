@@ -48,6 +48,7 @@ def variables(folder: Path) -> dict[str, object]:
         "compose_stack_heavy_memory_mib": 11008,
         "airbyte_namespace": "airbyte",
         "airbyte_release": "airbyte",
+        "compose_stack_aistor_licence_file": str(folder / "secrets" / "aistor" / "licence"),
     }
 
 
@@ -92,7 +93,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(
             f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n"
             f"DOCKER_SOCKET_GID={socket_gid}\nSTACK_K3S_NAMESPACE=airbyte\nSTACK_K3S_RELEASE=airbyte\nPLATFORM_COMMIT={'c' * 40}\n"
-            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n",
+            f"WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\nAISTOR_LICENCE_FILE={folder / 'secrets' / 'aistor' / 'licence'}\n",
             host,
         )
         self.assertEqual("HEAVY_MEMORY_MIB=11008\n", heavy)
@@ -159,7 +160,8 @@ def step_order() -> list[str]:
     for task in tasks:
         if "ansible.builtin.include_tasks" in task:
             services = (task.get("vars") or {}).get("compose_stack_start_services")
-            steps.append(task["ansible.builtin.include_tasks"] + (f" {','.join(services) or 'all'}" if services is not None else ""))
+            named = services if isinstance(services, str) else ",".join(services or []) or "all"
+            steps.append(task["ansible.builtin.include_tasks"] + (f" {named}" if services is not None else ""))
         else:
             role = task["ansible.builtin.include_role"]
             steps.append(f"{role['name']}/{role['tasks_from']}")
@@ -167,7 +169,7 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_but_the_orchestration_services_and_makes_openbao_match(
+    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_makes_openbao_match_and_starts_aistor_last(
         self,
     ) -> None:
         self.assertEqual(
@@ -178,6 +180,7 @@ class StepOrderTest(unittest.TestCase):
                 "passwords.yml",
                 "verify_secrets.yml",
                 "grafana_password.yml",
+                "aistor_credentials.yml",
                 "build_images.yml",
                 "airbyte/cluster.yml",
                 "airbyte/group_access.yml",
@@ -188,6 +191,8 @@ class StepOrderTest(unittest.TestCase):
                 "kafka.yml",
                 "registry.yml",
                 "openbao/bootstrap.yml",
+                "aistor_licence.yml",
+                "start.yml {{ compose_stack_storage_services }}",
             ],
             step_order(),
         )
@@ -383,6 +388,175 @@ class GrafanaPasswordTest(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assertIn("The Grafana password file", output)
                 self.assertNotIn("a-long-random-value", output)
+
+
+class AistorCredentialsTest(unittest.TestCase):
+    """AIStor's root user and root password are two files that root owns (the server runs as root), mode 0400, made once, never printed and never replaced."""
+
+    FILES = ("root_user", "root_password")
+
+    def values(self, folder: Path) -> dict[str, object]:
+        return variables(folder)
+
+    def test_both_files_are_made_for_root_with_mode_0400_in_a_folder_for_root_and_no_output_holds_a_value(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+            made = {name: (folder / "secrets" / "aistor" / name) for name in self.FILES}
+            statuses = {name: path.stat() for name, path in made.items()}
+            texts = {name: path.read_text() for name, path in made.items()}
+            folder_status = (folder / "secrets" / "aistor").stat()
+        self.assertEqual(0, code, output)
+        for name in self.FILES:
+            with self.subTest(name):
+                self.assertEqual((0o400, UID, GID), (stat.S_IMODE(statuses[name].st_mode), statuses[name].st_uid, statuses[name].st_gid))
+                self.assertRegex(texts[name], r"^[A-Za-z0-9_-]{40,}$")
+                self.assertNotIn(texts[name], output)
+        self.assertNotEqual(texts["root_user"], texts["root_password"])
+        self.assertEqual((0o700, UID, GID), (stat.S_IMODE(folder_status.st_mode), folder_status.st_uid, folder_status.st_gid))
+
+    def test_a_second_run_changes_nothing_and_keeps_both_values(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            run_tasks(["aistor_credentials.yml"], self.values(folder))
+            before = {name: (folder / "secrets" / "aistor" / name).read_text() for name in self.FILES}
+            code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+            after = {name: (folder / "secrets" / "aistor" / name).read_text() for name in self.FILES}
+        self.assertEqual(0, code, output)
+        self.assertEqual(before, after)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_file_with_another_mode_is_given_mode_0400_with_its_value_kept(self) -> None:
+        for mode in (0o600, 0o640, 0o444):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                run_tasks(["aistor_credentials.yml"], self.values(folder))
+                target = folder / "secrets" / "aistor" / "root_password"
+                value = target.read_text()
+                target.chmod(mode)
+                code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+                self.assertEqual(0, code, output)
+                self.assertEqual((0o400, value), (stat.S_IMODE(target.stat().st_mode), target.read_text()))
+
+    def test_an_empty_credential_file_is_refused_by_name_and_is_never_filled_in(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            run_tasks(["aistor_credentials.yml"], self.values(folder))
+            target = folder / "secrets" / "aistor" / "root_user"
+            target.chmod(0o600)
+            target.write_text("")
+            target.chmod(0o400)
+            code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+            text = target.read_text()
+        self.assertNotEqual(0, code)
+        self.assertIn("the secret file root_user is empty", output)
+        self.assertEqual("", text)
+
+
+class AistorCredentialVerifyTest(unittest.TestCase):
+    """The check after the files are made passes a plain file of root with content and mode 0400 and refuses every other file by a message that names it."""
+
+    def check(
+        self, *, mode: int = 0o400, expected: tuple[int, int] = (UID, GID), create: bool = True, content: str = "a-long-random-value", link: bool = False
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor"
+            target.mkdir(parents=True, mode=0o700)
+            for name in ("root_user", "root_password"):
+                if not create and name == "root_password":
+                    continue
+                if link and name == "root_password":
+                    real = folder / "real"
+                    real.write_text(content)
+                    real.chmod(0o400)
+                    (target / name).symlink_to(real)
+                    continue
+                (target / name).write_text(content if name == "root_password" else "a-long-random-value")
+                (target / name).chmod(mode if name == "root_password" else 0o400)
+            return run_tasks(["verify_aistor_credentials.yml"], variables(folder) | {"secret_files_root_owner": f"{expected[0]}:{expected[1]}"})
+
+    def test_a_private_plain_file_of_root_with_content_passes_and_every_other_file_is_refused_by_name_with_no_value_printed(self) -> None:
+        code, output = self.check()
+        self.assertEqual(0, code, output)
+        for label, kwargs in (
+            ("mode 0600", {"mode": 0o600}),
+            ("mode 0440", {"mode": 0o440}),
+            ("mode 0444", {"mode": 0o444}),
+            ("mode 0404", {"mode": 0o404}),
+            ("another user", {"expected": (UID + 1, GID)}),
+            ("another group", {"expected": (UID, GID + 1)}),
+            ("missing", {"create": False}),
+            ("empty", {"content": ""}),
+            ("a link", {"link": True}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn("The AIStor credential file root_password", output)
+                self.assertNotIn("a-long-random-value", output)
+
+
+class AistorLicenceTest(unittest.TestCase):
+    """The deploy step for AIStor refuses a licence file that is missing, empty, white space only, not a plain file or not root's alone by one fixed message."""
+
+    MESSAGE = "the AIStor licence file is missing, is empty or is not a plain file that only"
+
+    def check(self, content: str | None, *, mode: int = 0o400, link: bool = False, variable: str | None = None, unset: bool = False) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor" / "licence"
+            target.parent.mkdir(parents=True, mode=0o700)
+            if content is not None:
+                if link:
+                    real = folder / "real"
+                    real.write_text(content)
+                    real.chmod(0o400)
+                    target.symlink_to(real)
+                else:
+                    target.write_text(content)
+                    target.chmod(mode)
+            values = variables(folder)
+            if variable is not None:
+                values["compose_stack_aistor_licence_file"] = variable
+            if unset:
+                del values["compose_stack_aistor_licence_file"]
+            return run_tasks(["aistor_licence.yml"], values)
+
+    def test_a_private_file_with_content_passes_and_nothing_is_changed_or_printed(self) -> None:
+        code, output = self.check("a-licence-key-with-some-length\n")
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+        self.assertNotIn("a-licence-key", output)
+
+    def test_a_missing_empty_or_blank_file_a_link_or_another_mode_is_refused_by_the_fixed_message_and_no_content_is_printed(self) -> None:
+        for label, kwargs in (
+            ("missing", {"content": None}),
+            ("empty", {"content": ""}),
+            ("spaces and line breaks only", {"content": " \n\t\n  \n"}),
+            ("mode 0600", {"content": "secret-licence-text", "mode": 0o600}),
+            ("mode 0440", {"content": "secret-licence-text", "mode": 0o440}),
+            ("mode 0444", {"content": "secret-licence-text", "mode": 0o444}),
+            ("a link", {"content": "secret-licence-text", "link": True}),
+            ("an empty variable", {"content": "secret-licence-text", "variable": ""}),
+            ("no variable", {"content": "secret-licence-text", "unset": True}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn(self.MESSAGE, output)
+                self.assertNotIn("secret-licence-text", output)
+
+    def test_a_file_that_another_user_owns_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor" / "licence"
+            target.parent.mkdir(parents=True, mode=0o700)
+            target.write_text("secret-licence-text")
+            target.chmod(0o400)
+            code, output = run_tasks(["aistor_licence.yml"], variables(folder) | {"compose_stack_owner": "nobody"})
+        self.assertNotEqual(0, code)
+        self.assertIn(self.MESSAGE, output)
 
 
 class SecretsCheckTest(unittest.TestCase):

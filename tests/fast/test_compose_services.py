@@ -88,7 +88,7 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
         if not isinstance(port, str) or not re.match(r"127\.0\.0\.1:", port):
             problems.append(f"{name}: every published port must bind 127.0.0.1")
     for key, value in (service.get("environment") or {}).items():
-        if re.search(r"PASSWORD|SECRET|TOKEN|KEY", str(key)) and not str(key).endswith("_FILE") and str(value):
+        if re.search(r"PASSWORD|SECRET|TOKEN|KEY|LICEN[CS]E", str(key)) and not str(key).endswith("_FILE") and str(value):
             problems.append(f"{name}: {key} must come from a secrets file, not a value in the file")
     for secret in service.get("secrets") or []:
         source = secret if isinstance(secret, str) else secret.get("source")
@@ -800,6 +800,14 @@ class PlantedDefectTest(unittest.TestCase):
         self.assertEqual(1, len(problems))
         self.assertIn("POSTGRES_PASSWORD", problems[0])
         self.assertEqual([], self.defect(lambda _document, service: service["environment"].update({"OTHER_PASSWORD_FILE": "/run/secrets/x"})))
+
+    def test_a_licence_value_in_the_environment_is_named_in_both_spellings_and_a_file_reference_is_not(self) -> None:
+        for key in ("MINIO_LICENSE", "AISTOR_LICENCE", "SOME_LICENSE_TEXT"):
+            with self.subTest(key=key):
+                problems = self.defect(lambda _document, service, key=key: service["environment"].update({key: "x"}))
+                self.assertEqual(1, len(problems))
+                self.assertIn(key, problems[0])
+        self.assertEqual([], self.defect(lambda _document, service: service["environment"].update({"MINIO_LICENSE_FILE": "/run/secrets/x"})))
 
     def test_a_secret_that_the_file_does_not_declare_is_named(self) -> None:
         problems = self.defect(lambda document, _service: document.pop("secrets"))

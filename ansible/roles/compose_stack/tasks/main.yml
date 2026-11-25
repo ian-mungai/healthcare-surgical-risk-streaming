@@ -3,7 +3,8 @@
 # file, build the images the project makes itself, create Airbyte's namespace on k3s and write the k3s token and certificate authority that the code
 # location reads as Compose secrets, so a new host deploys in one pass, start PostgreSQL alone and wait for it, make the PostgreSQL accounts match the tool
 # list, prepare the secret store's first start, start the remaining services but the orchestration services and wait for them, make the Kafka
-# topics and the registry's rules match their lists, and make the secret store match the service list. The orchestration services (the code location and what waits for it) start last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
+# topics and the registry's rules match their lists, make the secret store match the service list, and last check the AIStor licence file and start AIStor (the
+# services of compose_stack_storage_services start apart, so a missing licence refuses that step after everything else is deployed). The orchestration services (the code location and what waits for it) start last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
 # code location mounts files that only they can make, and it gives Nessie's main branch its first commit. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
@@ -22,6 +23,9 @@
 
 - name: Create the Grafana password file
   ansible.builtin.include_tasks: grafana_password.yml
+
+- name: Create the AIStor root credential files
+  ansible.builtin.include_tasks: aistor_credentials.yml
 
 - name: Build the images the project makes itself
   ansible.builtin.include_tasks: build_images.yml
@@ -53,7 +57,7 @@
   ansible.builtin.include_tasks: start.yml
   vars:
     compose_stack_start_services: []
-    compose_stack_start_except: "{{ compose_stack_orchestration_services }}"
+    compose_stack_start_except: "{{ compose_stack_orchestration_services + compose_stack_storage_services }}"
 
 - name: Make the Kafka topics match the topic list
   ansible.builtin.include_tasks: kafka.yml
@@ -65,3 +69,11 @@
   ansible.builtin.include_role:
     name: openbao
     tasks_from: bootstrap.yml
+
+- name: Refuse a missing or empty AIStor licence file, which stops the start of AIStor and nothing before it
+  ansible.builtin.include_tasks: aistor_licence.yml
+
+- name: Start AIStor and wait for its health
+  ansible.builtin.include_tasks: start.yml
+  vars:
+    compose_stack_start_services: "{{ compose_stack_storage_services }}"

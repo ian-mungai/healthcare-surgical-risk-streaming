@@ -27,6 +27,7 @@ VARIABLES = ROOT / "ansible" / "group_vars" / "all.yml"
 PRODUCERS = {
     "postgres": ("compose_stack", "passwords.yml"),
     "grafana": ("compose_stack", "grafana_password.yml"),
+    "aistor": ("compose_stack", "aistor_credentials.yml"),
     "k3s": ("airbyte", "group_access.yml"),
     "airbyte_api": ("airbyte", "record_client_files.yml"),
     "openbao": ("openbao", "prepare.yml"),
@@ -35,6 +36,8 @@ PRODUCERS = {
 KEY_STEP = ("launcher", "place_project_key")
 FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP}
 CONNECTION = ROOT / "ansible" / "connection.yml"
+STORAGE_NAME = "compose_stack_storage_services"
+DEFERRED = "{{ compose_stack_orchestration_services + " + STORAGE_NAME + " }}"
 
 
 @dataclass
@@ -121,6 +124,17 @@ def variable(name: str) -> Any:
     return mapping(load_yaml(VARIABLES.read_text()))[name]
 
 
+def named_services(event: Event) -> list[str] | None:
+    """The services that a start names: a list, or one of the two variables of the services that start apart, or None when it names none."""
+    named = event.vars.get("compose_stack_start_services")
+    for name in ("compose_stack_orchestration_services", STORAGE_NAME):
+        if named == "{{ " + name + " }}":
+            named = list(variable(name))
+    if named is not None and not isinstance(named, list):
+        raise AssertionError("a start must name its services as a list or by one of the two variables, or leave them out")
+    return named
+
+
 def start_positions(events: list[Event]) -> dict[str, int]:
     """The position of the first ``start.yml`` that starts each service."""
     services = set(all_services())
@@ -129,15 +143,13 @@ def start_positions(events: list[Event]) -> dict[str, int]:
     for position, event in enumerate(events):
         if event.file != "start.yml":
             continue
-        named = event.vars.get("compose_stack_start_services")
-        if named == "{{ " + left_out_name + " }}":
-            named = list(variable(left_out_name))
-        if named is not None and not isinstance(named, list):
-            raise AssertionError("a start must name its services as a list or by the one variable, or leave them out")
+        named = named_services(event)
         excluded = event.vars.get("compose_stack_start_except")
-        left_out = set(variable(left_out_name)) if excluded == "{{ " + left_out_name + " }}" else set()
-        if excluded not in (None, "{{ " + left_out_name + " }}"):
-            raise AssertionError("a start leaves services out only through the one variable")
+        left_out = {"{{ " + left_out_name + " }}": set(variable(left_out_name)), DEFERRED: set(variable(left_out_name)) | set(variable(STORAGE_NAME))}.get(
+            str(excluded), set()
+        )
+        if excluded not in (None, "{{ " + left_out_name + " }}", DEFERRED):
+            raise AssertionError("a start leaves services out only through the orchestration variable or the orchestration and storage variables")
         started = set(named) if named else services - left_out
         for service in started:
             first.setdefault(service, position)
@@ -163,6 +175,20 @@ class DeployOrderTest(unittest.TestCase):
                 elif positions[producer] >= starts[service]:
                     problems.append(f"{service}: {secret_file} is made by {producer[1]} after the service starts")
         self.assertEqual([], problems)
+
+    def test_the_storage_service_starts_alone_after_the_licence_check_and_after_its_credential_files_and_no_other_start_names_it(self) -> None:
+        events = playbook_events()
+        starts = start_positions(events)
+        positions = {(event.role, event.file): index for index, event in reversed(list(enumerate(events)))}
+        self.assertEqual(["aistor"], variable(STORAGE_NAME))
+        for service in variable(STORAGE_NAME):
+            with self.subTest(service):
+                self.assertGreater(starts[service], positions[("compose_stack", "aistor_licence.yml")])
+                self.assertGreater(starts[service], positions[("compose_stack", "aistor_credentials.yml")])
+                named = [index for index, event in enumerate(events) if event.file == "start.yml" and service in (named_services(event) or [])]
+                self.assertEqual([starts[service]], named, "only the storage step names the service")
+        general = [event for event in events if event.file == "start.yml" and not named_services(event)]
+        self.assertEqual([DEFERRED], [event.vars.get("compose_stack_start_except") for event in general])
 
     def test_the_producers_in_the_table_are_the_files_that_write_those_folders(self) -> None:
         for folder, (role, file) in PRODUCERS.items():
