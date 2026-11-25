@@ -411,6 +411,13 @@ class SlotsTest(unittest.TestCase):
         self.assertIn("airbyte 76, apicurio 20, nessie 1", message)
         self.assertIn("compose/postgres_connections.yml", message)
 
+    def test_the_full_message_states_the_count_and_does_not_predict_the_error_text_that_a_tool_gets(self) -> None:
+        """The count is what this read saw. What PostgreSQL tells a client that connects later is not in the message: a prediction can be wrong."""
+        _, message = self.report(self.OUTPUT.replace("airbyte|75", "airbyte|76"))
+        for predicted in ("SUPERUSER", "refused", "remaining connection slots", "a tool that connects now"):
+            with self.subTest(predicted=predicted):
+                self.assertNotIn(predicted, message)
+
     def test_one_slot_free_is_not_full_and_the_message_does_not_name_the_cause(self) -> None:
         full, message = self.report(self.OUTPUT)
         self.assertFalse(full)

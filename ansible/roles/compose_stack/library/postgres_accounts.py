@@ -231,8 +231,7 @@ def slots_report(slots: Slots) -> tuple[bool, str]:
     if used >= usable:
         return True, (
             f"PostgreSQL connection slots are full: {used} of {usable} slots that an ordinary account may use are held by sessions of every account "
-            f"({holders}), "
-            f"so a tool that connects now is refused with 'remaining connection slots are reserved for roles with the SUPERUSER attribute'. "
+            f"({holders}). "
             f"Each tool's maximum is in {BUDGET_FILE_NAME}."
         )
     return (
