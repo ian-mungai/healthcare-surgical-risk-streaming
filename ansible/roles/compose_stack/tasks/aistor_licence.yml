@@ -18,6 +18,8 @@
       ansible.builtin.stat:
         path: "{{ compose_stack_aistor_licence_file }}"
         follow: false
+        get_checksum: false
+        get_mime: false
       register: compose_stack_aistor_licence_stat
 
     - name: Stop when the licence file is missing, empty, not a plain file or readable by anyone but its owner

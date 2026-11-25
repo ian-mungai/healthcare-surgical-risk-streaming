@@ -10,11 +10,14 @@ that each check still looks.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import unittest
 from pathlib import Path
 from typing import Any
+
+from jinja2 import Environment
 
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import group_variables
@@ -52,6 +55,97 @@ def root_use_problems(files: dict[str, str]) -> list[str]:
     found = [f"{name}: names AIStor's root pair" for name, text in files.items() if name not in ALLOWED and ROOT_NAMES.search(text)]
     found += [f"{name}: sets a root variable as a value" for name, text in files.items() if re.search(r"MINIO_ROOT_(?:USER|PASSWORD)(?!_FILE)", text)]
     return found
+
+
+MODULE_FILE = "ansible/roles/compose_stack/library/aistor_project_user.py"
+ROOT_SCRIPT_KINDS = {"read", "user_add", "policy_create"}
+ROOT_CALL_KINDS = {"read", "user_add", "policy_create", "sign_in"}
+# Every call the module may make with the root pair, as the first three words that mc gets. A new one needs a new line here, and so a reviewer's eye.
+ROOT_READS = {
+    ("admin", "policy", "info"),
+    ("admin", "user", "info"),
+    ("admin", "policy", "detach"),
+    ("admin", "policy", "attach"),
+    ("admin", "user", "enable"),
+    ("admin", "group", "remove"),
+}
+
+
+def leading_words(node: ast.AST) -> tuple[str, ...]:
+    """The string constants at the start of a tuple or of the arguments of a call, up to the first value that is not a string constant."""
+    items = node.elts if isinstance(node, ast.Tuple) else getattr(node, "args", [])
+    words: list[str] = []
+    for item in items:
+        if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+            break
+        words.append(item.value)
+    return tuple(words)
+
+
+def docstring_nodes(tree: ast.AST) -> set[int]:
+    """The ids of the constants that are a docstring: they describe the root pair and are not a use of it."""
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.ClassDef) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                found.add(id(first.value))
+    return found
+
+
+def is_helper_words(node: ast.AST) -> bool:
+    """The one call of the module that passes words it was given: ``tuple(words)`` inside the ``read`` helper."""
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "tuple" and ast.unparse(node) == "tuple(words)"
+
+
+def module_root_problems(text: str) -> list[str]:
+    """Each use of the root pair in the bootstrap module's code that its allowlist does not name: the scripts that read the pair, the calls that run with it and
+    the places that name a root file. The module is allowed to name the root pair, so this check looks inside it."""
+    tree = ast.parse(text)
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "SCRIPTS" for target in node.targets)
+            and isinstance(node.value, ast.Dict)
+        ):
+            for key, value in zip(node.value.keys, node.value.values, strict=True):
+                kind, source = ast.literal_eval(key) if key is not None else "", ast.get_source_segment(text, value) or ""
+                if ("ROOT_SIGN_IN" in source or "aistor_root" in source) and kind not in ROOT_SCRIPT_KINDS:
+                    problems.append(f"the script {kind} reads the root pair")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Call" and node.args:
+            first = node.args[0]
+            kind = first.value if isinstance(first, ast.Constant) else None
+            if kind not in ROOT_CALL_KINDS:
+                problems.append(f"a call of the kind {kind!r}")
+            if kind == "read" and len(node.args) > 1 and not is_helper_words(node.args[1]) and leading_words(node.args[1])[:3] not in ROOT_READS:
+                problems.append(f"a root read of {leading_words(node.args[1])[:3]}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "read" and len(node.args) > 1:
+            words = leading_words(ast.Tuple(elts=node.args[1:]))
+            if words[:3] not in ROOT_READS:
+                problems.append(f"a root read of {words[:3]}")
+    skipped = docstring_nodes(tree)
+    literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "aistor_root" in node.value and id(node) not in skipped
+    ]
+    if len(literals) != 2:
+        problems.append(f"the module names a root file in {len(literals)} places, not the 2 of ROOT_PAIR_FILES")
+    if re.search(r"\bos\.environ|\benviron\[|\benv=", text):
+        problems.append("the module reads or sets an environment")
+    return problems
+
+
+def evaluate_assertions(task: dict[str, Any], **facts: Any) -> bool:
+    """Whether every condition of the real ``assert`` task holds for the facts: the YAML is parsed, so a comment or a message cannot satisfy a condition."""
+    conditions = task["ansible.builtin.assert"]["that"]
+    environment = Environment(autoescape=True)
+    return all(bool(environment.compile_expression(str(condition))(**facts)) for condition in (conditions if isinstance(conditions, list) else [conditions]))
+
+
+def stat_facts(*, mode: str = "0400", uid: int = 0, gid: int = 0, size: int = 5, regular: bool = True, exists: bool = True) -> dict[str, Any]:
+    return {"exists": exists, "isreg": regular, "size": size, "mode": mode, "uid": uid, "gid": gid, "pw_name": "root"}
 
 
 def tasks_of(name: str) -> list[dict[str, Any]]:
@@ -106,6 +200,110 @@ class RootUseTest(unittest.TestCase):
         self.assertNotRegex(text, r"os\.environ|environ\[|env=")
 
 
+class ModuleRootUseTest(unittest.TestCase):
+    """The one module that may name the root pair is checked inside: only the three scripts read it, and only the named reads run with it."""
+
+    def text(self) -> str:
+        return (ROOT / MODULE_FILE).read_text()
+
+    def test_the_real_module_passes(self) -> None:
+        self.assertEqual([], module_root_problems(self.text()))
+
+    def test_an_extra_root_read_inside_the_module_is_found(self) -> None:
+        planted = self.text().replace(
+            'write(runner, Call("read", ("admin", "user", "enable", ALIAS, user)), "enable the user")', 'read(runner, "admin", "config", "get", ALIAS)'
+        )
+        self.assertNotEqual(self.text(), planted)
+        self.assertEqual(["a root read of ('admin', 'config', 'get')"], module_root_problems(planted))
+
+    def test_an_extra_root_call_by_the_call_class_is_found(self) -> None:
+        planted = self.text() + '\n\ndef extra(runner):\n    return runner(Call("read", ("admin", "service", "restart", ALIAS)))\n'
+        self.assertEqual(["a root read of ('admin', 'service', 'restart')"], module_root_problems(planted))
+
+    def test_a_call_of_a_kind_that_no_script_has_is_found(self) -> None:
+        planted = self.text() + '\n\ndef extra(runner):\n    return runner(Call("shell", ("ls",)))\n'
+        self.assertEqual(["a call of the kind 'shell'"], module_root_problems(planted))
+
+    def test_the_sign_in_script_that_reads_the_root_files_is_found(self) -> None:
+        planted = self.text().replace("IFS= read -r secret_value && MC_HOST_", "cat /run/secrets/aistor_root_user; IFS= read -r secret_value && MC_HOST_")
+        self.assertNotEqual(self.text(), planted)
+        problems = module_root_problems(planted)
+        self.assertIn("the script sign_in reads the root pair", problems)
+
+    def test_a_script_that_uses_the_root_sign_in_without_being_one_of_the_three_is_found(self) -> None:
+        planted = self.text().replace('"sign_in": f\'IFS= read', '"sign_in": f\'{ROOT_SIGN_IN}; IFS= read')
+        self.assertNotEqual(self.text(), planted)
+        self.assertIn("the script sign_in reads the root pair", module_root_problems(planted))
+
+    def test_a_third_place_that_names_a_root_file_and_an_environment_are_found(self) -> None:
+        self.assertIn(
+            "the module names a root file in 3 places, not the 2 of ROOT_PAIR_FILES",
+            module_root_problems(self.text() + '\nEXTRA = "/run/secrets/aistor_root_user"\n'),
+        )
+        self.assertIn("the module reads or sets an environment", module_root_problems(self.text() + "\nimport os\nVALUE = os.environ\n"))
+
+    def test_the_project_users_sign_in_script_is_not_among_the_scripts_that_read_the_pair(self) -> None:
+        self.assertEqual({"read", "user_add", "policy_create"}, ROOT_SCRIPT_KINDS)
+        self.assertNotIn("sign_in", ROOT_SCRIPT_KINDS)
+
+
+class ModeCheckTest(unittest.TestCase):
+    """The checks of the credential files and of the licence file are evaluated as they are in the task files, so a comment cannot stand in for a condition."""
+
+    def verify_task(self) -> dict[str, Any]:
+        return next(task for task in tasks_of("verify_aistor_credentials.yml") if "ansible.builtin.assert" in task)
+
+    def facts(self, **kwargs: Any) -> dict[str, Any]:
+        return {"item": {"stat": stat_facts(**kwargs), "item": "root_password"}, "secret_files_root_owner": "0:0"}
+
+    def test_a_private_plain_file_with_content_of_root_passes(self) -> None:
+        self.assertTrue(evaluate_assertions(self.verify_task(), **self.facts()))
+
+    def test_every_other_mode_fails_whatever_a_comment_or_a_message_says(self) -> None:
+        for mode in ("0444", "0440", "0600", "0640", "0404", "0200"):
+            with self.subTest(mode=mode):
+                self.assertFalse(evaluate_assertions(self.verify_task(), **self.facts(mode=mode)))
+
+    def test_another_owner_a_missing_file_a_link_and_an_empty_file_fail(self) -> None:
+        for label, kwargs in (("uid", {"uid": 1}), ("gid", {"gid": 1}), ("a link", {"regular": False}), ("empty", {"size": 0})):
+            with self.subTest(label):
+                self.assertFalse(evaluate_assertions(self.verify_task(), **self.facts(**kwargs)))
+
+    def test_a_planted_task_with_0444_and_the_right_mode_only_in_a_comment_fails_the_evaluation(self) -> None:
+        planted = load_yaml(
+            "- name: x\n  ansible.builtin.assert:\n    that:\n      - item.stat.mode == '0444'  # item.stat.mode == '0400'\n"
+            "    fail_msg: item.stat.mode == '0400'\n"
+        )
+        self.assertTrue(isinstance(planted, list) and not evaluate_assertions(planted[0], item={"stat": stat_facts(mode="0400")}))
+
+    def test_a_text_search_for_the_condition_is_not_the_check(self) -> None:
+        text = (TASKS / "verify_aistor_credentials.yml").read_text().replace(
+            "item.stat.mode == '0400'", "item.stat.mode == '0444'"
+        ) + "\n# item.stat.mode == '0400'\n"
+        document = load_yaml(text)
+        task = next(task for task in (document if isinstance(document, list) else []) if "ansible.builtin.assert" in task)
+        self.assertIn("item.stat.mode == '0400'", text)
+        self.assertTrue(evaluate_assertions(task, **self.facts(mode="0444")), "the planted file accepts 0444: the text search would have passed it")
+        self.assertFalse(evaluate_assertions(self.verify_task(), **self.facts(mode="0444")))
+
+
+class StatTasksTest(unittest.TestCase):
+    """A stat of a credential file computes no checksum and no content type: a checksum of a secret is a value of it, and ``-v`` prints it."""
+
+    def test_each_stat_task_of_a_credential_or_licence_file_sets_get_checksum_and_get_mime_to_false(self) -> None:
+        found = 0
+        for name in ("verify_aistor_credentials.yml", "aistor_licence.yml"):
+            for task in tasks_of(name) + [inner for outer in tasks_of(name) for inner in outer.get("block", [])]:
+                if "ansible.builtin.stat" in task:
+                    found += 1
+                    with self.subTest(file=name, task=task.get("name")):
+                        options = task["ansible.builtin.stat"]
+                        self.assertIs(False, options.get("get_checksum"))
+                        self.assertIs(False, options.get("get_mime"))
+                        self.assertIs(False, options.get("follow"))
+        self.assertEqual(2, found)
+
+
 class ProjectPasswordFileTest(unittest.TestCase):
     def test_the_password_file_is_made_for_root_with_the_module_that_makes_the_root_files_and_with_the_same_whitespace_rule(self) -> None:
         make = tasks_of("aistor_credentials.yml")[0]
@@ -114,11 +312,9 @@ class ProjectPasswordFileTest(unittest.TestCase):
         self.assertEqual(["root_user", "root_password", "project_password"], make["loop"])
         self.assertIs(True, make["no_log"])
 
-    def test_the_check_asserts_a_plain_file_with_content_mode_0400_and_the_root_owner_for_each_of_the_three_files(self) -> None:
-        text = (TASKS / "verify_aistor_credentials.yml").read_text()
-        self.assertIn("loop: [root_user, root_password, project_password]", text)
-        for needle in ("item.stat.isreg", "item.stat.size | default(0) | int > 0", "item.stat.mode == '0400'", "secret_files_root_owner.split(':')[0]"):
-            self.assertIn(needle, text)
+    def test_the_check_covers_each_of_the_three_files(self) -> None:
+        stat_task = next(task for task in tasks_of("verify_aistor_credentials.yml") if "ansible.builtin.stat" in task)
+        self.assertEqual(["root_user", "root_password", "project_password"], stat_task["loop"])
 
     def test_the_project_user_is_not_the_root_name_and_the_policy_is_not_a_built_in_one(self) -> None:
         variables = group_variables()
@@ -128,11 +324,15 @@ class ProjectPasswordFileTest(unittest.TestCase):
 
 
 class OrderTest(unittest.TestCase):
-    def test_the_password_file_exists_before_openbao_keeps_it_and_before_the_bootstrap_reads_it(self) -> None:
+    def test_the_password_file_exists_before_the_aistor_step_reads_it_and_openbao_is_matched_before_that_step_logs_in_to_it(self) -> None:
         names = includes()
         self.assertLess(names.index("aistor_credentials.yml"), names.index("aistor_project_user.yml"))
         main = (TASKS / "main.yml").read_text()
-        self.assertLess(main.index("aistor_credentials.yml"), main.index("tasks_from: bootstrap.yml"))
+        self.assertLess(
+            main.index("tasks_from: bootstrap.yml"),
+            main.index("aistor_project_user.yml"),
+            "the admin role and its secret ID file exist before the step logs in",
+        )
 
     def test_the_bootstrap_runs_after_aistor_is_started_and_healthy_and_after_the_licence_check_and_nothing_follows_it_that_needs_root(self) -> None:
         names = includes()
@@ -151,11 +351,27 @@ class OrderTest(unittest.TestCase):
         (task,) = tasks_of("aistor_project_user.yml")
         self.assertIs(True, task["no_log"])
         self.assertEqual(
-            {"compose_command", "service", "user", "policy", "bucket", "password_file"},
+            {"compose_command", "service", "user", "policy", "bucket", "password_file", "openbao_address", "openbao_secret_id_file", "openbao_path", "rotate"},
             set(task["aistor_project_user"]),
         )
-        self.assertEqual("{{ aistor_bucket }}", task["aistor_project_user"]["bucket"])
-        self.assertEqual("{{ compose_stack_aistor_project_password_file }}", task["aistor_project_user"]["password_file"])
+        params = task["aistor_project_user"]
+        self.assertEqual("{{ aistor_bucket }}", params["bucket"])
+        self.assertEqual("{{ compose_stack_aistor_project_password_file }}", params["password_file"])
+        self.assertEqual("{{ compose_stack_aistor_rotate_password }}", params["rotate"])
+        self.assertEqual("{{ compose_stack_secrets_directory }}/openbao/bootstrap.secret_id", params["openbao_secret_id_file"])
+        self.assertEqual("{{ compose_stack_aistor_openbao_path }}", params["openbao_path"])
+        self.assertNotIn("password:", str(params).replace("password_file", "").replace("rotate_password", ""))
+
+    def test_the_rotation_is_off_by_default_so_a_new_password_file_is_never_set_on_the_user_without_the_owner(self) -> None:
+        self.assertIs(False, group_variables()["compose_stack_aistor_rotate_password"])
+
+    def test_the_openbao_path_is_the_one_that_the_aistor_role_reads_and_that_the_storage_command_asks_for(self) -> None:
+        from scripts.infra import storage
+
+        variables = group_variables()
+        self.assertEqual(f"secret/data/services/{variables['compose_stack_aistor_service']}/aistor", "secret/data/services/" + storage.OPENBAO_ROLE + "/aistor")
+        self.assertEqual("secret/data/services/{{ compose_stack_aistor_service }}/aistor", variables["compose_stack_aistor_openbao_path"])
+        self.assertEqual(storage.OPENBAO_PATH, f"secret/data/services/{variables['compose_stack_aistor_service']}/aistor")
 
     def test_the_launcher_gives_the_bucket_the_policy_reaches(self) -> None:
         from scripts.infra import host
@@ -165,17 +381,19 @@ class OrderTest(unittest.TestCase):
 
 
 class OpenBaoStepTest(unittest.TestCase):
-    def test_the_bootstrap_step_gets_the_client_service_user_and_password_file_and_no_value(self) -> None:
+    def test_the_bootstrap_step_gets_the_client_service_only_and_is_hidden_because_it_handles_secret_ids_and_passwords(self) -> None:
         (task,) = [task for task in tasks_of_openbao("bootstrap.yml") if "openbao_bootstrap" in task]
         params = task["openbao_bootstrap"]
         self.assertEqual("{{ openbao_client_service }}", params["client_service"])
-        self.assertEqual("{{ openbao_client_user }}", params["client_user"])
-        self.assertEqual("{{ openbao_client_password_file }}", params["client_password_file"])
-        self.assertNotIn("password:", str(params))
+        for gone in ("client_user", "client_password_file"):
+            self.assertNotIn(gone, params, "the AIStor step keeps the sign-in, after it has signed in, and not this step")
+        self.assertIs(True, task["no_log"])
 
     def test_the_defaults_point_at_the_compose_stack_variables_and_the_service_is_a_listed_one(self) -> None:
         defaults: Any = load_yaml((ROOT / "ansible/roles/openbao/defaults/main.yml").read_text())
         self.assertEqual("{{ compose_stack_aistor_service }}", defaults["openbao_client_service"])
+        self.assertNotIn("openbao_client_user", defaults)
+        self.assertNotIn("openbao_client_password_file", defaults)
         listed = [line.split()[0] for line in (ROOT / "compose/openbao_services.txt").read_text().splitlines() if line.strip() and not line.startswith("#")]
         self.assertIn(group_variables()["compose_stack_aistor_service"], listed)
         self.assertIn(group_variables()["compose_stack_aistor_service"], group_variables()["compose_stack_storage_services"])

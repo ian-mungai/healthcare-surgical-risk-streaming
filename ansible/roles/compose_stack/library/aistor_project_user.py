@@ -2,8 +2,14 @@
 
 THE ONLY USE OF THE ROOT PAIR. The owner decided that root credentials are kept in a file, are secured on the disk and are not used for the project's work. This
 module's calls are the one place where the pair is used: only to create the project user, its policy and the attachment of one to the other. Everything else
-(Terraform, the storage command, the checks, the workloads) signs in as the project user, or through STS, and never as root. The module makes no call when the
-user and the policy exist and match, so after the first deploy root is not used again.
+(Terraform, the storage command, the checks, the workloads) signs in as the project user, or through STS, and never as root. A deploy first verifies the
+project user AS that user: it reads the sign-in that OpenBao keeps for the aistor service and lists the project's bucket with it. When that works and OpenBao
+holds the digest of the current policy, the module makes no call as root and no write, so after the first deploy root is not used again. Only a sign-in that
+is refused (no user, wrong password, disabled, no policy) or a policy digest that changed sends the deploy to the root step.
+
+OpenBao is written with the sign-in only after that pair has signed in, so a password file that was lost and made again never replaces the working value.
+When the user exists and no password signs in, the module changes no password and writes nothing: it refuses, unless the owner approved setting the password
+file's value on the user for one deploy with ``compose_stack_aistor_rotate_password: true``.
 
 How the pair is kept out of the host's processes: the module runs ``mc`` inside the AIStor container (the image ships it) through ``docker compose exec``. A
 fixed script there reads the two root files from the container's own secrets mount (``/run/secrets/aistor_root_user`` and ``..._password``, the files that
@@ -29,6 +35,7 @@ and runs on the host's Python.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -36,6 +43,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.openbao_client import OpenBaoClient, OpenBaoError
 
 ALIAS = "aistor"
 BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]")
@@ -49,9 +57,19 @@ ROOT_SIGN_IN = f'MC_HOST_{ALIAS}="http://$(cat {ROOT_PAIR_FILES[0]}):$(cat {ROOT
 GROUP_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 NO_SUCH_USER = "XMinioAdminNoSuchUser"
 NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
+# The S3 codes of a call that was refused for who made it (not a user, not the password, not enabled, no policy) and the code of a bucket that is not there yet:
+# the listing was allowed and found no bucket, so the sign-in worked. Any other answer is not a verdict on the sign-in.
+SIGN_IN_REFUSALS = {"InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied"}
+SIGNED_IN_CODES = {"NoSuchBucket"}
+SET_VALUE_ACTION = "set the project user's password to the one of the password file"
+PUBLISH = "write the project user's sign-in to OpenBao"
+APPROVAL = "compose_stack_aistor_rotate_password"
 SCRIPTS = {
     "read": f'{ROOT_SIGN_IN} exec mc --no-color --json "$@" 2>&1',
     "user_add": f'{ROOT_SIGN_IN} exec mc --no-color admin user add {ALIAS} "$1"',
+    # The one call as the project user. Its pair is the environment of the one mc process inside the container: the user is an argument of the script, the
+    # password comes on standard input, and neither is an argument of mc. The root files are not read here.
+    "sign_in": f'IFS= read -r secret_value && MC_HOST_{ALIAS}="http://$1:$secret_value@127.0.0.1:9000" exec mc --no-color ls --json {ALIAS}/"$2" 2>&1',
     "policy_create": (
         f'file=$(mktemp) && cat > "$file" && {ROOT_SIGN_IN} mc --no-color admin policy create {ALIAS} "$1" "$file"; status=$?; rm -f "$file"; exit $status'
     ),
@@ -148,16 +166,38 @@ def parse_user_info(text: str, user: str | None = None) -> tuple[str, list[str],
     return status, [policy.strip() for policy in held.split(",") if policy.strip()], [str(group) for group in names]
 
 
-def is_absent(result: Result, code: str) -> bool:
-    """Whether the answer is the server's own statement that the thing does not exist: a failed call whose JSON error holds exactly this code."""
+def error_code(result: Result) -> str | None:
+    """The code of the JSON error in a failed answer (``error.cause.error.Code``), or None when the call did not fail or the answer holds no such code."""
     if result.status == 0:
-        return False
+        return None
     try:
         found = answer_of(result.output)
     except BootstrapError:
-        return False
+        return None
     cause = ((found.get("error") or {}).get("cause") or {}).get("error") or {}
-    return found.get("status") == "error" and isinstance(cause, dict) and cause.get("Code") == code
+    code = cause.get("Code") if isinstance(cause, dict) else None
+    return code if found.get("status") == "error" and isinstance(code, str) else None
+
+
+def is_absent(result: Result, code: str) -> bool:
+    """Whether the answer is the server's own statement that the thing does not exist: a failed call whose JSON error holds exactly this code."""
+    return error_code(result) == code
+
+
+def policy_digest(bucket: str) -> str:
+    """The SHA-256 of the project's policy for the bucket. OpenBao keeps it beside the sign-in, so a changed policy or bucket is applied again."""
+    return hashlib.sha256(normalised(policy_document(bucket)).encode()).hexdigest()
+
+
+def signed_in(runner: Runner, user: str, bucket: str, password: str) -> bool:
+    """Whether the project user signs in with this password: a listing of the project's bucket as that user. A refusal is False, and any other answer fails."""
+    result = runner(Call("sign_in", (user, bucket), password + "\n"))
+    code = error_code(result)
+    if result.status == 0 or code in SIGNED_IN_CODES:
+        return True
+    if code in SIGN_IN_REFUSALS:
+        return False
+    raise BootstrapError(f"the sign-in as the project user failed with exit status {result.status} and an answer that is not a refusal")
 
 
 def read(runner: Runner, *words: str) -> Result:
@@ -185,22 +225,18 @@ def policy_state(runner: Runner, policy: str, document: dict[str, Any]) -> bool:
     return normalised(stored) == normalised(document)
 
 
-def reconcile(runner: Runner, user: str, policy: str, bucket: str, password: str, *, check_only: bool) -> list[str]:
-    """Make the project's policy, user and attachment match, and return what changed (or, in a check run, what would). A matching server gets no write call."""
-    if ACCOUNT_NAME.fullmatch(user) is None or user.lower() in RESERVED_USERS:
-        raise BootstrapError("the project user's name is not an account name or is a reserved name: the project user is never the root user")
-    if ACCOUNT_NAME.fullmatch(policy) is None or policy in BUILT_IN_POLICIES:
-        raise BootstrapError("the project policy's name is not a policy name or is a built-in policy's name")
-    if VALUE_FORM.fullmatch(password) is None:
-        raise BootstrapError("the project user's password file does not hold a password of the expected form")
-    document = policy_document(bucket)
+def reconcile_root(runner: Runner, user: str, policy: str, document: dict[str, Any], password: str, *, check_only: bool) -> tuple[list[str], bool]:
+    """The root step: make the project's policy, user and attachment match with root's calls, and return what changed (or would) and whether the user is new.
+
+    The password is given to a user that is explicitly absent and to no other user."""
     actions: list[str] = []
     if not policy_state(runner, policy, document):
         actions.append("create the policy")
         if not check_only:
             write(runner, Call("policy_create", (policy,), json.dumps(document)), "create the policy")
     answer = read(runner, "admin", "user", "info", ALIAS, user)
-    if is_absent(answer, NO_SUCH_USER):
+    created = is_absent(answer, NO_SUCH_USER)
+    if created:
         actions.append("create the user")
         if not check_only:
             write(runner, Call("user_add", (user,), password + "\n"), "create the user")
@@ -227,7 +263,110 @@ def reconcile(runner: Runner, user: str, policy: str, bucket: str, password: str
         actions.append("enable the user")
         if not check_only:
             write(runner, Call("read", ("admin", "user", "enable", ALIAS, user)), "enable the user")
+    return actions, created
+
+
+def kept_sign_in(stored: dict[str, Any] | None, user: str) -> str | None:
+    """The password in the sign-in that OpenBao keeps, when that is the project user's and has the form of a password. Any other document is not used."""
+    password = stored.get("password") if isinstance(stored, dict) and stored.get("user") == user else None
+    return password if isinstance(password, str) and VALUE_FORM.fullmatch(password) else None
+
+
+def first_that_signs_in(runner: Runner, user: str, bucket: str, candidates: list[tuple[str, str]]) -> tuple[str, str] | None:
+    for source, password in candidates:
+        if signed_in(runner, user, bucket, password):
+            return source, password
+    return None
+
+
+def refusal() -> BootstrapError:
+    return BootstrapError(
+        "the project user exists, but neither the sign-in that OpenBao keeps nor the password file signs in: no password is changed and nothing is written to "
+        f"OpenBao. To set the password file's value on the user, the owner approves it for one deploy with {APPROVAL}: true"
+    )
+
+
+def reconcile(runner: Runner, bao: Any, user: str, policy: str, bucket: str, password: str, *, check_only: bool, rotate: bool = False) -> list[str]:
+    """Verify the project user as itself and use root only when that fails, and return what changed (or, in a check run, what would).
+
+    1. OpenBao's sign-in is read, and the project user signs in with it. When that works and OpenBao's digest is the one of the current policy, nothing else
+       happens: no call as root, no write.
+    2. Otherwise the root step makes the policy, the user (only when absent), its one policy and no group match, enabling a disabled user last.
+    3. Then a password that signs in is found: OpenBao's first, the password file's next. OpenBao is written with the pair only after that pair has signed
+       in, so a new password file never replaces a working value. When nothing signs in, a user that was made now is an error; a user that existed is left as
+       it is and the run refuses, unless the owner approved setting the password file's value on it (``rotate``)."""
+    if ACCOUNT_NAME.fullmatch(user) is None or user.lower() in RESERVED_USERS:
+        raise BootstrapError("the project user's name is not an account name or is a reserved name: the project user is never the root user")
+    if ACCOUNT_NAME.fullmatch(policy) is None or policy in BUILT_IN_POLICIES:
+        raise BootstrapError("the project policy's name is not a policy name or is a built-in policy's name")
+    if VALUE_FORM.fullmatch(password) is None:
+        raise BootstrapError("the project user's password file does not hold a password of the expected form")
+    document, digest = policy_document(bucket), policy_digest(bucket)
+    stored = bao.read()
+    kept = kept_sign_in(stored, user)
+    fresh = kept is not None and isinstance(stored, dict) and stored.get("policy_sha256") == digest
+    candidates = ([("openbao", kept)] if kept else []) + ([("file", password)] if password != kept else [])
+    verified = first_that_signs_in(runner, user, bucket, candidates)
+    if verified is not None and verified[0] == "openbao" and fresh:
+        return []
+    actions, created = reconcile_root(runner, user, policy, document, password, check_only=check_only)
+    if check_only:
+        if verified is None and not created and not actions:
+            if not rotate:
+                raise refusal()
+            actions.append(SET_VALUE_ACTION)
+        source = (verified or candidates[0])[0] if verified or actions else "file"
+        if source == "file" or not fresh:
+            actions.append(PUBLISH)
+        return actions
+    verified = first_that_signs_in(runner, user, bucket, candidates) if actions or verified is None else verified
+    if verified is None:
+        if created:
+            raise BootstrapError("the project user cannot sign in with the password of the password file right after it was made")
+        if not rotate:
+            raise refusal()
+        write(runner, Call("user_add", (user,), password + "\n"), "set the password")
+        actions.append(SET_VALUE_ACTION)
+        if not signed_in(runner, user, bucket, password):
+            raise BootstrapError("the project user cannot sign in with the password of the password file after the password was set")
+        verified = ("file", password)
+    if verified[0] == "file" or not fresh:
+        bao.write(user, verified[1], digest)
+        after = bao.read()
+        if not (isinstance(after, dict) and after.get("user") == user and after.get("password") == verified[1] and after.get("policy_sha256") == digest):
+            raise BootstrapError("OpenBao did not keep the project user's sign-in that was written to it")
+        actions.append(PUBLISH)
     return actions
+
+
+class OpenBaoStore:
+    """The project user's sign-in at one OpenBao path, read and written as one AppRole whose secret ID is in a root-only file. Failures are fixed messages."""
+
+    def __init__(self, client: OpenBaoClient, role: str, secret_id_file: str, path: str) -> None:
+        self.client, self.role, self.secret_id_file, self.path = client, role, secret_id_file, path
+
+    def login(self) -> str:
+        try:
+            with open(self.secret_id_file, encoding="utf-8") as handle:
+                secret_id = handle.read().rstrip("\n")
+        except OSError as error:
+            raise BootstrapError(f"the OpenBao secret ID file cannot be read: {error.strerror}") from None
+        try:
+            return self.client.login(self.role, secret_id)
+        except OpenBaoError as error:
+            raise BootstrapError(str(error)) from None
+
+    def read(self) -> dict[str, Any] | None:
+        try:
+            return self.client.read(self.login(), self.path)
+        except OpenBaoError as error:
+            raise BootstrapError(str(error)) from None
+
+    def write(self, user: str, password: str, digest: str) -> None:
+        try:
+            self.client.write(self.login(), self.path, {"user": user, "password": password, "policy_sha256": digest})
+        except OpenBaoError as error:
+            raise BootstrapError(str(error)) from None
 
 
 def module_runner(module: AnsibleModule, compose: list[str], service: str) -> Runner:
@@ -249,6 +388,11 @@ def main() -> None:
             "policy": {"type": "str", "required": True},
             "bucket": {"type": "str", "required": True},
             "password_file": {"type": "path", "required": True},
+            "openbao_address": {"type": "str", "required": True},
+            "openbao_role": {"type": "str", "default": "bootstrap"},
+            "openbao_secret_id_file": {"type": "path", "required": True},
+            "openbao_path": {"type": "str", "required": True},
+            "rotate": {"type": "bool", "default": False},
         },
         supports_check_mode=True,
     )
@@ -259,13 +403,19 @@ def main() -> None:
                 password = handle.read().rstrip("\n")
         except OSError as error:
             raise BootstrapError(f"the project user's password file cannot be read: {error.strerror}") from None
+        try:
+            store = OpenBaoStore(OpenBaoClient(params["openbao_address"]), params["openbao_role"], params["openbao_secret_id_file"], params["openbao_path"])
+        except OpenBaoError as error:
+            raise BootstrapError(str(error)) from None
         actions = reconcile(
             module_runner(module, list(params["compose_command"]), params["service"]),
+            store,
             params["user"],
             params["policy"],
             params["bucket"],
             password,
             check_only=module.check_mode,
+            rotate=bool(params["rotate"]),
         )
         module.exit_json(changed=bool(actions), actions=actions)
     except BootstrapError as error:

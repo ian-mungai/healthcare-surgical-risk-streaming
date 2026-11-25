@@ -5,10 +5,8 @@ openbao_services_file: "{{ compose_stack_services_file }}"
 openbao_tools_file: "{{ compose_stack_tools_file }}"
 openbao_unlock_key_file: "{{ unlock_key_file }}"
 openbao_address: "http://127.0.0.1:{{ openbao_port }}"
-# The AIStor project user's sign-in that the reconcile step keeps at the service's own path (see openbao_bootstrap.py). An empty service keeps none.
+# The service whose role reads exactly one path, the AIStor project user's sign-in (see openbao_bootstrap.py). The AIStor step writes that path, not this step.
 openbao_client_service: "{{ compose_stack_aistor_service }}"
-openbao_client_user: "{{ compose_stack_aistor_project_user }}"
-openbao_client_password_file: "{{ compose_stack_aistor_project_password_file }}"
 openbao_ready_deadline_seconds: 120
 openbao_token_ttl_seconds: 3600
 openbao_token_max_ttl_seconds: 86400

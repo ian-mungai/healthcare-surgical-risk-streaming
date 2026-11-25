@@ -7,6 +7,7 @@ the placed Compose files, the rendered limits and host settings, the password fi
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import pwd
@@ -439,19 +440,37 @@ class AistorCredentialsTest(unittest.TestCase):
                 self.assertEqual(0, code, output)
                 self.assertEqual((0o400, value), (stat.S_IMODE(target.stat().st_mode), target.read_text()))
 
-    def test_an_empty_credential_file_is_refused_by_name_and_is_never_filled_in(self) -> None:
+    def refused(self, content: str) -> tuple[int, str, str]:
+        """Make the files, put ``content`` in root_user, run the task again and give the exit code, Ansible's output and the file's text afterwards."""
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             run_tasks(["aistor_credentials.yml"], self.values(folder))
             target = folder / "secrets" / "aistor" / "root_user"
             target.chmod(0o600)
-            target.write_text("")
+            target.write_text(content)
             target.chmod(0o400)
             code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
-            text = target.read_text()
+            return code, output, target.read_text()
+
+    def test_an_empty_credential_file_is_refused_by_name_under_no_log_and_is_never_filled_in(self) -> None:
+        code, output, text = self.refused("")
         self.assertNotEqual(0, code)
         self.assertIn("the secret file root_user is empty", output)
         self.assertEqual("", text)
+        # The task is hidden (no_log): each result of the loop is censored, so the only text about the file is the module's fixed message.
+        self.assertIn("the output has been hidden due to the fact that 'no_log: true' was specified for this result", output)
+        self.assertIn("failed: [localhost] (item=(censored due to no_log))", output)
+        self.assertNotIn("item=root_user", output, "the loop's labels are hidden with the results")
+
+    def test_a_value_with_whitespace_at_an_edge_is_refused_by_a_fixed_message_under_no_log_and_never_printed(self) -> None:
+        for content in ("  planted-value-0123456789  ", "\tplanted-value-0123456789", "planted-value-0123456789 "):
+            with self.subTest(content=content):
+                code, output, text = self.refused(content)
+                self.assertNotEqual(0, code)
+                self.assertIn("has whitespace at its start or its end", output)
+                self.assertNotIn("planted-value-0123456789", output)
+                self.assertEqual(content, text, "the value is kept as it was")
+                self.assertIn("the output has been hidden due to the fact that 'no_log: true' was specified for this result", output)
 
 
 class AistorCredentialVerifyTest(unittest.TestCase):
@@ -496,6 +515,28 @@ class AistorCredentialVerifyTest(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assertIn("The AIStor credential file root_password", output)
                 self.assertNotIn("a-long-random-value", output)
+
+
+class AistorStatOutputTest(unittest.TestCase):
+    """A stat is printed by a verbose run (the slow runner's): for a credential or the licence file it must hold no checksum and no content type."""
+
+    def test_the_verbose_output_of_the_checks_holds_no_checksum_and_no_mime_type(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor"
+            target.mkdir(parents=True, mode=0o700)
+            for name in ("root_user", "root_password", "project_password", "licence"):
+                (target / name).write_text("planted-value-0123456789")
+                (target / name).chmod(0o400)
+            digest = hashlib.sha1(b"planted-value-0123456789", usedforsecurity=False).hexdigest()
+            for task_file in ("verify_aistor_credentials.yml", "aistor_licence.yml"):
+                with self.subTest(task_file=task_file):
+                    code, output = run_tasks([task_file], variables(folder))
+                    self.assertEqual(0, code, output)
+                    self.assertNotIn(digest, output)
+                    self.assertNotIn("checksum", output)
+                    self.assertNotIn("mimetype", output)
+                    self.assertNotIn("planted-value-0123456789", output)
 
 
 class AistorLicenceTest(unittest.TestCase):

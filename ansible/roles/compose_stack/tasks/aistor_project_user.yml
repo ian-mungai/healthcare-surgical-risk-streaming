@@ -1,8 +1,10 @@
-# Reads compose_stack_docker, compose_stack_storage_services, compose_stack_aistor_service, compose_stack_aistor_project_user, compose_stack_aistor_project_policy,
-# compose_stack_aistor_project_password_file and aistor_bucket (the launcher gives the bucket). The only use of AIStor's root pair, and a one-time one: the module
-# makes the project's user and policy through mc in the AIStor container, which reads the root files from its own secrets mount, and makes no write call when the
-# user and the policy already match, so a second deploy does not use root. The task is hidden, so neither password reaches a log.
-- name: Make the AIStor project user and its policy, once, with the root pair that the server's container reads
+# Reads compose_stack_docker, compose_stack_aistor_service, compose_stack_aistor_project_user, compose_stack_aistor_project_policy, compose_stack_aistor_project_password_file,
+# compose_stack_aistor_openbao_path, compose_stack_aistor_rotate_password, compose_stack_secrets_directory, openbao_port and aistor_bucket (the launcher gives the bucket).
+# The project user signs in as itself with the sign-in that OpenBao keeps, so a deploy that matches makes no call with AIStor's root pair and no write. Only a refused
+# sign-in or a changed policy sends the step to the root pair, which the module's script reads inside the AIStor container from the container's own secrets mount.
+# OpenBao is logged in to as the bootstrap role, whose secret ID file is root-only on the host, and is written with the sign-in only after that pair has signed in.
+# The task is hidden, so neither password reaches a log.
+- name: Verify the AIStor project user as itself, and make its user and policy with the root pair that the server's container reads only when that fails
   aistor_project_user:
     compose_command: "{{ compose_stack_docker }}"
     service: "{{ compose_stack_aistor_service }}"
@@ -10,5 +12,9 @@
     policy: "{{ compose_stack_aistor_project_policy }}"
     bucket: "{{ aistor_bucket }}"
     password_file: "{{ compose_stack_aistor_project_password_file }}"
+    openbao_address: "http://127.0.0.1:{{ openbao_port }}"
+    openbao_secret_id_file: "{{ compose_stack_secrets_directory }}/openbao/bootstrap.secret_id"
+    openbao_path: "{{ compose_stack_aistor_openbao_path }}"
+    rotate: "{{ compose_stack_aistor_rotate_password }}"
   timeout: 300
   no_log: true

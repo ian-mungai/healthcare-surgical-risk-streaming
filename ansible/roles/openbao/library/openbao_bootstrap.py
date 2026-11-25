@@ -6,10 +6,11 @@ and is given that owner and mode when it has others.
 
 ``step: reconcile`` logs in as the ``bootstrap`` AppRole and makes the running server match the service list: for each service one policy that reads
 only its own path, one AppRole named for the service with a renewable token, one secret ID in a file that only the service reads (mode 0400, owned by
-the numeric user on its list line, or by root when the line has none), for a service that is also a PostgreSQL tool its PostgreSQL password at its own
-path and, for the one service named ``client_service``, the sign-in of the AIStor project user (its name and the password in a root-only file) at
-``secret/services/<service>/aistor``, which only that service's own role reads. A server that already matches needs no change and the step reports none. It
-reports every secret file with its owner, for the role's check. A service that left the list keeps its role and is reported as unlisted, never removed.
+the numeric user on its list line, or by root when the line has none) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own
+path. The one service named ``client_service`` (the AIStor project user's sign-in is kept at ``secret/services/<service>/aistor`` by the AIStor step, only after
+that pair has signed in) gets a policy that reads exactly that one path: no other path, no list and no write. A server that already matches needs no change and
+the step reports none. It reports every secret file with its owner, for the role's check. A service that left the list keeps its role and is reported as
+unlisted, never removed. A refused request is reported by its method, its path and its status only: an answer can repeat a secret that the request carried.
 
 It uses only the standard library and runs on the host's Python. No secret is a module argument, a command line, a log line or a message.
 """
@@ -22,7 +23,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -44,10 +45,11 @@ from ansible.module_utils.secret_files import (
 ADMIN_ROLE = "bootstrap"
 OPENBAO_FOLDER = "openbao"
 ADMIN_ID_FILE = "bootstrap.secret_id"
+# The one secret of the AIStor client service: ``secret/services/<service>/aistor``, written by the AIStor step after the sign-in was verified.
+CLIENT_PATH = "aistor"
 SECRET_BYTES = 32
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
-ERROR_CHARACTERS = 300
 # The form of a token that goes into a header: the characters of OpenBao's tokens and of a bearer token (RFC 6750, b64token), and nothing else. A control
 # character such as a line break makes the HTTP library's header error carry the token's text.
 TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
@@ -61,8 +63,10 @@ def policy_name(service: str) -> str:
     return f"service_{service}"
 
 
-def policy_text(service: str) -> str:
-    """The one policy of a service: it reads and lists its own path and nothing else."""
+def policy_text(service: str, single_path: str | None = None) -> str:
+    """The one policy of a service: it reads and lists its own path. With ``single_path`` it reads that one path of the service and nothing else."""
+    if single_path is not None:
+        return f'path "secret/data/services/{service}/{single_path}" {{ capabilities = ["read"] }}\n'
     return (
         f'path "secret/data/services/{service}/*" {{ capabilities = ["read"] }}\n'
         f'path "secret/metadata/services/{service}/*" {{ capabilities = ["read", "list"] }}\n'
@@ -89,19 +93,6 @@ class State:
     roles: dict[str, dict[str, Any]]
     secret_id_valid: dict[str, bool]
     passwords: dict[str, str | None]
-    client: dict[str, str] | None = None
-
-
-@dataclass(frozen=True)
-class Client:
-    """The AIStor project user whose sign-in one service's path keeps. Neither value is in the text form of the object."""
-
-    service: str
-    user: str = field(repr=False)
-    password: str = field(repr=False)
-
-    def path(self) -> str:
-        return f"secret/data/services/{self.service}/aistor"
 
 
 @dataclass(frozen=True)
@@ -118,13 +109,13 @@ def plan(
     password_of: Callable[[str], str],
     token_ttl: int,
     token_max_ttl: int,
-    client: Client | None = None,
+    client_service: str | None = None,
 ) -> list[Action]:
     """The changes that make the server match the list, and none when it already does."""
     actions: list[Action] = []
     for service in services:
         stored = state.policies.get(policy_name(service))
-        if stored is None or stored.strip() != policy_text(service).strip():
+        if stored is None or stored.strip() != service_policy(service, client_service).strip():
             actions.append(Action("policy", service, f"write policy {policy_name(service)}"))
         role = state.roles.get(service)
         if role is None or any(role.get(key) != value for key, value in role_settings(service, token_ttl, token_max_ttl).items()):
@@ -133,9 +124,12 @@ def plan(
             actions.append(Action("secret_id", service, f"issue a secret ID for {service}"))
         if service in tools and state.passwords.get(service) != password_of(service):
             actions.append(Action("password", service, f"write the PostgreSQL password of {service}"))
-        if client is not None and service == client.service and state.client != {"user": client.user, "password": client.password}:
-            actions.append(Action("client", service, f"write the AIStor project user's sign-in of {service}"))
     return actions
+
+
+def service_policy(service: str, client_service: str | None) -> str:
+    """The policy text of a service: the client's reads its one path of the AIStor project user's sign-in, every other one is the wide form."""
+    return policy_text(service, CLIENT_PATH if service == client_service else None)
 
 
 def secret_file(secrets_directory: Path, name: str) -> Path:
@@ -179,14 +173,18 @@ class Api:
             raise BootstrapError("the token that OpenBao gave is not a valid token")
         connection = http.client.HTTPConnection(self.host, self.port, timeout=HTTP_SECONDS)
         headers = {"X-Vault-Token": token} if token else {}
+        failure = None
         try:
             connection.request(method, f"/v1/{path}", json.dumps(body) if body is not None else None, headers)
             response = connection.getresponse()
             raw = response.read().decode(errors="replace")
         except (OSError, http.client.HTTPException) as error:
-            raise BootstrapError(f"{method} {path}: no answer from {self.address} ({type(error).__name__})") from error
+            failure = type(error).__name__
         finally:
             connection.close()
+        if failure is not None:
+            # Raised outside the handler, so the library's text (which can repeat the request) is not chained to the message.
+            raise BootstrapError(f"{method} {path}: no answer from {self.address} ({failure})")
         try:
             document = json.loads(raw) if raw else {}
         except ValueError:
@@ -196,8 +194,7 @@ class Api:
     def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
         status, document = self.call(method, path, token, body)
         if status not in (200, 204):
-            errors = " ".join(str(item) for item in document.get("errors") or [])[:ERROR_CHARACTERS]
-            raise BootstrapError(f"{method} {path}: HTTP {status}: {errors}")
+            raise BootstrapError(f"{method} {path}: HTTP {status}")
         return document
 
     def wait_ready(self, deadline_seconds: int) -> None:
@@ -228,7 +225,7 @@ class Api:
         return str(token)
 
 
-def read_state(api: Api, token: str, services: list[str], tools: list[str], secrets_directory: Path, client: Client | None = None) -> State:
+def read_state(api: Api, token: str, services: list[str], tools: list[str], secrets_directory: Path) -> State:
     state = State(policies={}, roles={}, secret_id_valid={}, passwords={})
     for service in services:
         status, document = api.call("GET", f"sys/policies/acl/{policy_name(service)}", token)
@@ -254,22 +251,15 @@ def read_state(api: Api, token: str, services: list[str], tools: list[str], secr
                 state.passwords[service] = str(((document.get("data") or {}).get("data") or {}).get("password") or "")
             elif status != 404:
                 raise BootstrapError(f"GET secret/data/services/{service}/postgres: HTTP {status}")
-    if client is not None:
-        status, document = api.call("GET", client.path(), token)
-        if status == 200:
-            stored = (document.get("data") or {}).get("data") or {}
-            state.client = {"user": str(stored.get("user") or ""), "password": str(stored.get("password") or "")}
-        elif status != 404:
-            raise BootstrapError(f"GET {client.path()}: HTTP {status}")
     return state
 
 
 def apply(
-    api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int], token_ttl: int, token_max_ttl: int, client: Client | None = None
+    api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int], token_ttl: int, token_max_ttl: int, client_service: str | None = None
 ) -> None:
     service = action.service
     if action.kind == "policy":
-        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service)})
+        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": service_policy(service, client_service)})
     elif action.kind == "role":
         api.must("POST", f"auth/approle/role/{service}", token, role_settings(service, token_ttl, token_max_ttl))
     elif action.kind == "secret_id":
@@ -277,8 +267,6 @@ def apply(
         if not issued:
             raise BootstrapError(f"OpenBao returned no secret ID for {service}")
         write_private_file(secret_file(secrets_directory, f"{service}.secret_id"), issued, replace=True, owner=owner)
-    elif action.kind == "client" and client is not None:
-        api.must("POST", client.path(), token, {"data": {"user": client.user, "password": client.password}})
     else:
         password = PasswordStore.in_secrets(secrets_directory).read(service)
         api.must("POST", f"secret/data/services/{service}/postgres", token, {"data": {"password": password}})
@@ -320,24 +308,22 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     tools = parse_names(Path(params["tools_file"]).read_text(), "tool")
     if missing := [tool for tool in tools if tool not in services]:
         raise BootstrapError(f"PostgreSQL tool {missing[0]!r} has no entry in the service list, so its password would never reach OpenBao")
-    client = None
-    if params.get("client_service"):
-        if params["client_service"] not in services:
-            raise BootstrapError(f"AIStor client {params['client_service']!r} has no entry in the service list, so no policy would read its sign-in")
-        client = Client(params["client_service"], params["client_user"], read_file(Path(params["client_password_file"]), "AIStor project password file"))
+    client_service = params.get("client_service") or None
+    if client_service is not None and client_service not in services:
+        raise BootstrapError(f"AIStor client {client_service!r} has no entry in the service list, so no policy would read its sign-in")
     api = Api(params["address"])
     api.wait_ready(int(params["ready_deadline_seconds"]))
     token = api.login(ADMIN_ROLE, read_file(secret_file(secrets_directory, ADMIN_ID_FILE), "admin secret ID file"))
     ttl, max_ttl = int(params["token_ttl_seconds"]), int(params["token_max_ttl_seconds"])
-    state = read_state(api, token, services, tools, secrets_directory, client)
-    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl, client)
+    state = read_state(api, token, services, tools, secrets_directory)
+    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl, client_service)
     actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"], root_owner)
     if not check_only:
         for action in actions:
             if action.kind == "access":
                 set_access(secret_file(secrets_directory, f"{action.service}.secret_id"), owners[action.service])
             else:
-                apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl, client)
+                apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl, client_service)
     files = [
         {"path": str(path), "owner": f"{owner[0]}:{owner[1]}"} for path, owner in secret_files(secrets_directory, entries, admin_owner, root_owner).items()
     ]
@@ -360,8 +346,6 @@ def main() -> None:
             "services_file": {"type": "path"},
             "tools_file": {"type": "path"},
             "client_service": {"type": "str"},
-            "client_user": {"type": "str"},
-            "client_password_file": {"type": "path"},
             "address": {"type": "str"},
             "ready_deadline_seconds": {"type": "int", "default": 120},
             "token_ttl_seconds": {"type": "int", "default": 3600},
@@ -379,8 +363,6 @@ def main() -> None:
             module.exit_json(changed=created, created=[ADMIN_ID_FILE] if created else [], secret_files=files)
         if not all(params[key] for key in ("services_file", "tools_file", "address")):
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
-        if bool(params["client_service"]) != bool(params["client_user"]) or bool(params["client_service"]) != bool(params["client_password_file"]):
-            raise BootstrapError("client_service, client_user and client_password_file are given together or not at all")
         module.exit_json(**reconcile(params, check_only=module.check_mode))
     except (BootstrapError, SecretFileError) as error:
         module.fail_json(msg=str(error))
