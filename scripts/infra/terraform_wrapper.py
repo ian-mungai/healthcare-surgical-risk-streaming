@@ -226,10 +226,22 @@ def stale_pin_problem(plan: object) -> str | None:
     created has no use for the pin.
     """
     creates, planned, region = planned_host_image(plan)
+    if not creates:
+        return None
     current = pinned_ami(region)
-    if not creates or (isinstance(planned, str) and planned == current):
+    if isinstance(planned, str) and planned == current:
         return None
     return f"the Ubuntu pin changed after this plan was saved; save a new plan: the plan creates the host from {planned!r} and the pin now gives {current!r}"
+
+
+def plan_region_problem(run: RunBinding, plan: object) -> str | None:
+    """The refusal for a plan whose own ``aws_region`` variable is not the run's bound region, or has no text value, or None."""
+    variables = plan.get("variables") if isinstance(plan, dict) else None
+    entry = variables.get("aws_region") if isinstance(variables, dict) else None
+    planned = entry.get("value") if isinstance(entry, dict) else None
+    if planned == run.region:
+        return None
+    return f"the plan was made for the region {planned!r} and the run is bound to {run.region!r}; save a new plan"
 
 
 def environment_override_problems(environment: Mapping[str, str]) -> list[str]:
@@ -426,9 +438,13 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
 
 
 def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None = None) -> int:
-    mode_problem = bucket_problem(run, configuration or load_configuration())
+    configuration = configuration or load_configuration()
+    mode_problem = bucket_problem(run, configuration)
     if mode_problem:
         raise WrapperError(f"refused before any change: {mode_problem}")
+    mismatch = region_problem(run, configuration)
+    if mismatch:
+        raise WrapperError(f"refused before any change: {mismatch}; then save a new plan")
     folder = ROOT / "runs" / run.run_id / "plans"
     plan_file = folder / "apply.tfplan"
     binding_file = folder / "apply_binding.json"
@@ -440,7 +456,8 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         raise WrapperError("refused before any change: " + "; ".join(problems))
     approved = approved_plan_copy(run, plan)
     try:
-        # The one check on the plan that is applied: its own JSON, read from the exact bytes that were checked, holds the three numbers the loader gives now.
+        # The checks on the plan that is applied read its own JSON, from the exact bytes that were checked: the three numbers the loader gives now, the
+        # pinned image of a created host and the region of the run's binding.
         try:
             applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
         except ValueError as error:
@@ -451,6 +468,9 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         moved = stale_pin_problem(applied_plan)
         if moved:
             raise WrapperError(f"refused before any change: {moved}")
+        elsewhere = plan_region_problem(run, applied_plan)
+        if elsewhere:
+            raise WrapperError(f"refused before any change: {elsewhere}")
         output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
         kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
         sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")

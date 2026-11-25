@@ -362,9 +362,12 @@ class PlanChangesTest(unittest.TestCase):
         self.assertEqual([("delete/create", "aws_thing.a"), ("update", "output.x")], plan_changes(document))
 
 
-def plan_with(inputs: Mapping[str, object] | None) -> dict[str, object]:
-    """A plan's JSON with a ``variables`` section holding the given heavy inputs, or none."""
-    return {"variables": {name: {"value": value} for name, value in inputs.items()}} if inputs is not None else {}
+def plan_with(inputs: Mapping[str, object] | None, *, region: object = None) -> dict[str, object]:
+    """A plan's JSON with a ``variables`` section holding the given heavy inputs and, when given, the region it was made for, or none."""
+    if inputs is None:
+        return {}
+    variables = {name: {"value": value} for name, value in inputs.items()}
+    return {"variables": variables | ({"aws_region": {"value": region}} if region is not None else {})}
 
 
 class StaleInputsTest(unittest.TestCase):
@@ -449,11 +452,13 @@ class StalePinTest(unittest.TestCase):
     def test_a_plan_that_replaces_the_host_is_checked_like_one_that_creates_it(self) -> None:
         self.assertIsNotNone(stale_pin_problem(host_plan(OTHER_AMI, actions=("delete", "create"))))
 
-    def test_a_plan_that_does_not_create_the_host_is_never_stale_for_this_cause(self) -> None:
-        for actions in (("no-op",), ("update",), ("delete",), ("read",)):
-            with self.subTest(actions=actions):
-                self.assertIsNone(stale_pin_problem(host_plan(OTHER_AMI, actions=actions)))
-        self.assertIsNone(stale_pin_problem(plan_with(HEAVY_INPUTS)))
+    def test_a_plan_that_does_not_create_the_host_is_never_stale_for_this_cause_and_never_reads_the_pin(self) -> None:
+        with mock.patch.object(terraform_wrapper, "pinned_ami") as read:
+            for actions in (("no-op",), ("update",), ("delete",), ("read",)):
+                with self.subTest(actions=actions):
+                    self.assertIsNone(stale_pin_problem(host_plan(OTHER_AMI, actions=actions)))
+            self.assertIsNone(stale_pin_problem(plan_with(HEAVY_INPUTS)))
+        read.assert_not_called()
 
     def test_a_region_that_the_pin_no_longer_names_makes_a_host_plan_stale(self) -> None:
         write_pin(self.root, {"eu-west-1": PINNED_AMI})
@@ -474,7 +479,7 @@ class StalePinTest(unittest.TestCase):
         broken["resource_changes"] = [{"type": "aws_instance", "name": "host", "change": {"actions": ["create"]}}]
         self.assertIn("save a new plan", stale_pin_problem(broken) or "")
 
-    def test_a_missing_or_unreadable_pin_file_refuses_a_host_plan_and_a_plan_without_a_host_never_reads_it(self) -> None:
+    def test_a_missing_or_unreadable_pin_file_refuses_a_host_plan_and_stops_no_plan_without_a_host(self) -> None:
         pin = self.root / "infra" / "ubuntu_build.json"
         for text in (None, "not json", "[]", '{"amis": []}', '{"amis": {"us-west-2": 5}}'):
             with self.subTest(text=text):
@@ -506,8 +511,12 @@ class StalePinTest(unittest.TestCase):
         self.assertIsNone(stale_inputs_problem(host_plan(OTHER_AMI)))
 
 
+ENV = {"AWS_PROFILE": "example_project_dev", "AWS_REGION": "us-west-2"}
+
+
 class ConfirmedPlanTest(unittest.TestCase):
-    """Confirming a saved plan compares the numbers it was made with against the limits now, before any apply."""
+    """Confirming a saved plan compares the numbers, the pinned image and the region that it was made with against the limits, the pin and the run now,
+    before any apply."""
 
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -520,7 +529,7 @@ class ConfirmedPlanTest(unittest.TestCase):
         (folder / "apply_binding.json").write_text(json.dumps(plan_binding(RUN, PLAN, "apply")))
         configuration_folder_of(self.root).mkdir(parents=True)
         self.calls: list[str] = []
-        self.plan_text = json.dumps(plan_with(HEAVY_INPUTS))
+        self.plan_text = json.dumps(plan_with(HEAVY_INPUTS, region=RUN.region))
 
         def fake_terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
             self.calls.append(arguments[0])
@@ -532,24 +541,24 @@ class ConfirmedPlanTest(unittest.TestCase):
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
 
     def test_a_plan_made_with_the_current_limits_is_applied(self) -> None:
-        self.assertEqual(0, apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"}))
+        self.assertEqual(0, apply_plan(RUN, CODE, ENV))
         self.assertIn("apply", self.calls)
 
     def test_a_plan_saved_before_a_limits_change_is_refused_before_any_apply(self) -> None:
         (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("host_reserve_mib: 4096", "host_reserve_mib: 5120"))
         with self.assertRaisesRegex(WrapperError, "the limits changed after this plan was saved; save a new plan"):
-            apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
+            apply_plan(RUN, CODE, ENV)
         self.assertNotIn("apply", self.calls)
 
     def test_a_host_plan_saved_before_the_pin_changed_is_refused_before_any_apply_and_a_current_one_is_applied(self) -> None:
         write_pin(self.root, {"us-west-2": PINNED_AMI})
         self.plan_text = json.dumps(host_plan(PINNED_AMI))
-        self.assertEqual(0, apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"}))
+        self.assertEqual(0, apply_plan(RUN, CODE, ENV))
         self.assertIn("apply", self.calls)
         self.calls.clear()
         self.plan_text = json.dumps(host_plan(OTHER_AMI))
         with self.assertRaisesRegex(WrapperError, "refused before any change: the Ubuntu pin changed after this plan was saved; save a new plan"):
-            apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
+            apply_plan(RUN, CODE, ENV)
         self.assertNotIn("apply", self.calls)
 
     def test_a_plan_document_of_any_shape_that_is_not_the_three_whole_numbers_is_refused_with_a_wrapper_error_before_any_apply(self) -> None:
@@ -582,8 +591,50 @@ class ConfirmedPlanTest(unittest.TestCase):
                 self.calls.clear()
                 self.plan_text = text
                 with self.assertRaises(WrapperError):
-                    apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
+                    apply_plan(RUN, CODE, ENV)
                 self.assertNotIn("apply", self.calls)
+
+    def saved_for(self, run: RunBinding) -> None:
+        """The saved plan and its binding for ``run``, which Terraform's JSON of the plan names as made for us-west-2."""
+        folder = self.root / "runs" / run.run_id / "plans"
+        (folder / "apply_binding.json").write_text(json.dumps(plan_binding(run, PLAN, "apply")))
+
+    def test_a_plan_saved_for_another_region_than_the_runs_bound_region_is_refused_before_any_apply(self) -> None:
+        elsewhere = replace(RUN, region="eu-west-1")
+        self.saved_for(elsewhere)
+        with self.assertRaisesRegex(
+            WrapperError, r"refused before any change: the plan was made for the region 'us-west-2' and the run is bound to 'eu-west-1'; save a new plan"
+        ):
+            apply_plan(elsewhere, CODE, ENV | {"AWS_REGION": "eu-west-1"})
+        self.assertNotIn("apply", self.calls)
+
+    def test_a_plan_whose_json_names_no_text_region_is_refused_before_any_apply(self) -> None:
+        good = {name: {"value": value} for name, value in HEAVY_INPUTS.items()}
+        documents: dict[str, object] = {
+            "no region": {"variables": good},
+            "a null region": {"variables": good | {"aws_region": {"value": None}}},
+            "a region entry that is text": {"variables": good | {"aws_region": "us-west-2"}},
+            "a list as region": {"variables": good | {"aws_region": {"value": ["us-west-2"]}}},
+            "another region": {"variables": good | {"aws_region": {"value": "eu-west-1"}}},
+        }
+        for label, document in documents.items():
+            with self.subTest(plan=label):
+                self.calls.clear()
+                self.plan_text = json.dumps(document)
+                with self.assertRaisesRegex(WrapperError, "the plan was made for the region .* save a new plan"):
+                    apply_plan(RUN, CODE, ENV)
+                self.assertNotIn("apply", self.calls)
+
+    def test_an_env_region_changed_after_the_plan_is_refused_before_terraform_starts(self) -> None:
+        refusal = "refused before any change: the run is bound to a region other than the AWS_REGION of .env; bind the run again or correct AWS_REGION"
+        with self.assertRaisesRegex(WrapperError, refusal + "; then save a new plan"):
+            apply_plan(RUN, CODE, ENV | {"AWS_REGION": "eu-west-1"})
+        self.assertEqual([], self.calls)
+
+    def test_the_env_region_is_checked_before_the_saved_plan_is_looked_for(self) -> None:
+        (self.root / "runs" / RUN.run_id / "plans" / "apply.tfplan").unlink()
+        with self.assertRaisesRegex(WrapperError, "AWS_REGION of .env"):
+            apply_plan(RUN, CODE, ENV | {"AWS_REGION": "eu-west-1"})
 
 
 class CallerVariableTest(unittest.TestCase):
