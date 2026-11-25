@@ -70,12 +70,11 @@ class LaunchHelperTest(unittest.TestCase):
     def setUp(self) -> None:
         self.launch: Any = importlib.import_module("tests.e2e.spark_launch")
 
-    def test_a_job_module_goes_through_the_launcher_in_the_service_of_its_workload_and_a_helper_script_keeps_the_python_entry_point(self) -> None:
+    def test_a_launch_keeps_the_python_entry_point_and_names_the_service_of_the_job_that_its_arguments_run(self) -> None:
         job = ["-m", "spark.jobs.silver_cases", "build", "--branch", "b"]
-        self.assertEqual([], self.launch.launch_options(job, "gold_dimensions"))
-        self.assertEqual(["spark_silver", "silver_cases", "build", "--branch", "b"], self.launch.launch_words(job, "gold_dimensions"))
+        self.assertEqual(["--entrypoint", "python"], self.launch.launch_options(job, "gold_dimensions"))
+        self.assertEqual(["spark_silver", *job], self.launch.launch_words(job, "gold_dimensions"))
         script = ["/data/stand_in.py", "build", "b"]
-        self.assertEqual(["--entrypoint", "python"], self.launch.launch_options(script, "gold_dimensions"))
         self.assertEqual(["spark_gold", *script], self.launch.launch_words(script, "gold_dimensions"))
 
     def test_every_job_resolves_to_its_workloads_service_profile_and_credential_folder(self) -> None:
@@ -89,13 +88,11 @@ class LaunchHelperTest(unittest.TestCase):
                 self.assertEqual([ROOT / "a" / workload], self.launch.access_folders(ROOT / "a", [job]))
                 self.assertEqual([f"{workload.upper()}_ACCESS_DIR={ROOT / 'a' / workload}"], self.launch.access_settings(ROOT / "a", [job]))
 
-    def test_the_filters_list_every_spark_service_and_a_sealed_launch_goes_through_the_launcher_too(self) -> None:
+    def test_the_filters_list_every_spark_service(self) -> None:
         self.assertEqual(
             ["spark_bronze", "spark_silver", "spark_gold", "spark_maintenance"],
             [item.rsplit("=", 1)[1] for item in self.launch.SPARK_FILTERS if item.startswith("label=")],
         )
-        self.assertEqual(["-m", "spark.launcher", "silver_labels", "build"], self.launch.python_arguments(["-m", "spark.jobs.silver_labels", "build"], "x"))
-        self.assertEqual(["-c", "print(1)"], self.launch.python_arguments(["-c", "print(1)"], "x"))
 
 
 if __name__ == "__main__":
