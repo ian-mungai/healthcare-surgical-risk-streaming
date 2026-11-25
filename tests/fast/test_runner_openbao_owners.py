@@ -11,6 +11,12 @@ Failure modes covered here:
 - A file with a wrong mode or a wrong owner passes, or the observation does not say which of the two is wrong.
 - A service with no owner on its line (it runs outside Compose) is not checked against root, which the deploy gives it.
 - The observation shows more than the mode and the numeric ids.
+- The runner expects a file for each service that has a PostgreSQL account and not for each deployed service, so a missing file of a service with no
+  account (the list of the deploy has more services than the list of the accounts) passes.
+- A ``stat`` answer that is not ``<octal mode> <uid>:<gid>`` (an error text, extra words, letters in an id) is shown as it is in the observation, or reads as
+  a mode or an owner. It must read as unreadable, with none of its text.
+- The folder's mode is cut from the first word of any answer, so an error text on the folder shows in the observation.
+- The Nessie runner prints the raw ``stat`` answer and the raw answer of ``id`` in its observations.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from __future__ import annotations
 import importlib
 import unittest
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from scripts.project_config import ROOT
 from tests.e2e.run_record import Record
@@ -48,20 +54,24 @@ class HostTarget:
     def __init__(self, modes: dict[str, str]) -> None:
         self.modes = modes
 
+    folder = "700 0:0"
+
     def mode(self, path: str) -> str:
         if path.endswith("/openbao"):
-            return "700 0:0"
+            return self.folder
         return self.modes.get(path.rsplit("/", 1)[1].removesuffix(".secret_id"), "unreadable")
 
 
 class Owners(unittest.TestCase):
-    def check(self, modes: dict[str, str], without: str = "") -> tuple[bool, str]:
+    def check(self, modes: dict[str, str], without: str = "", extra_service: str = "", folder: str = "700 0:0") -> tuple[bool, str]:
         module = runner()
         record = Record(feature="x", slug="x", rerun="x")
         owners = {name: owner for name, owner in module.deployed_owners().items() if name != without}
-        services = module.listed_names(ROOT / "compose" / "openbao_services.txt")
+        services = [*module.listed_names(ROOT / "compose" / "openbao_services.txt"), *([extra_service] if extra_service else [])]
         tools = module.listed_names(ROOT / "compose" / "postgres_tools.txt")
-        module.private_files(module.Stack(HostTarget(modes), record, [], services, tools, owners))
+        target = HostTarget(modes)
+        target.folder = folder
+        module.private_files(module.Stack(target, record, [], services, tools, owners))
         observation = record.observations[-1]
         return observation.passed, observation.observed
 
@@ -118,6 +128,91 @@ class Owners(unittest.TestCase):
         for word in problems.replace(",", " ").split():
             self.assertRegex(word, r"^(mode|owner|expected|[a-z_]+:|[0-9]+(:[0-9]+)?)$")
         self.assertNotIn("/", observed.partition("wrong: ")[2])
+
+    def test_a_missing_file_of_a_service_with_no_postgresql_account_fails(self) -> None:
+        modes = {**HOST_MODES}
+        passed, observed = self.check(modes, extra_service="probe_service")
+        self.assertFalse(passed)
+        self.assertIn("probe_service: unreadable", observed)
+
+    def test_every_deployed_service_is_checked_and_counted(self) -> None:
+        module = runner()
+        services = module.listed_names(ROOT / "compose" / "openbao_services.txt")
+        _, observed = self.check(HOST_MODES)
+        self.assertIn(f"files checked: {len(services) + 1},", observed)
+
+    def test_an_answer_that_does_not_parse_reads_as_unreadable_and_shows_none_of_its_text(self) -> None:
+        for text in (
+            "stat: cannot statx: Permission denied",
+            "400 10000:10001 extra",
+            "400 ten:10001",
+            "400 10000:",
+            "4x0 10000:10001",
+            "400 10000 10001",
+            "-1 10000:10001",
+            "",
+            "400 10000:10001\n400 1:1",
+        ):
+            with self.subTest(text=text):
+                passed, observed = self.check({**HOST_MODES, "nessie": text})
+                self.assertFalse(passed)
+                self.assertIn("nessie: unreadable", observed)
+                for word in ("stat", "Permission", "extra", "ten", "4x0"):
+                    self.assertNotIn(word, observed.replace("nessie: unreadable", ""))
+
+    def test_an_answer_for_the_folder_that_does_not_parse_fails_and_shows_none_of_its_text(self) -> None:
+        passed, observed = self.check(HOST_MODES, folder="stat: cannot statx: No such file")
+        self.assertFalse(passed)
+        self.assertIn("folder unreadable", observed)
+        self.assertNotIn("cannot", observed)
+
+    def test_a_folder_that_is_not_700_fails(self) -> None:
+        passed, observed = self.check(HOST_MODES, folder="755 0:0")
+        self.assertFalse(passed)
+        self.assertIn("folder 755", observed)
+
+    def test_the_parse_takes_the_mode_and_the_two_ids_and_nothing_else(self) -> None:
+        module = runner()
+        self.assertEqual(module.parse_stat("400 10000:10001"), ("400", "10000:10001"))
+        self.assertEqual(module.parse_stat("700 0:0\n"), ("700", "0:0"))
+        for text in ("", "400", "400 1", "400 1:2:3", "400 a:b", "8 1:2", "400 1:2 x", "unreadable"):
+            self.assertIsNone(module.parse_stat(text), text)
+
+
+class NessieStatAnswers(unittest.TestCase):
+    """The Nessie runner shows the owner, the group and the mode as numbers, or says unreadable."""
+
+    def stack(self, module: ModuleType, process: tuple[int, str], stat: tuple[int, str]) -> tuple[object, Record]:
+        record = Record(feature="x", slug="x", rerun="x")
+        target = SimpleNamespace(secrets_directory="/opt/platform/secrets", run=lambda args, **_: stat)
+        stack = SimpleNamespace(record=record, target=target, compose_run=lambda *args, **_: process)
+        return stack, record
+
+    def cases(self, process: tuple[int, str], stat: tuple[int, str]) -> dict[str, tuple[bool, str]]:
+        if not (E2E / "stack_nessie.py").is_file():
+            raise unittest.SkipTest("the untracked runners are not on this machine")
+        module = importlib.import_module("tests.e2e.stack_nessie")
+        stack, record = self.stack(module, process, stat)
+        module.container_user(stack, True)
+        return {item.case: (item.passed, item.observed) for item in record.observations}
+
+    def test_the_answers_of_the_host_pass(self) -> None:
+        cases = self.cases((0, "10000\n10001\n10000\n"), (0, "10000:10001:400\n"))
+        self.assertTrue(all(passed for passed, _ in cases.values()), cases)
+
+    def test_a_wrong_owner_fails_and_shows_the_numbers(self) -> None:
+        cases = self.cases((0, "10000\n10001\n10000\n"), (0, "0:0:400\n"))
+        passed, observed = cases["owner of the password file"]
+        self.assertFalse(passed)
+        self.assertIn("0:0:400", observed)
+
+    def test_text_that_is_not_numbers_reads_as_unreadable_and_is_not_shown(self) -> None:
+        cases = self.cases((0, "OCI runtime exec failed: unable to start\n"), (0, "stat: cannot statx: Permission denied\n"))
+        for passed, observed in cases.values():
+            self.assertFalse(passed)
+            self.assertIn("unreadable", observed)
+            for word in ("OCI", "runtime", "cannot", "Permission"):
+                self.assertNotIn(word, observed)
 
 
 if __name__ == "__main__":
