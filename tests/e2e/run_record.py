@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
+import shutil
+import socket
 import sys
 import tempfile
 from collections.abc import Callable
@@ -63,6 +67,78 @@ def parsed(code: int, output: str, parse: Callable[[str], Any] = str) -> Any:
         return parse(text)
     except (ValueError, KeyError, TypeError, IndexError, StopIteration) as error:
         return Unread(type(error).__name__)
+
+
+RFC3339 = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))")
+CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
+NEVER_STARTED_YEAR = 1
+OPEN, REFUSED, DROPPED = "open", "refused", "dropped"
+
+
+def rfc3339_text(text: str) -> str:
+    """``text`` itself when it is an RFC 3339 timestamp of a real moment, with up to nine fractional digits and a ``Z`` or an offset, else a ``ValueError``.
+
+    The text is kept, not a ``datetime``, so every fractional digit of Docker's ``StartedAt`` takes part in a comparison. The zero time that Docker prints for
+    a container that never started is no start time.
+    """
+    found = RFC3339.fullmatch(text)
+    if found is None:
+        raise ValueError("not an RFC 3339 timestamp")
+    year, month, day, hour, minute, second = (int(found.group(index)) for index in range(1, 7))
+    datetime(year, month, day, hour, minute, second)
+    if found.group(9) is not None and (int(found.group(9)) > 23 or int(found.group(10)) > 59):
+        raise ValueError("the offset is not a real one")
+    if year == NEVER_STARTED_YEAR:
+        raise ValueError("the container never started")
+    return text
+
+
+def container_id(text: str) -> str:
+    """``text`` itself when it is a full Docker container ID (64 lower case hexadecimal digits), else a ``ValueError``."""
+    if CONTAINER_ID.fullmatch(text) is None:
+        raise ValueError("not a container ID")
+    return text
+
+
+def tcp_state(address: str, port: int, timeout: float) -> str | Unread:
+    """What the TCP connect to ``address`` and ``port`` alone says, whatever a TLS or HTTP exchange would do after it.
+
+    ``OPEN`` when the connect succeeds. ``REFUSED`` for a refusal or a reset (there was no data to reset). ``DROPPED`` when it times out. Any other error, such
+    as an unreachable network or host, a name that does not resolve or a permission error, is an ``Unread`` that names the error: it says nothing about the
+    port.
+    """
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(timeout)
+            probe.connect((address, port))
+    except ConnectionRefusedError, ConnectionResetError:
+        return REFUSED
+    except TimeoutError:
+        return DROPPED
+    except OSError as error:
+        if error.errno == errno.ECONNREFUSED:
+            return REFUSED
+        return Unread(errno.errorcode.get(error.errno or 0, type(error).__name__))
+    return OPEN
+
+
+def state_counts(states: dict[str, str | Unread]) -> str:
+    """How many of ``states`` are refused, dropped, open and unread, for an observation."""
+    unread = sum(isinstance(state, Unread) for state in states.values())
+    return ", ".join([*(f"{name}: {list(states.values()).count(name)}" for name in (REFUSED, DROPPED, OPEN)), f"unread: {unread}"])
+
+
+def all_closed(states: dict[str, str | Unread]) -> bool:
+    """True when there is at least one state and each is a refusal or a drop: no connect succeeded and none is unread."""
+    return bool(states) and all(state in (REFUSED, DROPPED) for state in states.values())
+
+
+def remove_scratch(record: Record, scratch: Path) -> bool:
+    """Remove the run's scratch folder and record the result as an assertion. A link or a file left in its place counts as left (``lexists``)."""
+    shutil.rmtree(scratch, ignore_errors=True)
+    gone = not os.path.lexists(scratch)
+    return record.expect("scratch folder removed", "control", "the scratch folder of the run is gone", f"removed: {gone}", gone)
 
 
 def listed_words(code: int, output: str) -> list[str] | Unread:

@@ -17,7 +17,6 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import ast
 import ipaddress
 import json
 import re
@@ -132,33 +131,6 @@ class RemovedProject(unittest.TestCase):
                 self.assertFalse(call_remove_project(module, DockerOfThisComputer(fails=("networks",))))
 
 
-class CleanupIsAnAssertion(unittest.TestCase):
-    """The result of a local cleanup is an assertion of the record, not only a line of its cleanup text."""
-
-    def test_the_result_of_remove_project_reaches_an_expectation_in_run_local(self) -> None:
-        for name in ("stack_caddy", "stack_nessie", "stack_openbao", "catalog_proof"):
-            runner(name)
-            tree = ast.parse((E2E / f"{name}.py").read_text())
-            function = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "run_local")
-            names = {
-                target.id
-                for node in ast.walk(function)
-                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == "remove_project"
-                for target in node.targets
-                if isinstance(target, ast.Name)
-            }
-            expected = [
-                node
-                for node in ast.walk(function)
-                if isinstance(node, ast.Call)
-                and ast.unparse(node.func).endswith("record.expect")
-                and any(isinstance(arg, ast.Name) and arg.id in names for arg in node.args)
-            ]
-            with self.subTest(runner=name):
-                self.assertTrue(names, "the result of remove_project is kept in a name")
-                self.assertTrue(expected, "and that name is the verdict of a record.expect call")
-
-
 class MonitoringCleanup(unittest.TestCase):
     """The local cleanup of the monitoring runner fails the run when a labelled resource or a project resource is left or a listing is unreadable."""
 
@@ -223,6 +195,15 @@ def inspect_answers(before: tuple[int, str], after: tuple[int, str], *, id_text:
 
 GOOD = (0, "2026-11-25T00:00:00Z\n")
 OTHER = (0, "2026-11-25T00:00:09Z\n")
+ID = "0123456789abcdef" * 4
+
+
+def shaped(name: str, answer: tuple[int, str], identifier: str = ID) -> tuple[int, str]:
+    """The answer of ``docker inspect`` in the form that the runner's format asks for: the monitoring runner asks for the ID and the start time."""
+    code, text = answer
+    return (code, f"{identifier} {text}") if name == "stack_monitoring" and text.strip() else answer
+
+
 UNREAD_CASES = {
     "exit 1, no text": (1, ""),
     "exit 255, a timestamp": (255, "2026-11-25T00:00:00Z\n"),
@@ -237,7 +218,7 @@ class StartTimes(unittest.TestCase):
     def second_start(self, name: str, first: tuple[int, str], second: tuple[int, str]) -> Record:
         module = runner(name)
         run = record()
-        target = Noisy(inspect_answers(first, second))
+        target = Noisy(inspect_answers(shaped(name, first), shaped(name, second)))
         if name == "stack_caddy":
             stack = module.Stack(target, run, [], ["docker", "compose"])
             module.second_start_case(stack, stack.container())

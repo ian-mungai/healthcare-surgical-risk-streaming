@@ -1,0 +1,251 @@
+"""Every clean-up step of a host runner records its outcome as an assertion, and the test runs the runner's own clean-up and reads the final record.
+
+The runners stay untracked, so each test skips when its runner is not on this machine. Docker and Nessie are stand-ins: no cloud, Docker or Spark runs here.
+
+Failure modes covered here:
+
+- A step of the clean-up (the removal of the Compose project, of the test network, of the scratch folder, of the Nessie references the run made, of the pinned
+  Trino file) fails and only the text of the record says so, so the run passes with something left behind.
+- The scratch folder is tested with ``exists``, which is false for a link that points nowhere, so a link left in its place reads as removed.
+- A failed step stops the steps after it, so a second leftover is not reported.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+from tests.e2e.run_record import Record
+from tests.fast.test_runner_failed_reads import DockerOfThisComputer, failed, record
+from tests.fast.test_runner_stdout_alone import runner
+
+NETWORK = "p2_caddy_net"
+LEFT = {"containers": ["c1"], "volumes": [], "networks": []}
+
+
+class NetworkRefused(DockerOfThisComputer):
+    """The Docker of this computer, which refuses to remove the test network that Caddy's run made."""
+
+    def __call__(self, program: str, arguments: list[str], **keywords: object) -> SimpleNamespace:
+        if arguments[:3] == ["network", "rm", NETWORK]:
+            self.calls.append(arguments)
+            return SimpleNamespace(returncode=1, stdout="", stderr="network has active endpoints")
+        return super().__call__(program, arguments, **keywords)
+
+
+def clean(name: str, docker: DockerOfThisComputer, *, scratch_stays: bool = False) -> tuple[Record, Path]:
+    """Run the clean-up of the local run of ``name`` on a scratch folder. ``scratch_stays`` makes the removal of the folder do nothing."""
+    module = runner(name)
+    run = record()
+    scratch = Path(tempfile.mkdtemp(prefix="clean_results_"))
+    (scratch / "inner").mkdir()
+    removal = mock.patch("shutil.rmtree") if scratch_stays else contextlib.nullcontext()
+    with mock.patch.object(module, "run_command", docker), removal:
+        if name == "stack_caddy":
+            module.clean_local(run, [], scratch, NETWORK)
+        elif name == "stack_openbao":
+            module.clean_local(run, [], scratch, "p2_openbao_x")
+        elif name == "catalog_proof":
+            module.clean_local(run, [], scratch, [])
+        else:
+            module.clean_local(run, [], scratch)
+    return run, scratch
+
+
+def refused_network(name: str) -> list[str]:
+    """The Docker that refuses every removal also refuses the test network that only Caddy's run makes."""
+    return ["network removed"] if name == "stack_caddy" else []
+
+
+LOCAL_RUNNERS = ("stack_caddy", "stack_nessie", "stack_openbao", "catalog_proof")
+
+
+class LocalCleanup(unittest.TestCase):
+    def test_the_four_runners_with_a_local_cleanup_are_all_covered(self) -> None:
+        self.assertEqual(LOCAL_RUNNERS, ("stack_caddy", "stack_nessie", "stack_openbao", "catalog_proof"))
+
+    def test_a_clean_run_has_no_failed_assertion_and_each_step_is_one(self) -> None:
+        for name in LOCAL_RUNNERS:
+            with self.subTest(runner=name):
+                run, scratch = clean(name, DockerOfThisComputer())
+                self.assertEqual(failed(run), [])
+                cases = [item.case for item in run.observations]
+                self.assertIn("project removed", cases)
+                self.assertIn("scratch folder removed", cases)
+                self.assertEqual("network removed" in cases, name == "stack_caddy")
+                self.assertIn("scratch folder removed: True", run.cleanup)
+                self.assertFalse(scratch.exists())
+
+    def test_a_project_resource_that_is_left_fails_the_run(self) -> None:
+        for name in LOCAL_RUNNERS:
+            with self.subTest(runner=name):
+                run, _ = clean(name, DockerOfThisComputer(dict(LEFT), stubborn=True))
+                self.assertEqual(failed(run), ["project removed", *refused_network(name)])
+
+    def test_a_project_listing_that_cannot_be_read_fails_the_run(self) -> None:
+        for name in LOCAL_RUNNERS:
+            with self.subTest(runner=name):
+                run, _ = clean(name, DockerOfThisComputer(fails=("containers",)))
+                self.assertEqual(failed(run), ["project removed"])
+
+    def test_a_scratch_folder_that_is_left_fails_the_run(self) -> None:
+        for name in LOCAL_RUNNERS:
+            with self.subTest(runner=name):
+                run, scratch = clean(name, DockerOfThisComputer(), scratch_stays=True)
+                self.assertEqual(failed(run), ["scratch folder removed"])
+                self.assertIn("scratch folder removed: False", run.cleanup)
+                (scratch / "inner").rmdir()
+                scratch.rmdir()
+
+    def test_a_link_that_points_nowhere_in_the_place_of_the_folder_is_left(self) -> None:
+        for name in LOCAL_RUNNERS:
+            with self.subTest(runner=name):
+                module = runner(name)
+                run = record()
+                with tempfile.TemporaryDirectory() as folder:
+                    link = Path(folder) / "scratch"
+                    link.symlink_to(Path(folder) / "missing")
+                    with mock.patch.object(module, "run_command", DockerOfThisComputer()), mock.patch("shutil.rmtree"):
+                        arguments: dict[str, tuple[Any, ...]] = {
+                            "stack_caddy": (NETWORK,),
+                            "stack_openbao": ("p2_openbao_x",),
+                            "catalog_proof": ([],),
+                            "stack_nessie": (),
+                        }
+                        module.clean_local(run, [], link, *arguments[name])
+                self.assertEqual(failed(run), ["scratch folder removed"])
+
+    def test_two_leftovers_are_both_reported(self) -> None:
+        for name in LOCAL_RUNNERS:
+            with self.subTest(runner=name):
+                run, scratch = clean(name, DockerOfThisComputer(dict(LEFT), stubborn=True), scratch_stays=True)
+                self.assertEqual(failed(run), ["project removed", *refused_network(name), "scratch folder removed"])
+                (scratch / "inner").rmdir()
+                scratch.rmdir()
+
+    def test_a_network_that_cannot_be_removed_fails_the_caddy_run(self) -> None:
+        run, _ = clean("stack_caddy", NetworkRefused())
+        self.assertEqual(failed(run), ["network removed"])
+        self.assertIn(f"network {NETWORK} removed: False", run.cleanup)
+
+    def test_a_network_that_cannot_be_removed_does_not_skip_the_scratch_folder(self) -> None:
+        run, scratch = clean("stack_caddy", NetworkRefused(), scratch_stays=True)
+        self.assertEqual(failed(run), ["network removed", "scratch folder removed"])
+        (scratch / "inner").rmdir()
+        scratch.rmdir()
+
+
+class NessieHostCleanup(unittest.TestCase):
+    def clean(self, *, refuses: tuple[str, ...] = ()) -> Record:
+        module = runner("stack_nessie")
+        run = record()
+        calls: list[str] = []
+
+        def delete(name: str, hash_: str) -> None:
+            calls.append(name)
+            if name in refuses:
+                raise module.NessieError("refused")
+
+        client = SimpleNamespace(reference=lambda name: SimpleNamespace(hash="h"), delete_reference=delete)
+        module.clean_host(run, [], client, [("branch", "a"), ("tag", "b")])
+        self.assertEqual(calls, ["b", "a"])
+        return run
+
+    def test_references_that_are_all_deleted_pass(self) -> None:
+        run = self.clean()
+        self.assertEqual(failed(run), [])
+        self.assertEqual([item.case for item in run.observations], ["references deleted"])
+        self.assertIn("deleted: 2", run.cleanup)
+
+    def test_a_reference_that_cannot_be_deleted_fails_the_run(self) -> None:
+        for refused in ("a", "b"):
+            with self.subTest(refused=refused):
+                run = self.clean(refuses=(refused,))
+                self.assertEqual(failed(run), ["references deleted"])
+                self.assertIn("deleted: 1", run.cleanup)
+
+    def test_a_reference_that_cannot_be_read_fails_the_run(self) -> None:
+        module = runner("stack_nessie")
+        run = record()
+
+        def read(name: str) -> object:
+            raise module.NessieError("no such reference")
+
+        module.clean_host(run, [], SimpleNamespace(reference=read, delete_reference=lambda *a: None), [("branch", "a")])
+        self.assertEqual(failed(run), ["references deleted"])
+
+
+class CatalogFinish(unittest.TestCase):
+    def finish(self, *, restored: bool = True, trino: bool = True, refuses: tuple[str, ...] = (), file_removed: bool = True) -> tuple[Record, str]:
+        module = runner("catalog_proof")
+        run = record()
+
+        def delete(name: str, hash_: str) -> None:
+            if name in refuses:
+                raise module.NessieError("refused")
+
+        stack = SimpleNamespace(
+            container=lambda service: "abc" if trino else "",
+            pin_trino=lambda reference, scratch_file: 1.0 if restored else None,
+            target=SimpleNamespace(remove_file=lambda path: file_removed),
+        )
+        nessie = SimpleNamespace(reference=lambda name: SimpleNamespace(hash="h"), delete_reference=delete)
+        proof = SimpleNamespace(stack=stack, nessie=nessie, made=["a", "b"], pin_file="/pin.env", facts={})
+        return run, module.finish(proof, run)
+
+    def test_a_finish_that_put_trino_back_deleted_the_references_and_removed_the_file_passes(self) -> None:
+        run, text = self.finish()
+        self.assertEqual(failed(run), [])
+        self.assertEqual([item.case for item in run.observations], ["Trino back on main", "references deleted", "pin file removed"])
+        self.assertIn("deleted: 2", text)
+
+    def test_trino_that_did_not_come_back_fails_the_run(self) -> None:
+        self.assertEqual(failed(self.finish(restored=False)[0]), ["Trino back on main"])
+
+    def test_a_stack_with_no_trino_container_has_nothing_to_put_back(self) -> None:
+        self.assertEqual(failed(self.finish(trino=False, restored=False)[0]), [])
+
+    def test_a_reference_that_cannot_be_deleted_fails_the_run(self) -> None:
+        for refused in ("a", "b"):
+            with self.subTest(refused=refused):
+                self.assertEqual(failed(self.finish(refuses=(refused,))[0]), ["references deleted"])
+
+    def test_a_pin_file_that_cannot_be_removed_fails_the_run(self) -> None:
+        self.assertEqual(failed(self.finish(file_removed=False)[0]), ["pin file removed"])
+
+    def test_every_leftover_is_reported_at_once(self) -> None:
+        run, _ = self.finish(restored=False, refuses=("a",), file_removed=False)
+        self.assertEqual(failed(run), ["Trino back on main", "references deleted", "pin file removed"])
+
+
+class RemoveFile(unittest.TestCase):
+    """The targets of the catalog runner say whether the file is gone."""
+
+    def test_the_local_target_reports_a_removed_file_and_a_file_that_is_left(self) -> None:
+        module = runner("catalog_proof")
+        target = module.Local.__new__(module.Local)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pin.env"
+            path.write_text("x")
+            self.assertTrue(target.remove_file(str(path)))
+            self.assertFalse(path.exists())
+            self.assertTrue(target.remove_file(str(path)))
+            with mock.patch.object(Path, "unlink"):
+                path.write_text("x")
+                self.assertFalse(target.remove_file(str(path)))
+
+    def test_the_remote_target_reports_the_exit_of_the_removal(self) -> None:
+        module = runner("catalog_proof")
+        target = module.Remote.__new__(module.Remote)
+        for code in (0, 1):
+            with self.subTest(code=code), mock.patch.object(module.Remote, "run", return_value=(code, "")):
+                self.assertEqual(target.remove_file("/pin.env"), code == 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

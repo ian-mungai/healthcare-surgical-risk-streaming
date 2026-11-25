@@ -146,7 +146,7 @@ def no_network(module: ModuleType) -> contextlib.AbstractContextManager[Any]:
     """A connection from the runner to the host's addresses fails the test at once and does not wait for a timeout."""
     refuse = mock.Mock(side_effect=AssertionError("a network call was made"))
     stack = contextlib.ExitStack()
-    for name in ("try_get", "tcp_open"):
+    for name in ("try_get", "tcp_state"):
         stack.enter_context(mock.patch.object(module, name, refuse))
     return stack
 
