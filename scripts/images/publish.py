@@ -186,7 +186,7 @@ def remote_digest(settings: Settings, name: str, tag: str) -> str | None:
     code, out, error = docker(settings, ["manifest", "inspect", "--verbose", tag], INSPECT_SECONDS, "docker inspect")
     if code == 0:
         return platform_digest(name, out)
-    if error.rstrip() == f"no such manifest: docker.io/{tag}" and not out.strip():
+    if error.rstrip() == f"no such manifest: docker.io/{tag}":
         return None
     raise PublishError(LOGIN_TEXT if refused_login(out + error) else f"{name}: the repository could not be read")
 
