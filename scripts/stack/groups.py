@@ -284,22 +284,27 @@ def describe_states(states: Iterable[ServiceState], missing: Sequence[str] = ())
     return "; ".join(parts[name] for name in sorted(parts))
 
 
-def read_states(settings: Settings) -> dict[str, ServiceState]:
-    """The state of every container of the project, by service name."""
+def read_states(settings: Settings, timeout: float = COMMAND_SECONDS) -> dict[str, ServiceState]:
+    """The state of every container of the project, by service name. Both reads together take at most ``timeout`` seconds."""
+    started = time.monotonic()
     listed = docker(
         ["ps", "--all", "--quiet", "--no-trunc", "--filter", f"label={COMPOSE_LABEL}.project={settings.project}"],
-        timeout=COMMAND_SECONDS,
+        timeout=timeout,
         label="listing the containers",
     )
     identifiers = listed.split()
     if not identifiers:
         return {}
-    return parse_inspect(docker(["inspect", "--format", INSPECT_FORMAT, *identifiers], timeout=COMMAND_SECONDS, label="reading the containers"))
+    left = timeout - (time.monotonic() - started)
+    if left <= 0:
+        raise GroupError(f"reading the containers: {timeout_text('docker', timeout)}")
+    return parse_inspect(docker(["inspect", "--format", INSPECT_FORMAT, *identifiers], timeout=left, label="reading the containers"))
 
 
-def running_services(settings: Settings, limits: Limits) -> frozenset[str]:
-    """The names of the services that run now: Compose services from the containers and k3s workloads from the k3s control."""
-    names = {name for name, state in read_states(settings).items() if state.state == "running"}
+def running_services(settings: Settings, limits: Limits, timeout: float = COMMAND_SECONDS) -> frozenset[str]:
+    """The names of the services that are alive now: Compose services whose container runs, is paused or restarts (each holds its memory), and k3s workloads
+    from the k3s control. The reads of the containers take at most ``timeout`` seconds."""
+    names = {name for name, state in read_states(settings, timeout).items() if state.state in ALIVE_STATES}
     k3s = sorted(name for name, entry in limits.services.items() if entry.runtime == "k3s")
     if k3s and settings.k3s is not None:
         names |= settings.k3s.running(k3s)

@@ -55,7 +55,7 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -67,13 +67,13 @@ from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.output_file import replace_owned_file
 from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
-from scripts.process import TimeoutExpired, run_command
+from scripts.process import TimeoutExpired
 from scripts.sample.candidates import RELEASE_FILE
 from scripts.stack.groups import Settings, compose_arguments, rendered_environment, running_services
 from scripts.stack.job_workloads import job_command, profile_of_job
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
-from scripts.stack.spark_slot import SlotError, spark_slot
+from scripts.stack.spark_slot import Running, SlotError, run_in_slot
 from scripts.stack.tags import paged
 from spark import table_checks as rules
 
@@ -211,7 +211,7 @@ def compose_runner(
     volume: str,
     directory: str,
     deadline_seconds: float,
-    running: Callable[[], Collection[str]] | None = None,
+    running: Running | None = None,
 ) -> Runner:
     """A runner that starts the job as a one-off of the Bronze service that ``scripts/stack/job_workloads.py`` names, in that service's own profile and with no
     service it depends on started. The job reads the loaded tables with the Bronze credentials, which cannot write them.
@@ -221,26 +221,29 @@ def compose_runner(
     is the one the group commands use: the memory limits that ``scripts.stack.limits`` renders from the limits file, then the process's own variables. A job
     that passes its deadline is stopped by the launcher and its reply carries the exit code 124.
 
-    The job holds the one Spark slot (``scripts/stack/spark_slot.py``) for the whole of ``docker compose run``, so it does not start while a job of any Spark
-    service runs and no other Spark job starts before its container has exited. ``running`` reads the running services and defaults to the stack's own. The lock
-    is the one file of the slot (``spark_slot.LOCK_FILE``), which the manual one-off of ``scripts/stack/spark_run.py`` takes too.
+    The container is named ``spark_slot.SLOT_NAME``, which Docker allows once at a time on the engine, so the job holds the one Spark slot
+    (``scripts/stack/spark_slot.py``) as long as its container exists: it does not start while a Spark container of any launcher is alive, and no other Spark
+    job starts before this container is gone, even if this process is killed or the code location restarts. A job that passes its deadline is stopped and its
+    container removed first. ``running`` reads the live services within the seconds it is given and defaults to the stack's own.
     """
     root = Path(directory)
-    read_running = running or (lambda: running_services(settings, load_limits(settings.limits_file)))
+    read_running = running or (lambda timeout: running_services(settings, load_limits(settings.limits_file), timeout))
 
     def start(staging: Path) -> RunnerReply:
         if staging.parent != root:
             raise TableChecksError("the staging folder is not a folder of the staging volume, which the job could not see")
-        arguments = compose_arguments(
-            settings,
-            profile_of_job(JOB),
-            *["run", "--rm", "--no-TTY", "--no-deps", "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
-            *job_command(JOB, "--staging", f"/staging/{staging.name}"),
-        )
+
+        def arguments(options: Sequence[str]) -> list[str]:
+            return compose_arguments(
+                settings,
+                profile_of_job(JOB),
+                *["run", "--rm", "--no-TTY", "--no-deps", *options, "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
+                *job_command(JOB, "--staging", f"/staging/{staging.name}"),
+            )
+
         environment = rendered_environment(load_limits(settings.limits_file))
         try:
-            with spark_slot(read_running):
-                result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
+            result = run_in_slot(arguments, running=read_running, deadline_seconds=deadline_seconds, env=environment)
         except SlotError as error:
             raise TableChecksError(f"the table checks do not start: {error}") from None
         except TimeoutExpired:

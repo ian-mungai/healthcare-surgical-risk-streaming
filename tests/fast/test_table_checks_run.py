@@ -29,12 +29,13 @@ from scripts.ingestion import table_checks as run
 from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
-from scripts.process import CompletedProcess, TimeoutExpired
+from scripts.process import TimeoutExpired
 from scripts.stack import spark_slot as slot
 from scripts.stack.groups import Settings
 from scripts.stack.nessie import NessieClient, NessieError
 from spark import table_checks as rules
 from tests.fast.ingestion_support import Landed, landed_set, pin_the_synthetic_list
+from tests.fast.spark_engine import SLOT_NAME, Engine, finishes
 
 CLINICAL = b"caseid,age\r\n1,60\r\n2,\r\n"
 LAB = b"caseid,dt,name,result\r\n1,5,alb,2.9\r\n1,5,alb,2.9\r\n"
@@ -2058,28 +2059,35 @@ class ComposeRunnerTest(unittest.TestCase):
     volume read-only."""
 
     def setUp(self) -> None:
-        """No Docker daemon is needed: the view of the running services is a stand-in and the one lock file is a file of the test."""
-        self.enterContext(mock.patch.object(slot, "LOCK_FILE", Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot_"))) / "slot.lock"))
+        """No Docker daemon is needed: the view of the live services and the engine are stand-ins (``tests/fast/spark_engine.py``)."""
+        self.engine = Engine()
+        self.started = self.enterContext(mock.patch.object(slot, "run_command", side_effect=self.engine.run_command))
 
     def settings(self) -> Settings:
         return Settings(compose_directory=ROOT / "compose", project="stack_example", host_env=Path("/opt/stack/compose/host.env"))
 
     def runner(self) -> run.Runner:
         return run.compose_runner(
-            self.settings(), volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77, running=lambda: []
+            self.settings(), volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77, running=lambda _: []
         )
 
+    def launch(self) -> mock._Call:
+        """The one call of ``run_command`` that starts the container."""
+        (call,) = [call for call in self.started.call_args_list if call.args[1][0] == "compose"]
+        return call
+
     def test_control_the_command_names_the_job_the_volume_and_the_folder_of_this_run(self) -> None:
-        with mock.patch.object(run, "run_command", return_value=CompletedProcess([], 0, "RESULT {}\n", "")) as started:
-            reply = self.runner()(Path("/opt/dagster/staging/run_one"))
-        program, arguments = started.call_args.args
+        self.engine.on_start = finishes(0, "RESULT {}\n")
+        reply = self.runner()(Path("/opt/dagster/staging/run_one"))
+        program, arguments = self.launch().args
         self.assertEqual("docker", program)
-        self.assertEqual(77, started.call_args.kwargs["timeout"])
+        self.assertEqual(77, self.launch().kwargs["timeout"])
         text = " ".join(arguments)
         self.assertIn(f"compose --project-directory {ROOT / 'compose'}", text)
         self.assertIn("--project-name stack_example", text)
         self.assertIn("--profile batch_bronze run --rm --no-TTY --no-deps", text)
         self.assertIn("--volume stack_example_table_check_staging:/staging:ro", text)
+        self.assertIn(f"--name {SLOT_NAME}", text)
         self.assertTrue(text.endswith("spark_bronze table_checks --staging /staging/run_one"), text)
         self.assertNotIn("--entrypoint", text)
         self.assertEqual((0, "RESULT {}\n"), (reply.exit_code, reply.stdout))
@@ -2088,11 +2096,10 @@ class ComposeRunnerTest(unittest.TestCase):
         from scripts.stack.groups import rendered_environment
         from scripts.stack.limits import load_limits
 
-        with mock.patch.object(run, "run_command", return_value=CompletedProcess([], 0, "", "")) as started:
-            self.runner()(Path("/opt/dagster/staging/run_one"))
-        arguments = started.call_args.args[1]
+        self.runner()(Path("/opt/dagster/staging/run_one"))
+        arguments = self.launch().args[1]
         self.assertEqual(f"{run.SPARK_UID}:{run.STAGING_GID}", arguments[arguments.index("--user") + 1])
-        environment = started.call_args.kwargs["env"]
+        environment = self.launch().kwargs["env"]
         expected = rendered_environment(load_limits(ROOT / "compose" / "limits.yml"))["MEM_LIMIT_SPARK_BRONZE"]
         self.assertRegex(expected, r"^[0-9]+m$")
         self.assertEqual(expected, environment["MEM_LIMIT_SPARK_BRONZE"])
@@ -2105,20 +2112,21 @@ class ComposeRunnerTest(unittest.TestCase):
         self.assertNotIn("MEM_LIMIT", source)
 
     def test_a_job_that_passes_its_deadline_is_a_reply_with_the_timeout_code_and_no_output_of_the_command(self) -> None:
-        with mock.patch.object(run, "run_command", side_effect=TimeoutExpired("docker", 77)):
-            reply = self.runner()(Path("/opt/dagster/staging/run_one"))
+        self.engine.on_start = lambda engine, box: (_ for _ in ()).throw(TimeoutExpired("docker", 77))
+        reply = self.runner()(Path("/opt/dagster/staging/run_one"))
         self.assertEqual(run.RunnerReply(124, ""), reply)
+        self.assertEqual({}, self.engine.boxes)
 
     def test_a_reply_holds_the_exit_code_and_the_standard_output_and_nothing_else(self) -> None:
         self.assertEqual(["exit_code", "stdout"], [field.name for field in dataclasses.fields(run.RunnerReply)])
-        with mock.patch.object(run, "run_command", return_value=CompletedProcess([], 0, "RESULT {}\n", "stderr text")):
-            reply = self.runner()(Path("/opt/dagster/staging/run_one"))
+        self.engine.on_start = finishes(0, "RESULT {}\n", "stderr text")
+        reply = self.runner()(Path("/opt/dagster/staging/run_one"))
         self.assertEqual(run.RunnerReply(0, "RESULT {}\n"), reply)
 
     def test_a_staging_folder_outside_the_volume_is_refused_before_anything_starts(self) -> None:
-        with mock.patch.object(run, "run_command") as started, self.assertRaises(run.TableChecksError):
+        with self.assertRaises(run.TableChecksError):
             self.runner()(Path("/somewhere/else/run_one"))
-        started.assert_not_called()
+        self.started.assert_not_called()
 
 
 class LoadRecordTest(unittest.TestCase):

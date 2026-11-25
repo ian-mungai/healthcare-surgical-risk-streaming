@@ -1,11 +1,12 @@
-"""One Spark job runs at a time, across all four Spark groups and every way a job starts, and the slot is held until the job's container exits.
+"""One Spark job runs at a time, across all four Spark groups and every way a job starts, and the slot is held as long as the job's container exists.
 
-The memory figure of the host assumes one Spark job's limit (``infra/heavy_memory.tf``), and each Spark service is its own group, so the memory check of
-one group does not see another group's job. The slot is the missing rule. The launchers that take it are the table checks one-off (``compose_runner``) and the
-manual one-off (``scripts/stack/spark_run.py``). Both run in the code location container and take the one lock file of ``spark_slot.LOCK_FILE``, which no
-argument or environment variable moves. A Spark group is never started by ``group-up``: its service starts no job, and a stopped container of an older
-version would restart its old entry point. The Dagster runs of the Spark groups share one tag that ``orchestration/dagster.yaml`` limits to one run. The tests
-run with stand-ins for Docker and use real files for the lock.
+The memory figure of the host assumes one Spark job's limit (``infra/heavy_memory.tf``), and each Spark service is its own group, so the memory check of one
+group does not see another group's job. The slot is the missing rule: a container name that Docker keeps unique on the engine (``spark_slot.SLOT_NAME``). The
+launchers that take it are the table checks one-off (``compose_runner``) and the manual one-off (``scripts/stack/spark_run.py``); the runners start their own
+Spark containers with the same name. A second launch fails on the name, a client that is killed or a code location that restarts does not free it, and a
+paused container holds it. A launch that passes its deadline removes its own container and never another launch's. A Spark group is never started by
+``group-up``: its service starts no job. The Dagster runs of the Spark groups share one tag that ``orchestration/dagster.yaml`` limits to one run. The tests run
+with ``tests/fast/spark_engine.py``, a stand-in for the Docker engine with the daemon's rule that a name exists once.
 """
 
 from __future__ import annotations
@@ -13,10 +14,8 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
-import tempfile
 import unittest
-from collections.abc import Collection, Iterator
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
@@ -30,19 +29,18 @@ from scripts.stack import spark_slot as slot
 from scripts.stack.admission import decide, describe
 from scripts.stack.job_workloads import SPARK_GROUPS, SPARK_SERVICES
 from scripts.stack.limits import LIMITS_FILE, load_limits
-from scripts.stack.spark_slot import SlotBusy, SlotError, spark_holders, spark_slot
+from scripts.stack.spark_slot import SlotBusy, SlotError, run_in_slot, spark_holders
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.spark_engine import OWNER_LABEL, SLOT_NAME, Box, Engine, finishes
 
 ROOT = Path(__file__).resolve().parents[2]
 CODE_FOLDER = ROOT / "orchestration" / "surgical_risk"
 PLENTY = 10**6
 
 
-@contextlib.contextmanager
-def one_lock(lock: Path) -> Iterator[None]:
-    """Move the one lock file of the stack to ``lock``, a file of the test."""
-    with mock.patch.object(slot, "LOCK_FILE", lock):
-        yield
+def killed(engine: Engine, box: Box) -> CompletedProcess[str]:
+    """The client is killed while the container runs: ``run_command`` raises the deadline, and the container is not stopped by that."""
+    raise TimeoutExpired("docker", 5)
 
 
 class AdmissionTest(unittest.TestCase):
@@ -83,10 +81,12 @@ class AdmissionTest(unittest.TestCase):
 
 
 class SlotTest(unittest.TestCase):
+    """``run_in_slot`` over the engine stand-in: the name is the lock."""
+
     def setUp(self) -> None:
-        self.lock = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="spark_slot_"))) / "slot.lock"
-        self.enterContext(one_lock(self.lock))
+        self.engine = Engine()
         self.now = 0.0
+        self.reads: list[float] = []
 
     def clock(self) -> float:
         return self.now
@@ -94,109 +94,245 @@ class SlotTest(unittest.TestCase):
     def sleep(self, seconds: float) -> None:
         self.now += seconds
 
-    def claim(self, running: list[str], wait: float = 0) -> AbstractContextManager[None]:
-        return spark_slot(lambda: running, wait_seconds=wait, clock=self.clock, sleep=self.sleep)
+    def build(self, options: Sequence[str]) -> list[str]:
+        return ["compose", "run", "--rm", "--no-TTY", *options, "spark_maintenance", "table_maintenance"]
 
-    def test_holders_are_the_spark_services_that_run_in_name_order(self) -> None:
+    def record_read(self, seconds: float) -> list[str]:
+        self.reads.append(seconds)
+        return []
+
+    def go(self, running: Callable[[float], Collection[str]] | None = None, *, wait: float = 0, poll: float = 5.0) -> CompletedProcess[str]:
+        def read(seconds: float) -> Collection[str]:
+            self.reads.append(seconds)
+            return running(seconds) if running else []
+
+        return run_in_slot(
+            self.build, running=read, deadline_seconds=100, wait_seconds=wait, poll_seconds=poll, clock=self.clock, sleep=self.sleep, docker=self.engine.docker
+        )
+
+    def test_the_names_are_the_ones_of_the_design(self) -> None:
+        self.assertEqual((SLOT_NAME, OWNER_LABEL), (slot.SLOT_NAME, slot.OWNER_LABEL))
+        self.assertEqual(["--name", SLOT_NAME, "--label", f"{OWNER_LABEL}=abc"], slot.slot_options("abc"))
+
+    def test_the_holders_are_the_spark_services_that_are_alive_in_name_order(self) -> None:
         self.assertEqual(("spark_bronze", "spark_gold"), spark_holders({"spark_gold", "nessie", "spark_bronze"}))
         self.assertEqual((), spark_holders({"nessie"}))
 
-    def test_a_free_slot_is_claimed_and_released_when_the_work_ends(self) -> None:
-        with self.claim([]):
-            pass
-        with self.claim([]):
-            pass
+    def test_a_free_slot_starts_the_job_with_the_slots_name_and_its_own_label_and_leaves_no_container(self) -> None:
+        result = self.go()
+        self.assertEqual(0, result.returncode)
+        (launch,) = self.engine.launches()
+        owner = launch[launch.index("--label") + 1]
+        self.assertEqual(["--name", SLOT_NAME, "--label", owner], launch[launch.index("--no-TTY") + 1 : launch.index("spark_maintenance")])
+        self.assertTrue(owner.startswith(f"{OWNER_LABEL}="))
+        self.assertEqual({}, self.engine.boxes)
 
-    def test_a_slot_held_by_a_running_job_refuses_with_its_name_when_there_is_no_wait(self) -> None:
-        with self.assertRaisesRegex(SlotBusy, "spark_bronze"), self.claim(["spark_bronze"]):
-            self.fail("the body must not run")
+    def test_each_launch_has_its_own_owner_value(self) -> None:
+        self.go()
+        self.go()
+        owners = {launch[launch.index("--label") + 1] for launch in self.engine.launches()}
+        self.assertEqual(2, len(owners))
 
-    def test_a_second_claim_while_the_first_is_held_is_refused_and_the_lock_is_released_after_an_error(self) -> None:
-        with self.claim([]), self.assertRaisesRegex(SlotBusy, "another launcher"), self.claim([]):
-            self.fail("the body must not run")
-        with self.assertRaises(RuntimeError), self.claim([]):
-            raise RuntimeError("the job failed")
-        with self.claim([]):
-            pass
+    def test_the_slot_is_held_while_the_container_runs_and_free_after_it_exits(self) -> None:
+        inner: list[str] = []
 
-    def test_a_claim_waits_until_the_running_job_has_ended_and_not_longer_than_its_deadline(self) -> None:
-        running = ["spark_silver"]
-        calls = []
+        def job(engine: Engine, box: Box) -> CompletedProcess[str]:
+            with self.assertRaises(SlotBusy) as caught:
+                self.go()
+            inner.append(str(caught.exception))
+            return CompletedProcess([], 0, "", "")
 
-        def view() -> list[str]:
-            calls.append(self.now)
-            return list(running) if self.now < 30 else []
+        self.engine.on_start = job
+        self.go()
+        self.assertIn(SLOT_NAME, inner[0])
+        self.go()
 
-        with spark_slot(view, wait_seconds=60, clock=self.clock, sleep=self.sleep, poll_seconds=10):
-            pass
-        self.assertEqual([0.0, 10.0, 20.0, 30.0], calls)
+    def test_a_container_with_the_slots_name_in_any_state_refuses_the_start_and_no_job_is_launched(self) -> None:
+        for state in ("running", "paused", "restarting", "created", "exited"):
+            engine = Engine()
+            engine.hold(state=state)
+            with self.subTest(state=state), self.assertRaisesRegex(SlotBusy, f"{SLOT_NAME} \\({state}\\)"):
+                run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=engine.docker)
+            self.assertEqual([], engine.launches())
+            self.assertEqual(1, len(engine.boxes), "the container of the other launch is left as it is")
+
+    def test_a_live_spark_service_refuses_the_start_with_its_name(self) -> None:
+        with self.assertRaisesRegex(SlotBusy, "spark_bronze"):
+            self.go(lambda _: ["spark_bronze", "nessie"])
+        self.assertEqual([], self.engine.launches())
+
+    def test_a_launch_that_loses_the_name_to_another_launch_after_the_read_is_busy_and_touches_nothing(self) -> None:
+        """The race that the engine decides: both read a free slot, and the engine creates one container."""
+        listed: list[bool] = []
+
+        def racing(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            reply = self.engine.docker(arguments, timeout)
+            if arguments[:2] == ["container", "ls"] and not listed:
+                listed.append(True)
+                self.engine.hold(owner="the_other_launch")
+            return reply
+
+        with self.assertRaisesRegex(SlotBusy, SLOT_NAME):
+            run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=racing)
+        self.assertEqual(1, len(self.engine.boxes))
+        self.assertEqual("the_other_launch", next(iter(self.engine.boxes.values())).labels[OWNER_LABEL])
+        self.assertFalse([call for call in self.engine.calls if call[:2] in (["container", "stop"], ["container", "rm"])])
+
+    def test_a_job_that_prints_the_conflict_words_is_not_started_twice(self) -> None:
+        self.engine.on_start = finishes(1, "", "x is already in use")
+        result = self.go(wait=30)
+        self.assertEqual(1, result.returncode)
+        self.assertEqual(1, len(self.engine.launches()))
+
+    def test_a_container_of_a_killed_launcher_holds_the_slot_for_every_later_launcher(self) -> None:
+        """A restart of the code location clears its memory file system and every file in it: the container is what holds the slot."""
+        self.engine.on_start = killed
+        with self.assertRaises(TimeoutExpired):
+            self.go()
+        self.engine.hold(owner="a_launcher_that_is_gone")
+        with self.assertRaisesRegex(SlotBusy, SLOT_NAME):
+            self.go()
+        source = (ROOT / "scripts" / "stack" / "spark_slot.py").read_text()
+        for word in ("fcntl", "LOCK_FILE", "flock"):
+            self.assertNotIn(word, source)
+
+    def test_a_job_that_passes_its_deadline_is_stopped_and_removed_by_id_before_the_deadline_is_reported(self) -> None:
+        self.engine.on_start = killed
+        with self.assertRaises(TimeoutExpired):
+            self.go()
+        self.assertEqual({}, self.engine.boxes)
+        box_id = f"{1:064x}"
+        self.assertIn(["container", "stop", "--time", str(slot.STOP_SECONDS), box_id], self.engine.calls)
+        self.assertIn(["container", "rm", "--force", box_id], self.engine.calls)
+        self.engine.on_start = finishes()
+        self.assertEqual(0, self.go().returncode)
+
+    def test_a_container_that_cannot_be_removed_is_a_slot_error_and_not_the_deadline(self) -> None:
+        self.engine.on_start = killed
+        self.engine.removal_fails = True
+        with self.assertRaisesRegex(SlotError, f"{SLOT_NAME}.*still there"):
+            self.go()
+
+    def test_the_cleanup_removes_only_the_container_that_carries_its_own_owner(self) -> None:
+        foreign = self.engine.hold(owner="another_launch")
+        slot.remove_owned(self.engine.docker, "mine")
+        unlabeled = Engine()
+        unlabeled.hold(owner="")
+        slot.remove_owned(unlabeled.docker, "mine")
+        self.assertIn(foreign.id, self.engine.boxes)
+        self.assertEqual(1, len(unlabeled.boxes))
+        for engine in (self.engine, unlabeled):
+            self.assertFalse([call for call in engine.calls if call[:2] in (["container", "stop"], ["container", "rm"])])
+
+    def test_an_interrupt_ends_the_container_of_this_launch_and_a_failed_cleanup_hides_nothing(self) -> None:
+        def interrupt(engine: Engine, box: Box) -> CompletedProcess[str]:
+            raise KeyboardInterrupt
+
+        self.engine.on_start = interrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.go()
+        self.assertEqual({}, self.engine.boxes)
+        self.engine.removal_fails = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.go()
+
+    def test_a_wait_ends_when_the_holder_is_gone_and_not_later_than_its_deadline(self) -> None:
+        holder = self.engine.hold()
+        seen: list[float] = []
+
+        def read(seconds: float) -> list[str]:
+            seen.append(self.now)
+            if self.now >= 20:
+                self.engine.boxes.pop(holder.id, None)
+            return []
+
+        self.go(read, wait=60, poll=10)
+        self.assertEqual([0.0, 10.0, 20.0], seen)
+        self.assertEqual(1, len(self.engine.launches()))
         self.now = 0
-        with self.assertRaises(SlotBusy), spark_slot(lambda: ["spark_silver"], wait_seconds=25, clock=self.clock, sleep=self.sleep, poll_seconds=10):
-            pass
+        self.engine.hold()
+        with self.assertRaises(SlotBusy):
+            self.go(wait=25, poll=10)
         self.assertEqual(25, self.now)
 
     def test_a_wait_shorter_than_the_poll_ends_at_its_deadline_and_never_admits_after_it(self) -> None:
-        """A wait of 1 second with a poll of 5 seconds slept the whole poll and admitted at 5 seconds."""
-        with self.assertRaises(SlotBusy), spark_slot(lambda: ["spark_silver"] if self.now < 5 else [], wait_seconds=1, clock=self.clock, sleep=self.sleep):
-            self.fail("the body must not run")
+        self.engine.hold()
+        with self.assertRaises(SlotBusy):
+            self.go(wait=1)
         self.assertEqual(1, self.now)
 
-    def test_a_free_reading_that_arrives_after_the_deadline_does_not_admit(self) -> None:
-        """The reading takes 4 seconds, so the slot looked free after the wait of 2 seconds ended."""
-        readings = []
+    def test_a_free_reading_that_arrives_after_the_deadline_does_not_admit_even_the_first_one(self) -> None:
+        """The read takes 4 seconds, so the slot looked free after the wait of 2 seconds ended. The old code admitted the first reading whatever the wait."""
 
-        def slow_view() -> list[str]:
-            readings.append(self.now)
-            self.now += 4 if len(readings) > 1 else 0
-            return ["spark_silver"] if len(readings) == 1 else []
+        def slow(seconds: float) -> list[str]:
+            self.now += 4
+            return []
 
-        with self.assertRaises(SlotBusy), spark_slot(slow_view, wait_seconds=2, clock=self.clock, sleep=self.sleep):
-            self.fail("the body must not run")
-        with self.claim([]):
-            pass
+        with self.assertRaisesRegex(SlotBusy, "wait of 2 seconds ended"):
+            self.go(slow, wait=2)
+        self.assertEqual([], self.engine.launches())
 
-    def test_the_first_reading_admits_a_free_slot_however_long_it_takes_and_whatever_the_wait(self) -> None:
-        def slow_view() -> list[str]:
+    def test_with_no_wait_the_first_reading_admits_a_free_slot_however_long_it_takes(self) -> None:
+        def slow(seconds: float) -> list[str]:
             self.now += 30
             return []
 
-        with spark_slot(slow_view, wait_seconds=0, clock=self.clock, sleep=self.sleep):
-            pass
+        self.assertEqual(0, self.go(slow).returncode)
 
-    def test_the_one_lock_follows_no_argument_and_no_environment_variable(self) -> None:
-        """Two launchers with different environments, as a host and a container have, took two lock files and both entered."""
-        elsewhere = self.lock.parent / "elsewhere"
-        elsewhere.mkdir()
-        with (
-            mock.patch.dict("os.environ", {"SPARK_SLOT_LOCK": str(elsewhere / "other.lock"), "TMPDIR": str(elsewhere)}),
-            self.claim([]),
-            self.assertRaisesRegex(SlotBusy, "another launcher"),
-            self.claim([]),
-        ):
-            self.fail("the body must not run")
-        self.assertEqual([], sorted(path.name for path in elsewhere.iterdir()))
-        with self.assertRaises(TypeError):
-            spark_slot(lambda: [], lock_file=elsewhere / "other.lock")  # type: ignore[call-arg]
+    def test_every_read_gets_the_time_that_is_left_of_the_wait_and_never_more_than_the_read_limit(self) -> None:
+        timeouts: list[float] = []
 
-    def test_the_default_lock_is_the_one_file_of_the_code_location_container(self) -> None:
-        self.assertIn('LOCK_FILE = Path("/run/dagster/spark_slot.lock")', (ROOT / "scripts" / "stack" / "spark_slot.py").read_text())
-        document: Any = load_yaml((ROOT / "compose" / "services" / "dagster_code_location.yml").read_text())
-        compose = document["services"]["dagster_code_location"]
-        self.assertIn("/run/dagster:uid=10001,gid=10001,mode=0700", compose["tmpfs"])
-        dockerfile = (ROOT / "orchestration" / "Dockerfile").read_text()
-        self.assertIn("stack/spark_run.py", dockerfile)
-        self.assertIn("stack/spark_slot.py", dockerfile)
+        def recording(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            timeouts.append(timeout)
+            return self.engine.docker(arguments, timeout)
 
-    def test_a_lock_that_cannot_be_opened_is_a_slot_error_that_names_the_folder_and_is_not_a_busy_slot(self) -> None:
-        with (
-            mock.patch.object(slot, "LOCK_FILE", self.lock.parent / "no_such_folder" / "slot.lock"),
-            self.assertRaises(SlotError) as caught,
-            self.claim([]),
-        ):
-            self.fail("the body must not run")
-        self.assertNotIsInstance(caught.exception, SlotBusy)
-        self.assertIn("no_such_folder", str(caught.exception))
-        self.assertIn("code location", str(caught.exception))
+        self.engine.hold()
+        with self.assertRaises(SlotBusy):
+            run_in_slot(
+                self.build,
+                running=self.record_read,
+                deadline_seconds=100,
+                wait_seconds=10,
+                poll_seconds=4,
+                clock=self.clock,
+                sleep=self.sleep,
+                docker=recording,
+            )
+        self.assertEqual([10, 6, 2], self.reads)
+        self.assertEqual([10, 6, 2], timeouts)
+        self.reads.clear()
+        self.engine.boxes.clear()
+        self.go(wait=500)
+        self.assertEqual([slot.READ_SECONDS], self.reads)
+        self.reads.clear()
+        self.go()
+        self.assertEqual([slot.READ_SECONDS], self.reads)
+
+    def test_a_wait_that_is_not_a_finite_number_that_is_0_or_more_is_refused_before_anything_is_read(self) -> None:
+        for wait in (float("nan"), float("inf"), float("-inf"), -1.0):
+            with self.subTest(wait=wait), self.assertRaises(SlotError):
+                self.go(wait=wait)
+        self.assertEqual([], self.reads)
+        self.assertEqual([], self.engine.calls)
+
+    def test_the_seconds_parser_takes_finite_numbers_that_are_0_or_more_and_nothing_else(self) -> None:
+        self.assertEqual(0.0, slot.finite_seconds("0"))
+        self.assertEqual(2.5, slot.finite_seconds("2.5"))
+        for text in ("nan", "inf", "-inf", "-1", "1e999", "", "two"):
+            with self.subTest(text=text), self.assertRaises(Exception) as caught:
+                slot.finite_seconds(text)
+            self.assertEqual("ArgumentTypeError", type(caught.exception).__name__)
+
+    def test_a_container_that_cannot_be_read_is_a_slot_error_and_not_a_free_slot(self) -> None:
+        def broken(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            return CompletedProcess(arguments, 1, "", "")
+
+        def slow(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            raise TimeoutExpired("docker", timeout)
+
+        for docker in (broken, slow):
+            with self.subTest(docker=docker.__name__), self.assertRaisesRegex(SlotError, "cannot be read"):
+                run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=docker)
 
 
 class OccupancyTest(unittest.TestCase):
@@ -228,6 +364,44 @@ class OccupancyTest(unittest.TestCase):
         with mock.patch.object(groups, "docker", side_effect=[listing, inspected]):
             self.assertIn("spark_silver", groups.running_services(settings, load_limits(LIMITS_FILE)))
             self.assertEqual({"spark_silver"}, set(spark_holders({"spark_silver"})))
+
+
+class PausedTest(unittest.TestCase):
+    """A paused or restarting container holds its memory and the slot, and an exited or created one does not."""
+
+    def alive(self, state: str, timeout: float | None = None) -> frozenset[str]:
+        settings = groups.Settings(compose_directory=ROOT / "compose", project="stack_example")
+        with mock.patch.object(groups, "docker", side_effect=["id_one", f"spark_silver|{state}|none|0|false|0\n"]) as asked:
+            found = (
+                groups.running_services(settings, load_limits(LIMITS_FILE))
+                if timeout is None
+                else groups.running_services(settings, load_limits(LIMITS_FILE), timeout)
+            )
+        self.timeouts = [call.kwargs["timeout"] for call in asked.call_args_list]
+        return found
+
+    def test_a_running_paused_or_restarting_service_is_alive_and_a_stopped_one_is_not(self) -> None:
+        for state in ("running", "paused", "restarting"):
+            with self.subTest(state=state):
+                self.assertEqual(frozenset({"spark_silver"}), self.alive(state))
+        for state in ("exited", "created", "dead", "removing"):
+            with self.subTest(state=state):
+                self.assertEqual(frozenset(), self.alive(state))
+
+    def test_the_two_reads_together_take_at_most_the_seconds_they_are_given(self) -> None:
+        self.alive("paused", 8)
+        self.assertEqual(8, self.timeouts[0])
+        self.assertLessEqual(self.timeouts[1], 8)
+        settings = groups.Settings(compose_directory=ROOT / "compose", project="stack_example")
+        with mock.patch.object(groups, "docker", return_value=""), mock.patch("scripts.stack.groups.time.monotonic", side_effect=[0.0, 0.0]):
+            self.assertEqual(frozenset(), groups.running_services(settings, load_limits(LIMITS_FILE), 3))
+        ticks = iter([0.0, 5.0])
+        with (
+            mock.patch.object(groups, "docker", return_value="id_one"),
+            mock.patch("scripts.stack.groups.time.monotonic", side_effect=lambda: next(ticks)),
+            self.assertRaisesRegex(groups.GroupError, "timed out after 3 seconds"),
+        ):
+            groups.running_services(settings, load_limits(LIMITS_FILE), 3)
 
 
 class GroupUpTest(unittest.TestCase):
@@ -280,75 +454,92 @@ class GroupUpTest(unittest.TestCase):
 
 
 class OneOffTest(unittest.TestCase):
-    """The table checks one-off holds the slot for the whole of ``docker compose run``, and does not start while a Spark job runs."""
+    """The table checks one-off holds the slot as long as its container exists, and does not start while a Spark container of any launcher is alive."""
 
     def setUp(self) -> None:
-        self.lock = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="spark_slot_"))) / "slot.lock"
-        self.enterContext(one_lock(self.lock))
+        self.engine = Engine()
+        self.enterContext(mock.patch.object(slot, "run_command", self.engine.run_command))
         self.settings = groups.Settings(compose_directory=ROOT / "compose", project="stack_example")
+        self.staging = Path("/opt/dagster/staging/run_one")
 
-    def runner(self, running: list[str]) -> run.Runner:
+    def runner(self, running: list[str] | None = None) -> run.Runner:
         return run.compose_runner(
-            self.settings, volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77, running=lambda: running
+            self.settings, volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77, running=lambda _: running or []
         )
+
+    def manual(self) -> tuple[int, str]:
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+            return spark_run.main(["table_maintenance", "--dry-run"], running=lambda _: []), error.getvalue()
 
     def test_a_job_of_another_group_that_runs_refuses_the_start_and_no_container_is_made(self) -> None:
         for holder in SPARK_SERVICES:
-            with self.subTest(holder=holder), mock.patch.object(run, "run_command") as started:
-                with self.assertRaisesRegex(run.TableChecksError, holder):
-                    self.runner([holder])(Path("/opt/dagster/staging/run_one"))
-                started.assert_not_called()
+            with self.subTest(holder=holder), self.assertRaisesRegex(run.TableChecksError, holder):
+                self.runner([holder])(self.staging)
+            self.assertEqual([], self.engine.launches())
 
-    def test_the_slot_is_held_while_the_container_runs_and_released_when_it_exits(self) -> None:
-        def container(*_: object, **__: object) -> CompletedProcess[str]:
-            with self.assertRaises(SlotBusy), spark_slot(lambda: []):
-                pass
+    def test_the_container_has_the_slots_name_and_the_options_come_before_the_service(self) -> None:
+        self.assertEqual(0, self.runner()(self.staging).exit_code)
+        (launch,) = self.engine.launches()
+        self.assertEqual(SLOT_NAME, launch[launch.index("--name") + 1])
+        self.assertLess(launch.index("--name"), launch.index("--user"))
+        self.assertLess(launch.index("--label"), launch.index("spark_bronze"))
+        self.assertEqual({}, self.engine.boxes)
+
+    def test_the_slot_is_held_while_the_container_runs_and_free_when_it_exits(self) -> None:
+        seen: list[tuple[int, str]] = []
+
+        def container(engine: Engine, box: Box) -> CompletedProcess[str]:
+            seen.append(self.manual())
             return CompletedProcess([], 0, "RESULT {}\n", "")
 
-        with mock.patch.object(run, "run_command", side_effect=container) as started:
-            self.assertEqual(0, self.runner([])(Path("/opt/dagster/staging/run_one")).exit_code)
-        started.assert_called_once()
-        with spark_slot(lambda: []):
-            pass
+        self.engine.on_start = container
+        self.assertEqual(0, self.runner()(self.staging).exit_code)
+        self.assertEqual(1, seen[0][0])
+        self.assertIn(SLOT_NAME, seen[0][1])
+        self.assertEqual(0, self.manual()[0])
 
-    def test_the_slot_is_released_when_the_job_passes_its_deadline(self) -> None:
-        with mock.patch.object(run, "run_command", side_effect=TimeoutExpired("docker", 77)):
-            self.assertEqual(124, self.runner([])(Path("/opt/dagster/staging/run_one")).exit_code)
-        with spark_slot(lambda: []):
-            pass
+    def test_a_job_that_passes_its_deadline_returns_124_after_its_container_is_removed(self) -> None:
+        self.engine.on_start = killed
+        self.assertEqual(124, self.runner()(self.staging).exit_code)
+        self.assertEqual({}, self.engine.boxes)
 
-    def test_a_lock_that_cannot_be_opened_is_a_table_checks_error_and_no_container_is_made(self) -> None:
-        with (
-            mock.patch.object(slot, "LOCK_FILE", self.lock.parent / "no_such_folder" / "slot.lock"),
-            mock.patch.object(run, "run_command") as started,
-            self.assertRaisesRegex(run.TableChecksError, "no_such_folder"),
-        ):
-            self.runner([])(Path("/opt/dagster/staging/run_one"))
-        started.assert_not_called()
+    def test_a_container_that_cannot_be_removed_after_the_deadline_is_a_table_checks_error(self) -> None:
+        self.engine.on_start = killed
+        self.engine.removal_fails = True
+        with self.assertRaisesRegex(run.TableChecksError, "still there"):
+            self.runner()(self.staging)
 
-    def test_the_table_checks_and_the_manual_one_off_exclude_each_other_through_the_one_lock(self) -> None:
-        """Both launchers run in the code location container. While one's container runs, the other is refused, though the container is not yet listed."""
-        manual_reply: list[int] = []
+    def test_a_slot_container_of_another_launch_refuses_the_start_in_every_state_and_is_left_alone(self) -> None:
+        for state in ("running", "paused"):
+            engine = Engine()
+            engine.hold(state=state)
+            with self.subTest(state=state), mock.patch.object(slot, "run_command", engine.run_command), self.assertRaisesRegex(run.TableChecksError, SLOT_NAME):
+                self.runner()(self.staging)
+            self.assertEqual([], engine.launches())
+            self.assertEqual(1, len(engine.boxes))
 
-        def container(*_: object, **__: object) -> CompletedProcess[str]:
-            with mock.patch.object(spark_run, "run_command") as other, contextlib.redirect_stderr(io.StringIO()):
-                manual_reply.append(spark_run.main(["table_maintenance", "--dry-run"], running=lambda: []))
-            other.assert_not_called()
+    def test_the_table_checks_and_the_manual_one_off_exclude_each_other_through_the_name_in_both_directions(self) -> None:
+        manual: list[tuple[int, str]] = []
+
+        def container(engine: Engine, box: Box) -> CompletedProcess[str]:
+            manual.append(self.manual())
             return CompletedProcess([], 0, "RESULT {}\n", "")
 
-        with mock.patch.object(run, "run_command", side_effect=container):
-            self.runner([])(Path("/opt/dagster/staging/run_one"))
-        self.assertEqual([1], manual_reply)
+        self.engine.on_start = container
+        self.runner()(self.staging)
+        self.assertEqual(1, manual[0][0])
+        nested: list[str] = []
 
-        def manual_container(*_: object, **__: object) -> CompletedProcess[str]:
-            with mock.patch.object(run, "run_command") as other, self.assertRaisesRegex(run.TableChecksError, "another launcher"):
-                self.runner([])(Path("/opt/dagster/staging/run_one"))
-            other.assert_not_called()
+        def manual_container(engine: Engine, box: Box) -> CompletedProcess[str]:
+            with self.assertRaisesRegex(run.TableChecksError, "do not start") as caught:
+                self.runner()(self.staging)
+            nested.append(str(caught.exception))
             return CompletedProcess([], 0, "", "")
 
-        with mock.patch.object(spark_run, "run_command", side_effect=manual_container) as started:
-            self.assertEqual(0, spark_run.main(["table_maintenance", "--dry-run"], running=lambda: []))
-        started.assert_called_once()
+        self.engine.on_start = manual_container
+        self.assertEqual(0, self.manual()[0])
+        self.assertIn(SLOT_NAME, nested[0])
 
 
 class DagsterTagTest(unittest.TestCase):

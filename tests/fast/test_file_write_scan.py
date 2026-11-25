@@ -156,10 +156,6 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "Opens the lock file locks/<run ID> with create, to take a lock; it holds no data and is never replaced or removed",
     ),
-    ("scripts/stack/spark_slot.py", "open_lock", "os.open"): (
-        1,
-        "Opens the Spark slot's lock file with create, to take an exclusive lock; it holds no data, is opened without following a link and is never replaced",
-    ),
     ("replay/service/serve.py", "archive", "os.replace"): (
         2,
         "Moves a request and its reference from the inbox into done/ or failed/, folders of the service's own state; the run ID is reserved once",
