@@ -192,7 +192,13 @@ uninstall) : > "$STAND_IN/recovered"; : > "$STAND_IN/status"; : > "$STAND_IN/his
 *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
 """
-K3S_STAND_IN = '#!/bin/sh\necho "$*" >> "$STAND_IN/log"\n'
+K3S_STAND_IN = (
+    "#!/bin/sh\n"
+    'echo "$*" >> "$STAND_IN/log"\n'
+    'if [ -e "$STAND_IN/flag_fail_restart" ] && [ "$2" = rollout ]; then\n'
+    '  echo "Error: LEAKED-STDERR rollout" >&2; echo "LEAKED-STDOUT rollout"; exit 1\n'
+    "fi\n"
+)
 CHART_SHA = "c" * 64
 DEADLINE = 600
 UPGRADE = "upgrade --install"
@@ -203,6 +209,7 @@ CONFIGMAP_A = "".join(f"{name}\n" for name in VALUES_FILES)
 CONFIGMAP_B = CONFIGMAP_A.replace("host.values.yaml\n", HOST_VALUES_B)
 LEAK = "LEAKED"
 RECORD = "release_inputs.sha256"
+RESTART = ["kubectl rollout restart deployment", "kubectl wait --for=condition=Available deployment --all"]
 
 
 def history(*states: str) -> list[dict[str, object]]:
@@ -296,19 +303,19 @@ class ReleaseRecoveryTest(unittest.TestCase):
     def test_a_release_with_an_upgrade_pending_is_rolled_back_to_its_last_deployed_revision_before_the_install(self) -> None:
         code, output, log = self.run_release("pending-upgrade", history("superseded", "deployed", "pending-upgrade"), recorded="other")
         self.assertEqual(0, code, output)
-        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE], self.commands(log))
+        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE, *RESTART], self.commands(log))
         self.assertIn(f"rollback airbyte 2 --namespace airbyte --wait --timeout {DEADLINE}s", log)
 
     def test_a_release_with_a_rollback_pending_is_rolled_back_to_the_last_deployed_revision_and_not_to_a_failed_one(self) -> None:
         past = history("superseded", "deployed", "failed", "pending-rollback")
         code, output, log = self.run_release("pending-rollback", past, recorded="other")
         self.assertEqual(0, code, output)
-        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE], self.commands(log))
+        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE, *RESTART], self.commands(log))
 
     def test_with_two_deployed_revisions_in_the_history_the_later_one_is_the_target(self) -> None:
         code, output, log = self.run_release("pending-upgrade", history("deployed", "deployed", "pending-upgrade"), recorded="other")
         self.assertEqual(0, code, output)
-        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE], self.commands(log))
+        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE, *RESTART], self.commands(log))
 
     def test_a_first_install_that_is_pending_is_uninstalled_before_the_install_with_the_same_deadline(self) -> None:
         code, output, log = self.run_release("pending-install", history("pending-install"), recorded="none")
@@ -369,18 +376,20 @@ class ReleaseRecoveryTest(unittest.TestCase):
 
     def test_a_pending_release_whose_recorded_inputs_match_is_still_upgraded_from_this_runs_inputs_after_the_recovery(self) -> None:
         """Older code left the record in place when it was stopped inside Helm, so the record matches while the hook's ConfigMap still holds inputs B."""
-        for status, past, recovery in (
-            ("pending-upgrade", history("deployed", "pending-upgrade"), ["history airbyte", "rollback airbyte 1"]),
-            ("pending-rollback", history("superseded", "deployed", "pending-rollback"), ["history airbyte", "rollback airbyte 2"]),
-            ("pending-install", history("pending-install"), ["uninstall airbyte"]),
-            ("uninstalling", history("superseded", "uninstalling"), ["uninstall airbyte"]),
+        # A rollback leaves a deployed release whose pods keep their settings, so the upgrade restarts them; an uninstall leaves none, so the install
+        # starts every pod new and nothing restarts.
+        for status, past, recovery, restart in (
+            ("pending-upgrade", history("deployed", "pending-upgrade"), ["history airbyte", "rollback airbyte 1"], RESTART),
+            ("pending-rollback", history("superseded", "deployed", "pending-rollback"), ["history airbyte", "rollback airbyte 2"], RESTART),
+            ("pending-install", history("pending-install"), ["uninstall airbyte"], []),
+            ("uninstalling", history("superseded", "uninstalling"), ["uninstall airbyte"], []),
         ):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as scratch:
                 box = ReleaseSandbox(scratch, status, past, "match", {})
                 (box.stand_in / "configmap").write_text(CONFIGMAP_B)
                 code, output, log = box.run()
                 self.assertEqual(0, code, output)
-                self.assertEqual([*recovery, UPGRADE], commands(log))
+                self.assertEqual([*recovery, UPGRADE, *restart], commands(log))
                 self.assertEqual(CONFIGMAP_A, box.configmap(), "the upgrade ran from this run's inputs and not from the inputs that the interrupted run wrote")
                 self.assertEqual(f"{box.inputs}\n", box.record().read_text())
 
@@ -397,7 +406,31 @@ class ReleaseRecoveryTest(unittest.TestCase):
     def test_a_deployed_release_with_changed_inputs_is_upgraded_with_no_recovery(self) -> None:
         code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
         self.assertEqual(0, code, output)
+        self.assertEqual([UPGRADE, *RESTART], self.commands(log))
+
+    def test_an_upgrade_of_a_deployed_release_restarts_every_deployment_and_waits_for_each_so_changed_settings_reach_the_pods(self) -> None:
+        """The chart passes its settings to the pods as environment values from one ConfigMap, which a pod reads only when it starts, and an upgrade that
+        changes only that ConfigMap leaves the pods running (live host, Nov 24 2026: the workload launcher kept a 256Mi sidecar limit after the limits file
+        and the ConfigMap said 512Mi, and the sidecar was OOMKilled). After the upgrade, every deployment of the namespace restarts and the run waits until
+        each is available, within the release deadline."""
+        code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual([UPGRADE, *RESTART], self.commands(log))
+        self.assertIn(f"kubectl wait --for=condition=Available deployment --all --namespace airbyte --timeout={DEADLINE}s", log)
+
+    def test_a_first_install_restarts_nothing_because_every_pod_starts_with_the_new_settings(self) -> None:
+        code, output, log = self.run_release(NOT_INSTALLED, recorded="none")
+        self.assertEqual(0, code, output)
         self.assertEqual([UPGRADE], self.commands(log))
+
+    def test_a_restart_that_fails_stops_the_run_with_fixed_text_and_leaves_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {})
+            code, output, _ = box.run(flags=("fail_restart",))
+            self.assertNotEqual(0, code)
+            self.assertIn("could not restart the Airbyte deployments", output)
+            self.assertNotIn(LEAK, output)
+            self.assertFalse(box.record().exists(), "a release whose pods kept the old settings is not recorded as done")
 
     def test_an_upgrade_without_install_is_refused_for_a_release_that_is_absent_or_uninstalled_and_is_not_counted_as_one(self) -> None:
         """Recheck 4: only ``upgrade --install`` installs a release that is not there, and the log keeps a bare upgrade as it was called."""
@@ -496,7 +529,7 @@ class ReleaseRecoveryTest(unittest.TestCase):
             self.assertFalse(box.record().exists())
             code, output, log = box.run(host_values="host.values.yaml\n")
             self.assertEqual(0, code, output)
-            self.assertEqual(["history airbyte", "rollback airbyte 1", UPGRADE], commands(log))
+            self.assertEqual(["history airbyte", "rollback airbyte 1", UPGRADE, *RESTART], commands(log))
             self.assertEqual(CONFIGMAP_A, box.configmap())
             self.assertEqual(f"{box.inputs}\n", box.record().read_text())
 
@@ -510,7 +543,7 @@ class ReleaseRecoveryTest(unittest.TestCase):
             self.assertFalse(box.record().exists())
             code, output, log = box.run()
             self.assertEqual(0, code, output)
-            self.assertEqual(["history airbyte", "rollback airbyte 3", UPGRADE], commands(log))
+            self.assertEqual(["history airbyte", "rollback airbyte 3", UPGRADE, *RESTART], commands(log))
             self.assertEqual(CONFIGMAP_A, box.configmap())
 
     def test_the_inputs_are_recorded_only_after_the_install_succeeded(self) -> None:

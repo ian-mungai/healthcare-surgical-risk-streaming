@@ -227,6 +227,53 @@
           Helm could not install or upgrade the Airbyte release {{ airbyte_release }} (status {{ airbyte_release_state_now }}, exit status {{ airbyte_release_install.rc }}).
           Run helm upgrade by hand to see why.
 
+    # The chart gives the pods their settings as environment values from one ConfigMap, which a pod reads only when it starts, and an upgrade that changes
+    # only that ConfigMap leaves the pods running with the old values (live host, Nov 24 2026: the workload launcher kept a 256Mi sidecar limit after the
+    # ConfigMap said 512Mi). So an upgrade of a release that was deployed restarts every deployment of the namespace and waits until each is available; a
+    # first install starts every pod with the new values. A failure stops the run before the inputs are recorded, so the next run upgrades and restarts again.
+    - name: Restart every Airbyte deployment so that changed settings reach the pods
+      when: airbyte_release_state_now == 'deployed'
+      ansible.builtin.command:
+        argv: [k3s, kubectl, rollout, restart, deployment, --namespace, "{{ airbyte_namespace }}"]
+      register: airbyte_release_restart
+      changed_when: true
+      failed_when: false
+      no_log: true
+      timeout: 120
+
+    - name: Stop when the deployments could not be restarted
+      when: airbyte_release_restart is not skipped and airbyte_release_restart.rc != 0
+      ansible.builtin.fail:
+        msg: >-
+          The Airbyte release {{ airbyte_release }} was upgraded, but k3s could not restart the Airbyte deployments (exit status {{ airbyte_release_restart.rc }}),
+          so its pods may still run with the old settings. Run the role again.
+
+    - name: Wait until every restarted deployment is available
+      when: airbyte_release_state_now == 'deployed'
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --for=condition=Available
+          - deployment
+          - --all
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - "--timeout={{ airbyte_release_deadline_seconds }}s"
+      register: airbyte_release_restarted
+      changed_when: false
+      failed_when: false
+      no_log: true
+      timeout: "{{ airbyte_release_deadline_seconds | int + 60 }}"
+
+    - name: Stop when a restarted deployment did not become available
+      when: airbyte_release_restarted is not skipped and airbyte_release_restarted.rc != 0
+      ansible.builtin.fail:
+        msg: >-
+          The Airbyte release {{ airbyte_release }} was upgraded, but k3s could not restart the Airbyte deployments within
+          {{ airbyte_release_deadline_seconds }} seconds (exit status {{ airbyte_release_restarted.rc }}). Run the role again.
+
     - name: Record the inputs of this successful release
       ansible.builtin.copy:
         dest: "{{ airbyte_directory }}/release_inputs.sha256"
