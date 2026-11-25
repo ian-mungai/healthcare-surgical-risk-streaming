@@ -199,6 +199,8 @@ class CatalogFinish(unittest.TestCase):
         remove_error: Exception | None = None,
         never_made: tuple[str, ...] = (),
         unreadable: tuple[str, ...] = (),
+        other_404: tuple[str, ...] = (),
+        code_not_404: tuple[str, ...] = (),
     ) -> tuple[Record, str]:
         module = runner("catalog_proof")
         run = record()
@@ -232,6 +234,10 @@ class CatalogFinish(unittest.TestCase):
                 raise module.NessieError("missing", status=404, error_code="REFERENCE_NOT_FOUND")
             if name in unreadable:
                 raise module.NessieError("unavailable", status=503, error_code=None)
+            if name in other_404:
+                raise module.NessieError("missing", status=404, error_code="CONTENT_NOT_FOUND")
+            if name in code_not_404:
+                raise module.NessieError("refused", status=400, error_code="REFERENCE_NOT_FOUND")
             return SimpleNamespace(hash="h")
 
         nessie = SimpleNamespace(reference=reference, delete_reference=delete)
@@ -325,6 +331,12 @@ class CatalogFinish(unittest.TestCase):
         run, text = self.finish(unreadable=("a",))
         self.assertEqual(failed(run), ["references deleted"])
         self.assertIn("already absent: 0", text)
+
+    def test_only_a_404_with_the_reference_not_found_code_is_absent(self) -> None:
+        for kind, (run, text) in (("other code", self.finish(other_404=("a",))), ("other status", self.finish(code_not_404=("a",)))):
+            with self.subTest(kind=kind):
+                self.assertEqual(failed(run), ["references deleted"])
+                self.assertIn("already absent: 0", text)
 
     def test_every_leftover_is_reported_at_once(self) -> None:
         run, _ = self.finish(restored=False, refuses=("a",), file_removed=False)
