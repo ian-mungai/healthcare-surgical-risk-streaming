@@ -7,12 +7,21 @@ a duration): no glob, no ID of Airbyte, no credential and no text of an exceptio
 
 ``start`` refuses, before any job call, a connection whose source selects any other set of files than the fixed sample's (so a dev host that still holds the
 full release's selection copies nothing), a connection whose destination is not the project's bucket under the landing prefix (``destination_differs``) and a
-connection that has an active job (so no second copy runs beside the first). It keeps the attempt (the connection and the time) in a ledger, in the state
-folder, before it sends the start, and the job from the start answer beside it before it returns the job. A start whose reply is lost is reconciled by a
-confirmed identity: the connection's latest job that Airbyte created after the attempt time and that the ledger does not hold yet. A start that cannot be
-reconciled is ``start_unconfirmed``, and its attempt stays in the ledger as unresolved: ``cancel-owned`` reconciles it again, counts it in ``unresolved`` while
-it is open and drops it only when no job is found and ``ATTEMPT_SETTLE_SECONDS`` have passed since the attempt (a request that was never answered cannot land
-after that). ``wait`` and ``cancel`` act only on a job of that ledger whose connection Airbyte confirms (``job_not_owned``
+connection that has an active job (so no second copy runs beside the first). It reads the IDs of the connection's sync jobs, and keeps the attempt (the
+connection, the time and those IDs) in a ledger, in the state folder, before it sends the start (a start whose IDs cannot be read is ``jobs_unreadable`` and
+sends nothing), and the job from the start answer beside it before it returns the job. A start whose reply is lost is reconciled by a confirmed identity: the
+connection's latest job whose ID is not among the IDs that were read before the start and that the ledger does not hold yet. The creation time of a job is
+never used, because Airbyte reports it in whole seconds
+(https://github.com/airbytehq/airbyte-platform/blob/main/airbyte-server/src/main/kotlin/io/airbyte/server/apis/publicapi/mappers/JobResponseMapper.kt#L55-L56),
+so a job that is made in the fractional second of the attempt reads as older than the attempt. A start that cannot be reconciled is ``start_unconfirmed``, and
+its attempt stays in the ledger as unresolved: ``cancel-owned`` reconciles it again, counts it in ``unresolved`` while it is open and drops it only when no
+job is found and ``ATTEMPT_SETTLE_SECONDS`` have passed since the attempt (a request that was never answered cannot land after that).
+
+RECORDED LIMIT (owner-accepted, Nov 25 2026): a sync that an operator starts on the connection between the read of its job IDs and the start of this tool is
+not in the read IDs, so a lost reply can adopt it as this tool's own, and ``cancel-owned`` can then cancel it. One operator uses the development host, so the
+limit is accepted there and no other fix is made. A ledger of an earlier build (``raw_copy_jobs_1``) is read as resolved jobs and its jobs are kept when the
+ledger is written again. A read of Airbyte spends only the time that is left of its operation's budget, through its pages and its ownership reads. ``wait``
+and ``cancel`` act only on a job of that ledger whose connection Airbyte confirms (``job_not_owned``
 otherwise), so a job that a person or another tool started is never waited for, and never cancelled. ``wait`` ends at its deadline, which starts before its
 ownership reads: a job that is still running then is cancelled and the cancellation is confirmed, a job whose success is read after the deadline is a
 ``deadline`` and not a success, and a job that cannot be confirmed stopped is named ``job_still_active``. ``cancel-owned`` cancels every job of the ledger that
@@ -35,7 +44,6 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -55,6 +63,7 @@ DEFAULT_CONFIRM_SECONDS = 120.0
 STATUS_READ_SECONDS = 30.0
 RECORD_COUNTS = ("rowsSynced", "bytesSynced")
 LEDGER_FORMAT = "raw_copy_jobs_2"
+FIRST_LEDGER_FORMAT = "raw_copy_jobs_1"
 LEDGER_FILE = "owned_jobs.json"
 LEDGER_FOLDER_DEFAULT = "/opt/dagster/data/raw_copy"
 LEDGER_FOLDER_VARIABLE = "RAW_COPY_STATE_DIR"
@@ -82,11 +91,13 @@ class RawConnection:
 
 @dataclass(frozen=True, slots=True)
 class Attempt:
-    """A start that was sent and whose job is not yet known: its token, the connection and the time of the attempt (epoch seconds)."""
+    """A start that was sent and whose job is not yet known: its token, the connection, the time of the attempt (epoch seconds) and the IDs of the connection's
+    sync jobs that were read before the start (None for an attempt that an earlier build kept without them)."""
 
     token: str
     connection_id: str
     started: float
+    before: tuple[int, ...] | None = None
 
 
 class JobLedger:
@@ -110,8 +121,12 @@ class JobLedger:
             return []
         except OSError, ValueError:
             raise RawCopyError("state_unreadable") from None
-        rows = document.get("jobs") if isinstance(document, dict) and document.get("format") == LEDGER_FORMAT else None
-        if type(rows) is not list or any(not well_formed(row) for row in rows):
+        rows = document.get("jobs") if isinstance(document, dict) else None
+        if isinstance(document, dict) and document.get("format") == FIRST_LEDGER_FORMAT:
+            if type(rows) is not list or any(not first_format_row(row) for row in rows):
+                raise RawCopyError("state_unreadable")
+            return [{"token": f"v1_{number}", "job": row["job"], "connection_id": row["connection_id"], "started": 0.0} for number, row in enumerate(rows)]
+        if type(rows) is not list or document.get("format") != LEDGER_FORMAT or any(not well_formed(row) for row in rows):
             raise RawCopyError("state_unreadable")
         return rows
 
@@ -122,7 +137,11 @@ class JobLedger:
         return [job for job, _ in self.entries()]
 
     def attempts(self) -> list[Attempt]:
-        return [Attempt(row["token"], row["connection_id"], row["started"]) for row in self.rows() if row["job"] is None]
+        return [
+            Attempt(row["token"], row["connection_id"], row["started"], tuple(row["before"]) if "before" in row else None)
+            for row in self.rows()
+            if row["job"] is None
+        ]
 
     def connection_of(self, job: int) -> str | None:
         found = [connection for kept, connection in self.entries() if kept == job]
@@ -134,10 +153,10 @@ class JobLedger:
         kept = [row for row in rows if row["job"] is None or row in resolved]
         replace_owned_file(self.path, json.dumps({"format": LEDGER_FORMAT, "jobs": kept}, sort_keys=True) + "\n", state_root=self.directory, mode=0o600)
 
-    def begin(self, connection_id: str, started: float) -> str:
-        """Keep an attempt that is about to be sent, and return its token."""
+    def begin(self, connection_id: str, started: float, before: Sequence[int] = ()) -> str:
+        """Keep an attempt that is about to be sent, with the IDs of the connection's jobs that were read before it, and return its token."""
         token = secrets.token_hex(8)
-        self.save([*self.rows(), {"token": token, "job": None, "connection_id": connection_id, "started": started}])
+        self.save([*self.rows(), {"token": token, "job": None, "connection_id": connection_id, "started": started, "before": list(before)}])
         return token
 
     def resolve(self, token: str, job: int) -> None:
@@ -156,17 +175,23 @@ def well_formed(row: object) -> bool:
         and type(row.get("connection_id")) is str
         and (row.get("job") is None or type(row.get("job")) is int)
         and type(row.get("started")) in (int, float)
+        and ("before" not in row or (type(row["before"]) is list and all(type(job) is int for job in row["before"])))
     )
 
 
+def first_format_row(row: object) -> bool:
+    """A row of the ledger of the first format: a job and its connection, and nothing about an attempt."""
+    return type(row) is dict and type(row.get("job")) is int and type(row.get("connection_id")) is str
+
+
 class RawCopyApi(Protocol):
-    def raw_connection(self) -> RawConnection: ...
+    def raw_connection(self, *, timeout: float | None = None) -> RawConnection: ...
 
     def job_connection(self, job: int, *, timeout: float | None = None) -> str: ...
 
     def running_jobs(self, connection_id: str) -> list[int]: ...
 
-    def jobs_since(self, connection_id: str, since: float, *, timeout: float | None = None) -> list[int]: ...
+    def job_ids(self, connection_id: str, *, timeout: float | None = None) -> list[int]: ...
 
     def start_sync(self, connection_id: str) -> int: ...
 
@@ -180,16 +205,22 @@ class RawCopyApi(Protocol):
 class HttpRawCopyApi(HttpAirbyteApi):
     """The client of the record load, with the two reads that only the raw copy needs."""
 
-    def raw_connection(self) -> RawConnection:
+    def raw_connection(self, *, timeout: float | None = None) -> RawConnection:
         """The connection that the raw copy runs and the globs of its source. Nothing is created or changed. No connection of the name, two of the name,
-        a source with other than one stream and a glob list of any other form are refused."""
-        listed = self.listing(f"/connections?workspaceIds={quote(self.workspace_id(), safe='')}")
+        a source with other than one stream and a glob list of any other form are refused. ``timeout`` is the budget of all its reads together: each read gets
+        only the time that is left."""
+        ends = None if timeout is None else time.monotonic() + timeout
+
+        def left() -> float | None:
+            return None if ends is None else ends - time.monotonic()
+
+        listed = self.listing(f"/connections?workspaceIds={quote(self.workspace_id(timeout=left()), safe='')}", timeout=left())
         connection = named(listed, CONNECTION_NAME, "connection")
         if connection is None:
             raise AirbyteError("Airbyte holds no connection of the raw copy")
         what = "GET connections"
-        source = self.call("GET", f"/sources/{quote(text(connection, 'sourceId', what), safe='')}")
-        destination = self.call("GET", f"/destinations/{quote(text(connection, 'destinationId', what), safe='')}")
+        source = self.call("GET", f"/sources/{quote(text(connection, 'sourceId', what), safe='')}", timeout=left())
+        destination = self.call("GET", f"/destinations/{quote(text(connection, 'destinationId', what), safe='')}", timeout=left())
         written = fields(destination, "configuration", "GET destinations")
         bucket, landing_path = written.get("s3_bucket_name"), written.get("s3_bucket_path")
         if type(bucket) is not str or type(landing_path) is not str:
@@ -214,23 +245,13 @@ class HttpRawCopyApi(HttpAirbyteApi):
     def job_document(self, job: int, *, timeout: float | None = None) -> dict[str, Any]:
         return self.call("GET", f"/jobs/{job}", timeout=timeout)
 
-    def jobs_since(self, connection_id: str, since: float, *, timeout: float | None = None) -> list[int]:
-        """The IDs of the sync jobs of the connection that Airbyte started at or after ``since`` (epoch seconds), by each job's own ``startTime``. Every entry
-        must be a sync job of the connection in the documented shape with a start time as text that names a zone, or the lookup is refused."""
-        what = "GET jobs"
-        found: list[int] = []
-        for entry in self.listing(f"/jobs?connectionId={quote(connection_id, safe='')}&jobType={SYNC}"):
-            job, _ = job_entry(entry, what, connection_id)
-            started = entry.get("startTime")
-            try:
-                moment = datetime.fromisoformat(started) if type(started) is str else None
-            except ValueError:
-                moment = None
-            if moment is None or moment.tzinfo is None:
-                raise AirbyteError(f"{what} gave a job without a start time as text with a zone")
-            if moment.timestamp() >= since:
-                found.append(job)
-        return found
+    def job_ids(self, connection_id: str, *, timeout: float | None = None) -> list[int]:
+        """The IDs of every sync job of the connection, whatever its status. Every entry must be a sync job of the connection in the documented shape, or the
+        lookup is refused. ``timeout`` is the budget of all its pages together."""
+        return [
+            job_entry(entry, "GET jobs", connection_id)[0]
+            for entry in self.listing(f"/jobs?connectionId={quote(connection_id, safe='')}&jobType={SYNC}", timeout=timeout)
+        ]
 
 
 def check_selection(connection: RawConnection, wanted: Sequence[str]) -> None:
@@ -246,10 +267,13 @@ def check_destination(connection: RawConnection, bucket: str) -> None:
 
 
 def find_attempt_job(api: RawCopyApi, ledger: JobLedger, attempt: Attempt) -> int | None:
-    """The job that the attempt made, by a confirmed identity: the connection's latest job that Airbyte created after the attempt time and that the ledger does
-    not hold yet. None when there is none. A lookup that fails raises ``AirbyteError``: an unreadable list is not an empty one."""
-    known = set(ledger.jobs())
-    found = [job for job in api.jobs_since(attempt.connection_id, attempt.started, timeout=DEFAULT_CONFIRM_SECONDS) if job not in known]
+    """The job that the attempt made, by a confirmed identity: the connection's latest job whose ID was not among the IDs read before the attempt and that the
+    ledger does not hold yet. The creation time of a job is not used: Airbyte reports whole seconds, so a job of the attempt's own second reads as older. None
+    when there is none, and for an attempt that has no IDs from before it. A lookup that fails raises ``AirbyteError``: an unreadable list is no empty one."""
+    if attempt.before is None:
+        return None
+    excluded = set(ledger.jobs()) | set(attempt.before)
+    found = [job for job in api.job_ids(attempt.connection_id, timeout=DEFAULT_CONFIRM_SECONDS) if job not in excluded]
     return max(found) if found else None
 
 
@@ -263,9 +287,13 @@ def start(api: RawCopyApi, wanted: Sequence[str], ledger: JobLedger, bucket: str
     check_destination(connection, bucket)
     if api.running_jobs(connection.connection_id):
         raise RawCopyError("job_active")
+    try:
+        before = tuple(sorted(api.job_ids(connection.connection_id, timeout=DEFAULT_CONFIRM_SECONDS)))
+    except AirbyteError:
+        raise RawCopyError("jobs_unreadable") from None
     started = now()
     try:
-        attempt = Attempt(ledger.begin(connection.connection_id, started), connection.connection_id, started)
+        attempt = Attempt(ledger.begin(connection.connection_id, started, before), connection.connection_id, started, before)
     except RawCopyError:
         raise
     except Exception:
@@ -289,12 +317,23 @@ def start(api: RawCopyApi, wanted: Sequence[str], ledger: JobLedger, bucket: str
     return job
 
 
-def require_owned(api: RawCopyApi, ledger: JobLedger, job: int, budget: float) -> None:
-    """Refuse (``job_not_owned``) unless the ledger holds the job with the raw connection's ID and Airbyte says the job belongs to that same connection."""
+def read_budget(ends: float, clock: Callable[[], float]) -> float:
+    """The time that a read may take: what is left until ``ends``, at most ``STATUS_READ_SECONDS``. ``AirbyteError`` when nothing is left, so that no read is
+    sent after the budget."""
+    left = ends - clock()
+    if left <= 0:
+        raise AirbyteError("a read had no time left in the budget of its operation")
+    return min(left, STATUS_READ_SECONDS)
+
+
+def require_owned(api: RawCopyApi, ledger: JobLedger, job: int, budget: float, clock: Callable[[], float] = time.monotonic) -> None:
+    """Refuse (``job_not_owned``) unless the ledger holds the job with the raw connection's ID and Airbyte says the job belongs to that same connection.
+    Both reads spend ``budget`` together: each gets the time that is left, and the second is not sent when the first used it up (``ownership_unconfirmed``)."""
     kept = ledger.connection_of(job)
+    ends = clock() + budget
     try:
-        current = api.raw_connection().connection_id
-        belongs = api.job_connection(job, timeout=max(min(budget, STATUS_READ_SECONDS), 0.001))
+        current = api.raw_connection(timeout=read_budget(ends, clock)).connection_id
+        belongs = api.job_connection(job, timeout=read_budget(ends, clock))
     except AirbyteError:
         raise RawCopyError("ownership_unconfirmed") from None
     if kept is None or kept != current or belongs != kept:
@@ -333,7 +372,7 @@ def cancel(
 ) -> str:
     """Cancel the job when it is active and return its terminal status. A job that has ended keeps its own status and is not cancelled. A job that this tool
     did not start is refused (``job_not_owned``) before any status read or cancel."""
-    require_owned(api, ledger, job, confirm_seconds)
+    require_owned(api, ledger, job, confirm_seconds, clock)
     status = read_status(api, job, confirm_seconds)
     if status in TERMINAL_STATUSES:
         return status
@@ -356,7 +395,7 @@ def wait(
     """The terminal status of the job. At the deadline the job is cancelled and confirmed stopped, and the call raises ``deadline``; a stop that cannot be
     confirmed raises ``job_still_active`` instead. A status that cannot be read is treated as the deadline of that read: the job is cancelled too."""
     ends = clock() + deadline_seconds
-    require_owned(api, ledger, job, deadline_seconds)
+    require_owned(api, ledger, job, deadline_seconds, clock)
     while True:
         status = read_status(api, job, ends - clock())
         late = clock() > ends

@@ -301,20 +301,22 @@ class HttpAirbyteApi:
             raise AirbyteError(f"{label} gave an answer that is not an object")
         return document
 
-    def listing(self, path: str) -> list[dict[str, Any]]:
+    def listing(self, path: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
         """Every object of a list call, page by page, by the client's own offset.
 
         The offset starts at 0 and grows by ``PAGE_SIZE`` after each page, on the same route and with the same filters. The list ends at the first reply
         whose ``next`` is missing, null or empty: ``next`` only shows that another page exists, and its text is never read, so a link of any form can
         send neither the offset nor the request elsewhere. An entry that is not an object, or a ``next`` that is neither null nor text, refuses the call,
-        and so do more than ``MAX_PAGES`` pages.
+        and so do more than ``MAX_PAGES`` pages. ``timeout`` is the budget of all the pages together: each page gets only the time that is left, and a page is
+        not asked for when none is left.
         """
         label = f"GET {path.partition('?')[0].strip('/')}"
         found: list[dict[str, Any]] = []
         separator = "&" if "?" in path else "?"
         offset = 0
+        ends = None if timeout is None else time.monotonic() + timeout
         for _ in range(MAX_PAGES):
-            reply = self.call("GET", f"{path}{separator}limit={PAGE_SIZE}&offset={offset}")
+            reply = self.call("GET", f"{path}{separator}limit={PAGE_SIZE}&offset={offset}", timeout=None if ends is None else ends - time.monotonic())
             data = reply.get("data")
             following = reply.get("next")
             if not isinstance(data, list) or any(type(item) is not dict for item in data) or not (following is None or type(following) is str):
@@ -325,9 +327,9 @@ class HttpAirbyteApi:
             offset += PAGE_SIZE
         raise AirbyteError(f"{label} has more pages than {MAX_PAGES}")
 
-    def workspace_id(self) -> str:
+    def workspace_id(self, *, timeout: float | None = None) -> str:
         if self.workspace is None:
-            workspaces = self.listing("/workspaces")
+            workspaces = self.listing("/workspaces", timeout=timeout)
             if len(workspaces) != 1:
                 raise AirbyteError("GET workspaces does not give exactly one workspace")
             self.workspace = text(workspaces[0], "workspaceId", "GET workspaces")

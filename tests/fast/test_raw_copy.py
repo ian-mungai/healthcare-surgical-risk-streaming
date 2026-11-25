@@ -25,7 +25,6 @@ import json
 import tempfile
 import unittest
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -71,6 +70,9 @@ class StandIn:
         self.cancel_stops = True
         self.status_error = False
         self.created: list[tuple[int, float]] = []
+        self.during: list[tuple[int, float]] = []
+        self.seen: dict[str, list[float | None]] = {}
+        self.capture_error = False
         self.lost_reply = False
         self.never_arrives = False
         self.lookup_error = False
@@ -81,8 +83,9 @@ class StandIn:
         self.ownership_takes = 0.0
         self.document: dict[str, Any] = {"jobId": 7, "status": "succeeded", "rowsSynced": 11, "bytesSynced": 123456, "connectionId": CONNECTION}
 
-    def raw_connection(self) -> RawConnection:
+    def raw_connection(self, *, timeout: float | None = None) -> RawConnection:
         self.log.append("raw_connection")
+        self.seen.setdefault("raw_connection", []).append(timeout)
         if self.clock is not None:
             self.clock.now += self.ownership_takes
         return RawConnection(CONNECTION, self.globs, self.bucket, self.path)
@@ -98,6 +101,7 @@ class StandIn:
             self.attempts_at_send = self.ledger.attempts()
         if not self.never_arrives:
             self.created.append((7, self.created_at))
+        self.created.extend(self.during)
         if self.lost_reply:
             raise AirbyteError("POST jobs did not finish within its deadline")
         return 7
@@ -108,8 +112,16 @@ class StandIn:
             raise AirbyteError("GET jobs did not finish within its deadline")
         return [job for job, at in self.created if at >= since]
 
+    def job_ids(self, connection_id: str, *, timeout: float | None = None) -> list[int]:
+        self.log.append(f"job_ids {connection_id}")
+        self.seen.setdefault("job_ids", []).append(timeout)
+        if (self.lookup_error and self.started) or (self.capture_error and not self.started):
+            raise AirbyteError("GET jobs did not finish within its deadline")
+        return [job for job, _ in self.created]
+
     def job_connection(self, job: int, *, timeout: float | None = None) -> str:
         self.log.append(f"job_connection {job}")
+        self.seen.setdefault("job_connection", []).append(timeout)
         if self.clock is not None:
             self.clock.now += self.ownership_takes
         if job in self.unreadable_jobs:
@@ -146,7 +158,7 @@ class StartTest(unittest.TestCase):
     def test_a_connection_that_selects_exactly_the_fixed_sample_starts_one_sync_and_returns_its_job(self) -> None:
         api = StandIn()
         self.assertEqual(7, self.start(api))
-        self.assertEqual(["raw_connection", f"running_jobs {CONNECTION}", f"start_sync {CONNECTION}"], api.log)
+        self.assertEqual(["raw_connection", f"running_jobs {CONNECTION}", f"job_ids {CONNECTION}", f"start_sync {CONNECTION}"], api.log)
 
     def test_the_job_and_its_connection_are_kept_from_the_start_answer_before_the_job_is_returned(self) -> None:
         ledger = ledger_in(self)
@@ -179,19 +191,19 @@ class StartTest(unittest.TestCase):
         self.assertEqual(CONNECTION, self.ledger.connection_of(7))
         self.assertEqual([], self.ledger.attempts())
 
-    def test_the_latest_job_after_the_attempt_is_the_one_a_lost_reply_names(self) -> None:
+    def test_the_latest_job_that_the_connection_did_not_have_before_the_attempt_is_the_one_a_lost_reply_names(self) -> None:
         api = StandIn()
         api.lost_reply, api.created_at = True, 101.0
-        api.created.append((9, 102.0))
+        api.during.append((9, 102.0))
         self.assertEqual(9, self.start(api))
         self.assertEqual([9], self.ledger.jobs())
 
-    def test_a_job_made_before_the_attempt_or_already_in_the_ledger_is_never_taken_for_a_lost_reply(self) -> None:
-        for earlier, known in (((5, 50.0), False), ((8, 150.0), True)):
-            with self.subTest(earlier=earlier):
+    def test_a_job_that_the_connection_had_before_the_attempt_or_that_the_ledger_holds_is_never_taken_for_a_lost_reply(self) -> None:
+        for earlier, known in (((5, 150.0), False), ((8, 150.0), True)):
+            with self.subTest(earlier=earlier, known=known):
                 api = StandIn()
                 api.lost_reply, api.never_arrives = True, True
-                api.created.append(earlier)
+                (api.during if known else api.created).append(earlier)
                 ledger = ledger_in(self)
                 if known:
                     keep(ledger, earlier[0], CONNECTION)
@@ -200,6 +212,40 @@ class StartTest(unittest.TestCase):
                 self.assertEqual("start_unconfirmed", caught.exception.error_code)
                 self.assertEqual(1, len(ledger.attempts()))
                 self.assertEqual([earlier[0]] if known else [], ledger.jobs())
+
+    def test_the_jobs_of_the_connection_are_read_and_kept_in_the_attempt_before_the_start_is_sent(self) -> None:
+        api = StandIn()
+        api.created.extend([(5, 50.0), (6, 60.0)])
+        self.assertEqual(7, self.start(api))
+        (seen,) = api.attempts_at_send or []
+        self.assertEqual((5, 6), seen.before)
+        self.assertLess(api.log.index(f"job_ids {CONNECTION}"), api.log.index(f"start_sync {CONNECTION}"))
+
+    def test_a_job_created_in_the_fractional_second_of_the_attempt_is_adopted_after_a_lost_reply(self) -> None:
+        """Airbyte reports whole-second creation times, so a job made in the attempt's own second reads as older than the attempt."""
+        api = StandIn()
+        api.lost_reply, api.created_at = True, 100.0
+        self.assertEqual(7, self.start(api, at=100.7))
+        self.assertEqual([7], self.ledger.jobs())
+        self.assertEqual([], self.ledger.attempts())
+
+    def test_the_jobs_of_the_connection_that_cannot_be_read_before_the_attempt_stop_the_start_before_anything_is_kept_or_sent(self) -> None:
+        api = StandIn()
+        api.capture_error = True
+        ledger = ledger_in(self)
+        with self.assertRaises(RawCopyError) as caught:
+            self.start(api, ledger)
+        self.assertEqual("jobs_unreadable", caught.exception.error_code)
+        self.assertEqual(0, api.started)
+        self.assertEqual(([], []), (ledger.attempts(), ledger.jobs()))
+
+    def test_a_sync_that_another_operator_starts_between_the_capture_and_the_launch_is_adopted_after_a_lost_reply_as_the_recorded_limit(self) -> None:
+        """The owner-accepted limit of the module (see its docstring): one operator uses the development host, so a job that is absent from the capture is
+        this tool's own."""
+        api = StandIn()
+        api.lost_reply, api.never_arrives = True, True
+        api.during.append((12, 100.0))
+        self.assertEqual(12, self.start(api))
 
     def test_a_lost_reply_whose_lookup_also_fails_leaves_the_attempt_in_the_ledger_and_is_refused(self) -> None:
         api = StandIn()
@@ -332,6 +378,52 @@ class WaitTest(unittest.TestCase):
         self.assertEqual([], [line for line in api.log if line.startswith(("cancel_job", "job_status"))])
 
 
+class OwnershipBudgetTest(unittest.TestCase):
+    """The ownership reads of ``wait`` and ``cancel`` spend the budget of the operation: each read gets only the time that is left, and none is sent."""
+
+    def owned(self) -> JobLedger:
+        ledger = ledger_in(self)
+        keep(ledger, 7, CONNECTION)
+        return ledger
+
+    def test_each_ownership_read_is_given_the_time_that_is_left_of_the_deadline(self) -> None:
+        clock = FakeClock()
+        api = StandIn()
+        api.clock, api.ownership_takes = clock, 2.0
+        api.statuses[7] = ["succeeded"]
+        wait(api, 7, self.owned(), deadline_seconds=10.0, poll_seconds=5.0, cancel_confirm_seconds=30.0, clock=clock.time, sleep=clock.sleep)
+        self.assertEqual([10.0], api.seen["raw_connection"])
+        self.assertEqual([8.0], api.seen["job_connection"])
+
+    def test_a_wait_whose_budget_is_spent_by_the_first_ownership_read_sends_no_second_read(self) -> None:
+        clock = FakeClock()
+        api = StandIn()
+        api.clock, api.ownership_takes = clock, 5.0
+        with self.assertRaises(RawCopyError) as caught:
+            wait(api, 7, self.owned(), deadline_seconds=0.25, poll_seconds=5.0, cancel_confirm_seconds=30.0, clock=clock.time, sleep=clock.sleep)
+        self.assertEqual("ownership_unconfirmed", caught.exception.error_code)
+        self.assertNotIn("job_connection 7", api.log)
+        self.assertNotIn("cancel_job 7", api.log)
+
+    def test_a_cancel_gives_each_ownership_read_the_time_that_is_left_of_its_confirm_time(self) -> None:
+        clock = FakeClock()
+        api = StandIn()
+        api.clock, api.ownership_takes = clock, 3.0
+        cancel(api, 7, self.owned(), confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
+        self.assertEqual([30.0], api.seen["raw_connection"])
+        self.assertEqual([27.0], api.seen["job_connection"])
+
+    def test_a_cancel_whose_budget_is_spent_by_the_first_ownership_read_sends_no_second_read_and_cancels_nothing(self) -> None:
+        clock = FakeClock()
+        api = StandIn()
+        api.clock, api.ownership_takes = clock, 40.0
+        with self.assertRaises(RawCopyError) as caught:
+            cancel(api, 7, self.owned(), confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
+        self.assertEqual("ownership_unconfirmed", caught.exception.error_code)
+        self.assertNotIn("job_connection 7", api.log)
+        self.assertNotIn("cancel_job 7", api.log)
+
+
 class CancelTest(unittest.TestCase):
     def cancel(self, api: StandIn, ledger: JobLedger | None = None) -> str:
         clock = FakeClock()
@@ -425,6 +517,16 @@ class CancelOwnedTest(unittest.TestCase):
         self.assertIn("cancel_job 7", api.log)
         self.assertEqual(([], [7]), (ledger.attempts(), ledger.jobs()))
 
+    def test_a_job_made_in_the_fractional_second_of_the_attempt_is_found_by_the_cleanup_and_cancelled_and_never_left_active(self) -> None:
+        api = StandIn()
+        api.created.append((7, 100.0))
+        ledger = ledger_in(self)
+        ledger.begin(CONNECTION, 100.7, ())
+        found = self.cleanup(api, ledger, now=100.7 + raw_copy.ATTEMPT_SETTLE_SECONDS + 1)
+        self.assertEqual({"jobs": 1, "still_active": 0, "unresolved": 0}, found)
+        self.assertIn("cancel_job 7", api.log)
+        self.assertEqual(([], [7]), (ledger.attempts(), ledger.jobs()))
+
     def test_an_attempt_with_no_job_is_unresolved_until_it_has_settled_and_then_it_is_dropped(self) -> None:
         api = StandIn()
         ledger = ledger_in(self)
@@ -478,6 +580,45 @@ class CancelOwnedTest(unittest.TestCase):
         self.assertEqual(CONNECTION, JobLedger(ledger.directory).connection_of(39))
 
 
+class LedgerFormatTest(unittest.TestCase):
+    """A ledger that an earlier build wrote (``raw_copy_jobs_1``: one row for each job, no attempt) is still the ledger of its jobs."""
+
+    def first_format(self, rows: list[Any]) -> JobLedger:
+        ledger = ledger_in(self)
+        ledger.directory.mkdir(parents=True, exist_ok=True)
+        ledger.path.write_text(json.dumps({"format": "raw_copy_jobs_1", "jobs": rows}))
+        return ledger
+
+    def test_the_rows_of_the_first_format_are_read_as_resolved_jobs(self) -> None:
+        ledger = self.first_format([{"job": 3, "connection_id": CONNECTION}, {"job": 4, "connection_id": "connection_2"}])
+        self.assertEqual([3, 4], ledger.jobs())
+        self.assertEqual((CONNECTION, "connection_2", None), (ledger.connection_of(3), ledger.connection_of(4), ledger.connection_of(5)))
+        self.assertEqual([], ledger.attempts())
+
+    def test_the_cleanup_cancels_a_job_of_a_ledger_of_the_first_format(self) -> None:
+        api = StandIn()
+        api.statuses[3] = ["running"]
+        clock = FakeClock()
+        found = cancel_owned(
+            api, self.first_format([{"job": 3, "connection_id": CONNECTION}]), confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep
+        )
+        self.assertEqual({"jobs": 1, "still_active": 0, "unresolved": 0}, found)
+        self.assertIn("cancel_job 3", api.log)
+
+    def test_the_jobs_of_the_first_format_are_kept_when_the_ledger_is_written_in_the_second(self) -> None:
+        ledger = self.first_format([{"job": 3, "connection_id": CONNECTION}])
+        keep(ledger, 8, CONNECTION)
+        self.assertEqual("raw_copy_jobs_2", json.loads(ledger.path.read_text())["format"])
+        self.assertEqual([3, 8], ledger.jobs())
+        self.assertEqual(CONNECTION, JobLedger(ledger.directory).connection_of(3))
+
+    def test_a_row_of_the_first_format_of_another_shape_is_an_unreadable_state(self) -> None:
+        for rows in ([{"job": "3", "connection_id": CONNECTION}], [{"job": 3}], [{"job": 3, "connection_id": 5}], [3], "x"):
+            with self.subTest(rows=rows), self.assertRaises(RawCopyError) as caught:
+                self.first_format(rows).jobs()  # type: ignore[arg-type]
+            self.assertEqual("state_unreadable", caught.exception.error_code)
+
+
 class RecordTest(unittest.TestCase):
     def test_the_record_holds_exactly_the_closed_facts_and_nothing_else_of_airbyte_s_answer(self) -> None:
         api = StandIn()
@@ -512,10 +653,10 @@ class Fake(HttpRawCopyApi):
         self.sources = sources
         self.calls: list[str] = []
 
-    def workspace_id(self) -> str:
+    def workspace_id(self, *, timeout: float | None = None) -> str:
         return "workspace_1"
 
-    def listing(self, path: str) -> list[dict[str, Any]]:
+    def listing(self, path: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
         self.calls.append(path)
         return self.connections
 
@@ -594,30 +735,82 @@ class ConnectionReadTest(unittest.TestCase):
                 with self.assertRaises(AirbyteError):
                     other.job_connection(7)
 
-    def test_the_jobs_of_the_connection_after_a_time_are_read_from_the_job_list_by_their_own_start_time(self) -> None:
+    def test_the_job_ids_of_the_connection_are_read_from_the_sync_job_list_of_the_connection(self) -> None:
         sync = {"status": "succeeded", "jobType": "sync", "connectionId": CONNECTION}
-        api = Fake(
-            [
-                {"jobId": 5, "startTime": "2026-11-25T09:59:59Z", **sync},
-                {"jobId": 6, "startTime": "2026-11-25T10:00:00Z", **sync},
-                {"jobId": 7, "startTime": "2026-11-25T10:00:05+00:00", **sync},
-            ],
-            {},
-        )
-        since = datetime(2026, 11, 25, 10, 0, 0, tzinfo=UTC).timestamp()
-        self.assertEqual([6, 7], api.jobs_since(CONNECTION, since))
+        api = Fake([{"jobId": 5, **sync}, {"jobId": 6, **sync}], {})
+        self.assertEqual([5, 6], api.job_ids(CONNECTION))
         self.assertTrue(api.calls[0].startswith("/jobs?connectionId=connection_1&jobType=sync"))
-
-    def test_a_job_list_entry_without_a_start_time_as_text_or_of_another_connection_refuses_the_lookup(self) -> None:
-        sync = {"jobId": 7, "status": "running", "jobType": "sync", "connectionId": CONNECTION}
-        for entry in (sync, {**sync, "startTime": 5}, {**sync, "startTime": "yesterday"}, {**sync, "startTime": "2026-11-25T10:00:05", "connectionId": "x"}):
-            with self.subTest(entry=entry), self.assertRaises(AirbyteError):
-                Fake([entry], {}).jobs_since(CONNECTION, 0.0)
 
     def test_the_job_document_is_read_from_the_job_route(self) -> None:
         api = Fake([], {"/jobs/7": {"jobId": 7, "status": "running"}})
         self.assertEqual({"jobId": 7, "status": "running"}, api.job_document(7))
         self.assertEqual(["GET /jobs/7"], api.calls)
+
+
+class BudgetClient(HttpRawCopyApi):
+    """The client whose every call takes a fixed time on a clock of the test and refuses a call that has no time left, as the real call does."""
+
+    def __init__(self, clock: FakeClock, takes: float, answers: dict[str, dict[str, Any]], pages: int = 1) -> None:
+        self.clock = clock
+        self.takes = takes
+        self.answers = answers
+        self.pages = pages
+        self.timeouts: list[float | None] = []
+
+    def workspace_id(self, *, timeout: float | None = None) -> str:
+        return "workspace_1"
+
+    def call(self, method: str, path: str, body: Any = None, *, timeout: float | None = None) -> dict[str, Any]:
+        if timeout is not None and timeout <= 0:
+            raise AirbyteError(f"{method} {path.partition('?')[0]} had no time left in the budget of its operation")
+        self.timeouts.append(timeout)
+        self.clock.now += self.takes
+        route = path.partition("?")[0]
+        if route == "/jobs":
+            offset = int(path.rpartition("offset=")[2])
+            number = offset // 100
+            entry = {"jobId": number + 1, "status": "succeeded", "jobType": "sync", "connectionId": CONNECTION}
+            return {"data": [entry], "next": "more" if number + 1 < self.pages else None}
+        if route == "/connections":
+            return {"data": [{"name": CONNECTION_NAME, "connectionId": CONNECTION, "sourceId": "source_1", "destinationId": "destination_1"}], "next": None}
+        return self.answers[route]
+
+
+class BudgetTest(unittest.TestCase):
+    def client(self, takes: float, pages: int = 1) -> tuple[BudgetClient, FakeClock]:
+        clock = FakeClock()
+        answers = {"/sources/source_1": source_document(list(WANTED)), "/destinations/destination_1": destination_document()}
+        return BudgetClient(clock, takes, answers, pages), clock
+
+    def test_every_page_of_the_job_list_gets_only_the_time_that_is_left_and_no_page_is_asked_for_after_it(self) -> None:
+        api, clock = self.client(4.0, pages=4)
+        with mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock.time), self.assertRaises(AirbyteError):
+            api.job_ids(CONNECTION, timeout=10.0)
+        self.assertEqual([10.0, 6.0, 2.0], api.timeouts)
+
+    def test_the_job_ids_of_a_connection_are_every_sync_job_of_its_list_and_the_list_has_no_time_of_its_own_when_none_is_given(self) -> None:
+        api, clock = self.client(1.0, pages=3)
+        with mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock.time):
+            self.assertEqual([1, 2, 3], api.job_ids(CONNECTION))
+        self.assertEqual([None, None, None], api.timeouts)
+
+    def test_a_job_list_entry_that_is_not_a_sync_of_the_connection_refuses_the_lookup(self) -> None:
+        sync = {"jobId": 7, "status": "running", "jobType": "sync", "connectionId": CONNECTION}
+        for entry in ({**sync, "connectionId": "x"}, {**sync, "jobType": "reset"}, {**sync, "jobId": "7"}):
+            with self.subTest(entry=entry), self.assertRaises(AirbyteError):
+                Fake([entry], {}).job_ids(CONNECTION)
+
+    def test_the_three_reads_of_the_connection_share_one_budget(self) -> None:
+        api, clock = self.client(2.0)
+        with mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock.time):
+            api.raw_connection(timeout=10.0)
+        self.assertEqual([10.0, 8.0, 6.0], api.timeouts)
+
+    def test_a_connection_read_with_no_time_left_before_its_last_read_is_refused_and_does_not_send_it(self) -> None:
+        api, clock = self.client(4.0)
+        with mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock.time), self.assertRaises(AirbyteError):
+            api.raw_connection(timeout=7.0)
+        self.assertEqual([7.0, 3.0], api.timeouts)
 
 
 class CommandTest(unittest.TestCase):
