@@ -8,6 +8,7 @@ Failure modes covered here:
 
 - A host run asks Git for its revision, which fails in a checkout with no history, or names the revision of the working tree and not the manifest's commit.
 - A host checkout with no manifest, or one that is not the fixed shape, names a revision anyway.
+- A placement record that is not in the form that the placement command writes vouches for a file.
 - The pinned Spark image that a host run takes is read from a pin file that differs from the manifest, or from a second read of the file.
 - A run on the owner's computer (not the host) takes its revision from the manifest or its image from the pin file.
 """
@@ -59,36 +60,59 @@ class HostCheckout(unittest.TestCase):
         return {name: hashlib.sha256(text.encode()).hexdigest() for name, text in texts.items()}
 
     def write_manifest(self, files: dict[str, str], commit: str = "a" * 40) -> None:
+        """The source manifest and, as a placement of the same commit leaves it, a placement record with no runner."""
         (self.root / "runner_manifest.json").write_text(json.dumps({"commit": commit, "files": files}))
+        (self.root / "placed_runners.json").write_text(json.dumps({"commit": commit, "files": {}}))
 
     def test_the_revision_is_the_manifests_commit_and_the_digest_names_its_file_list_whatever_the_order(self) -> None:
         self.write_manifest({"b": "2" * 64, "a": "1" * 64}, commit="b" * 40)
-        revision, digest = self.module.checkout_state(self.root, True)
+        revision, digest = self.module.checkout_state(self.root, True, ())
         self.assertEqual("b" * 40, revision)
         self.assertEqual(hashlib.sha256(json.dumps({"a": "1" * 64, "b": "2" * 64}, sort_keys=True).encode()).hexdigest(), digest)
         self.write_manifest({"a": "1" * 64, "b": "2" * 64}, commit="b" * 40)
-        self.assertEqual((revision, digest), self.module.checkout_state(self.root, True))
+        self.assertEqual((revision, digest), self.module.checkout_state(self.root, True, ()))
 
     def test_a_host_checkout_with_no_git_history_gives_a_revision_and_asks_no_process(self) -> None:
         with mock.patch.object(self.module, "recorded_state", side_effect=AssertionError("Git was asked")):
-            self.assertEqual("a" * 40, self.module.checkout_state(self.root, True)[0])
+            self.assertEqual("a" * 40, self.module.checkout_state(self.root, True, ())[0])
 
     def test_a_computer_that_is_not_the_host_asks_git(self) -> None:
         with mock.patch.object(self.module, "recorded_state", return_value=("revision", "digest")) as asked:
-            self.assertEqual(("revision", "digest"), self.module.checkout_state(self.root, False))
+            self.assertEqual(("revision", "digest"), self.module.checkout_state(self.root, False, ()))
         asked.assert_called_once_with(self.root)
 
     def test_a_missing_or_malformed_manifest_refuses(self) -> None:
         (self.root / "runner_manifest.json").unlink()
         with self.assertRaises(self.module.HostCheckoutError):
-            self.module.checkout_state(self.root, True)
+            self.module.checkout_state(self.root, True, ())
         for text in ("not json", "[]", json.dumps({"commit": "short", "files": {"a": "1" * 64}}), json.dumps({"commit": "a" * 40, "files": {}}),
                      json.dumps({"commit": "a" * 40, "files": {"a": "xyz"}}), json.dumps({"commit": "a" * 40, "files": {"../a": "1" * 64}}),
                      json.dumps({"commit": "a" * 40, "files": {"a": "1" * 64}, "extra": 1})):  # fmt: skip
             with self.subTest(text=text[:30]):
                 (self.root / "runner_manifest.json").write_text(text)
                 with self.assertRaises(self.module.HostCheckoutError):
-                    self.module.checkout_state(self.root, True)
+                    self.module.checkout_state(self.root, True, ())
+
+    def test_a_placement_record_of_another_form_vouches_for_no_file(self) -> None:
+        commit, entry = "a" * 40, {"tests/e2e/silver_signals.py": "1" * 64}
+        self.write_manifest({"compose/services/kafka.yml": "1" * 64})
+        documents = {
+            "not json": "{",
+            "not an object": "[]",
+            "an extra key": json.dumps({"commit": commit, "files": entry, "more": 1}),
+            "no commit": json.dumps({"files": entry}),
+            "a short commit": json.dumps({"commit": "a" * 39, "files": entry}),
+            "files that are a list": json.dumps({"commit": commit, "files": []}),
+            "a path outside tests/e2e": json.dumps({"commit": commit, "files": {"compose/services/kafka.yml": "1" * 64}}),
+            "a path with a parent step": json.dumps({"commit": commit, "files": {"tests/e2e/../x.py": "1" * 64}}),
+            "a path in a folder below tests/e2e": json.dumps({"commit": commit, "files": {"tests/e2e/stream_stack/read_lake.py": "1" * 64}}),
+            "a short hash": json.dumps({"commit": commit, "files": {"tests/e2e/silver_signals.py": "1"}}),
+        }
+        for label, text in documents.items():
+            with self.subTest(record=label):
+                (self.root / "placed_runners.json").write_text(text)
+                with self.assertRaisesRegex(self.module.HostCheckoutError, "^the placement record placed_runners.json is not "):
+                    self.module.checkout_state(self.root, True, ())
 
     def test_the_pinned_reference_is_the_one_that_the_compose_stack_renders_from_the_pin_file(self) -> None:
         names = [image["name"] for image in pins.load_images()]
@@ -215,16 +239,17 @@ class EntryPoints(unittest.TestCase):
             with self.subTest(runner=name):
                 source = (E2E / f"{name}.py").read_text()
                 self.assertNotIn("recorded_state(", source)
-                self.assertIn("checkout_state(ROOT, HOST)", source)
+                self.assertIn("checkout_state(ROOT, HOST, RUNNER_FILES)", source)
 
     def test_the_state_of_a_run_on_a_checkout_with_no_history_is_the_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "runner_manifest.json").write_text(json.dumps({"commit": "c" * 40, "files": {"spark/jobs/x.py": "1" * 64}}))
+            (root / "placed_runners.json").write_text(json.dumps({"commit": "c" * 40, "files": {}}))
             for name in ENTRY_POINTS:
                 with self.subTest(runner=name):
                     module = import_runner(name)
-                    self.assertEqual("c" * 40, module.checkout_state(root, True)[0])
+                    self.assertEqual("c" * 40, module.checkout_state(root, True, ())[0])
 
 
 @unittest.skipUnless((E2E / "gold_dimensions.py").is_file() and HELPER.is_file(), "the temporary runners are not in this checkout")

@@ -1,6 +1,9 @@
 """The host batch names its revision and checks its own files from the source manifest that the deploy writes in the checkout root, and uses no Git.
 
-The approved host checkout has no Git history. The deploy writes ``runner_manifest.json`` there: ``{"commit": "<40 hex>", "files": {"<path>": "<sha256>"}}``.
+The approved host checkout has no Git history. The deploy writes ``runner_manifest.json`` there: ``{"commit": "<40 hex>", "files": {"<path>": "<sha256>"}}``,
+for the tracked files; the Git-ignored runner files are in the placement record. ``tests/fast/test_runner_host_records.py`` runs the start of the run against
+both records as the host holds them. The cases here give the map of placed files to the checks directly, because it holds the probe folder, which the placement
+command cannot send today.
 The runners are untracked, so the tests run only where they are on disk. Nothing starts.
 
 Failure modes covered here:
@@ -72,7 +75,11 @@ class SourceCase(unittest.TestCase):
         (self.root / "runner_manifest.json").write_text(json.dumps(document))
 
     def good(self) -> dict[str, Any]:
-        document = {"commit": COMMIT, "files": self.checkout()}
+        """A checkout that equals its two records: the manifest's document, which is returned and written, and the placed files in ``self.placed``."""
+        files = self.checkout()
+        tracked = import_runner("host_checkout").TRACKED_E2E
+        self.placed = {name: value for name, value in files.items() if name.startswith("tests/e2e/") and name not in tracked}
+        document = {"commit": COMMIT, "files": {name: value for name, value in files.items() if name not in self.placed}}
         self.write_manifest(document)
         return document
 
@@ -120,13 +127,13 @@ class ReadManifest(SourceCase):
         self.assertEqual(64, len(tree))
         again = self.host.SourceManifest(COMMIT, dict(reversed(list(manifest.files.items()))))
         self.assertEqual(tree, self.host.source_state(again)[1])
-        other = self.host.SourceManifest(COMMIT, {**manifest.files, "tests/e2e/stream_host.py": "f" * 64})
+        other = self.host.SourceManifest(COMMIT, {**manifest.files, "features/batch.py": "f" * 64})
         self.assertNotEqual(tree, self.host.source_state(other)[1])
 
 
 class RunnerFiles(SourceCase):
     def problems(self) -> list[str]:
-        return list(self.host.source_problems(self.host.read_source_manifest(self.root), self.root))
+        return list(self.host.source_problems(self.host.read_source_manifest(self.root), self.placed, self.root))
 
     def test_a_checkout_that_equals_its_manifest_has_no_problem(self) -> None:
         self.good()
@@ -140,11 +147,10 @@ class RunnerFiles(SourceCase):
         self.assertIn("tests/e2e/stream_host.py", found[0])
 
     def test_a_runner_file_with_no_entry_or_no_file_is_named(self) -> None:
-        document = self.good()
-        del document["files"]["tests/e2e/stream_features.py"]
-        self.write_manifest(document)
+        self.good()
+        del self.placed["tests/e2e/stream_features.py"]
         self.assertTrue(any("stream_features.py" in item and "no entry" in item for item in self.problems()))
-        document = self.good()
+        self.good()
         (self.root / "tests/e2e/stack_replay.py").unlink()
         self.assertTrue(any("stack_replay.py" in item and "missing" in item for item in self.problems()))
 
@@ -176,10 +182,9 @@ class RunnerFiles(SourceCase):
         self.assertTrue(any("read_lake.py" in item and "missing" in item for item in self.problems()), self.problems())
 
     def test_a_required_probe_that_is_gone_from_the_checkout_and_the_manifest_is_still_named(self) -> None:
-        document = self.good()
+        self.good()
         (self.root / "tests/e2e/stream_stack/read_lake.py").unlink()
-        del document["files"]["tests/e2e/stream_stack/read_lake.py"]
-        self.write_manifest(document)
+        del self.placed["tests/e2e/stream_stack/read_lake.py"]
         self.assertTrue(any("read_lake.py" in item for item in self.problems()), self.problems())
 
     def test_a_feature_file_that_is_changed_is_named(self) -> None:
@@ -203,7 +208,7 @@ class RunnerFiles(SourceCase):
     def test_a_manifest_entry_of_the_probe_or_feature_folders_with_no_file_is_named_as_missing(self) -> None:
         document = self.good()
         document["files"]["features/gone.py"] = "0" * 64
-        document["files"]["tests/e2e/stream_stack/gone_probe.py"] = "0" * 64
+        self.placed["tests/e2e/stream_stack/gone_probe.py"] = "0" * 64
         self.write_manifest(document)
         found = self.problems()
         self.assertTrue(any("features/gone.py" in item and "missing" in item for item in found), found)
@@ -233,12 +238,13 @@ class Staging(SourceCase):
             mock.patch.object(self.host, "build_landed_copy", landed_copy),
         ):
             work.mkdir()
-            staged: tuple[Path, Path, Path, Path] = self.host.prepare_folders(work, {}, manifest, self.root)
+            staged: tuple[Path, Path, Path, Path] = self.host.prepare_folders(work, {}, manifest, self.placed, self.root)
         self.assertEqual(landed, staged[0])
         return staged
 
     def test_files_that_equal_the_manifest_are_staged_with_the_bytes_that_it_lists(self) -> None:
-        files = self.good()["files"]
+        document = self.good()
+        files = document["files"] | self.placed
         _, _, probe, features = self.stage(self.root / "work")
         for folder, prefix in ((probe, "tests/e2e/stream_stack/"), (features, "features/")):
             for path in folder.glob("*.py"):
@@ -263,7 +269,7 @@ class Staging(SourceCase):
     def test_the_run_checks_the_manifest_before_it_downloads_and_the_staging_checks_it_again(self) -> None:
         source = inspect.getsource(self.host.run_batch)
         self.assertLess(source.index("source_problems("), source.index("fill_landed_cache("))
-        self.assertTrue("prepare_folders(work, paths, manifest_of_source)" in source, "run_batch does not give the manifest to the staging")
+        self.assertTrue("prepare_folders(work, paths, manifest_of_source, placed_of_source)" in source, "run_batch does not give the manifest to the staging")
 
 
 class DeployedFiles(SourceCase):
