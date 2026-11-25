@@ -30,6 +30,7 @@ from scripts.project_config import ROOT
 from tests.e2e.run_record import Record
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
+WARNING = "Warning: Permanently added '100.64.0.9' (ED25519) to the list of known hosts.\n"
 HOST_MODES = {
     "bootstrap": "400 100:1000",
     "nessie": "400 10000:10001",
@@ -183,9 +184,20 @@ class NessieStatAnswers(unittest.TestCase):
     """The Nessie runner shows the owner, the group and the mode as numbers, or says unreadable."""
 
     def stack(self, module: ModuleType, process: tuple[int, str], stat: tuple[int, str]) -> tuple[object, Record]:
+        """A stack whose ``run`` and ``compose_run`` answer with the SSH warning after the answer, as the live host's merged output did, and whose ``read`` and
+        ``compose_out`` answer with standard output alone."""
         record = Record(feature="x", slug="x", rerun="x")
-        target = SimpleNamespace(secrets_directory="/opt/platform/secrets", read=lambda args, **_: stat)
-        stack = SimpleNamespace(record=record, target=target, compose_out=lambda *args, **_: process)
+        target = SimpleNamespace(
+            secrets_directory="/opt/platform/secrets",
+            read=lambda args, **_: stat,
+            run=lambda args, **_: (stat[0], stat[1] + WARNING),
+        )
+        stack = SimpleNamespace(
+            record=record,
+            target=target,
+            compose_out=lambda *args, **_: process,
+            compose_run=lambda *args, **_: (process[0], process[1] + WARNING),
+        )
         return stack, record
 
     def cases(self, process: tuple[int, str], stat: tuple[int, str]) -> dict[str, tuple[bool, str]]:
@@ -199,6 +211,12 @@ class NessieStatAnswers(unittest.TestCase):
     def test_the_answers_of_the_host_pass(self) -> None:
         cases = self.cases((0, "10000\n10001\n10000\n"), (0, "10000:10001:400\n"))
         self.assertTrue(all(passed for passed, _ in cases.values()), cases)
+
+    def test_a_warning_on_the_merged_output_is_not_part_of_an_answer(self) -> None:
+        for name, (passed, observed) in self.cases((0, "10000\n10001\n10000\n"), (0, "10000:10001:400\n")).items():
+            with self.subTest(case=name):
+                self.assertTrue(passed, observed)
+                self.assertNotIn("Warning", observed)
 
     def test_a_wrong_owner_fails_and_shows_the_numbers(self) -> None:
         cases = self.cases((0, "10000\n10001\n10000\n"), (0, "0:0:400\n"))

@@ -10,12 +10,78 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, overload
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_PAYLOAD_CLASS = 3
 PASSED_END = "the result is verified and its work is pushed to hosted CI"
 FAILED_END = "the failure is fixed and the fix is pushed to hosted CI"
 BLOCKED_PREFIX = "blocked: "
+
+
+class Unread:
+    """A read that failed. It is never equal to anything, itself included, and it is false, so a failed read is no answer: two failed reads are not
+    "unchanged", a failed listing is not "none left" and a failed scan is not "nothing found". ``reason`` holds the exit code or the kind of error and never
+    any of the output."""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return f"unread ({self.reason})"
+
+    __repr__ = __str__
+
+
+@overload
+def parsed(code: int, output: str) -> str | Unread: ...
+
+
+@overload
+def parsed[T](code: int, output: str, parse: Callable[[str], T]) -> T | Unread: ...
+
+
+def parsed(code: int, output: str, parse: Callable[[str], Any] = str) -> Any:
+    """The stripped standard output of a read, through ``parse``, when the command exited 0 and printed something that parses, else an ``Unread``."""
+    if code != 0:
+        return Unread(f"exit {code}")
+    text = output.strip()
+    if not text:
+        return Unread("empty")
+    try:
+        return parse(text)
+    except (ValueError, KeyError, TypeError, IndexError, StopIteration) as error:
+        return Unread(type(error).__name__)
+
+
+def listed_words(code: int, output: str) -> list[str] | Unread:
+    """The words of a listing that exited 0 (an empty list when it printed none), else an ``Unread``: a listing that failed is not an empty one."""
+    return output.split() if code == 0 else Unread(f"exit {code}")
+
+
+def readable(value: object) -> bool:
+    """True when ``value`` is a read that succeeded: not a failure, not empty, and for a table or a collection of reads none of its items is one either."""
+    if isinstance(value, dict):
+        return bool(value) and all(readable(item) for item in value.values())
+    if isinstance(value, (set, frozenset, list, tuple)):
+        return bool(value) and all(readable(item) for item in value)
+    return not isinstance(value, Unread) and value is not None and value != ""
+
+
+def unchanged(before: object, after: object) -> bool:
+    """True only when both reads succeeded and are equal. A read that failed, on either side or on both, is never "unchanged"."""
+    return readable(before) and readable(after) and before == after
 
 
 @dataclass

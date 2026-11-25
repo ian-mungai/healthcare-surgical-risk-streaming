@@ -25,7 +25,9 @@ Failure modes covered here:
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib
+import json
 import re
 import unittest
 from collections.abc import Callable
@@ -291,6 +293,15 @@ class DeadlineLine(unittest.TestCase):
         self.assertNotIn("did not finish within", (E2E / "catalog_proof.py").read_text())
 
 
+def rendered_config(trino: str | None, spark: str | None) -> str:
+    """The standard output of ``docker compose config --format json``: the WAREHOUSE_LOCATION of each engine's service, or none when its value is None."""
+    services = {
+        name: {"environment": {"WAREHOUSE_LOCATION": value, "AWS_REGION": "us-east-1"} if value is not None else {"AWS_REGION": "us-east-1"}}
+        for name, value in (("trino", trino), ("spark", spark))
+    }
+    return json.dumps({"name": "p", "services": services})
+
+
 DENIED_LIST = "An error occurred (AccessDenied) when calling the ListObjectsV2 operation: User is not authorized to perform: s3:ListBucket\n"
 DENIED_PUT = "An error occurred (AccessDenied) when calling the PutObject operation: User is not authorized to perform: s3:PutObject\n"
 PARAMETER = "aws: [ERROR]: An error occurred (ParamValidation): Error parsing parameter '--body': Blob values must be a path to a file.\n"
@@ -299,15 +310,14 @@ PARAMETER = "aws: [ERROR]: An error occurred (ParamValidation): Error parsing pa
 class AwsOfTheHost:
     """The AWS CLI image as the host ran it: ``--body /dev/null`` is refused with exit 252, and a write from the Trino role is refused with AccessDenied.
 
-    Each answer is ``(exit code, stdout, stderr)``: the CLI writes its errors to stderr, and ssh adds ``warning`` to the stderr of every call. ``leftover``
-    puts an object at the probe key of the run before the write. ``calls`` holds what each call asked for, with the workload whose folder it mounted.
+    Each answer is ``(exit code, stdout, stderr)``: the CLI writes its errors to stderr, and ssh adds ``warning`` to the stderr of every call. ``bucket``
+    holds the keys that exist, and a test adds the probe key of the run to it before the write. ``calls`` holds what each call asked for, with the workload
+    whose folder it mounted.
     """
 
-    def __init__(
-        self, *, accept_write: bool = False, leftover: str = "", state_error: str = DENIED_LIST, write_error: str = DENIED_PUT, warning: str = ""
-    ) -> None:
+    def __init__(self, *, accept_write: bool = False, state_error: str = DENIED_LIST, write_error: str = DENIED_PUT, warning: str = "") -> None:
         self.accept_write = accept_write
-        self.bucket = {leftover} if leftover else set()
+        self.bucket: set[str] = set()
         self.state_error = state_error
         self.write_error = write_error
         self.warning = warning
@@ -577,7 +587,7 @@ class FailingSeed(unittest.TestCase):
                 return 0, ""
 
             def compose_out(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
-                return 0, "the warehouse is at s3://wh/"
+                return 0, rendered_config("s3://wh/", "s3://wh/")
 
         with (
             mock.patch.multiple(
@@ -656,6 +666,120 @@ class FailingSeed(unittest.TestCase):
             "trunk": next(node.lineno for node in ast.walk(host) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "start_private_trunk"),
         }
         self.assertLess(lines["start"], lines["trunk"])
+
+
+class WarehouseSettings(unittest.TestCase):
+    """The host mode reads the warehouse location that Compose renders for Trino and for Spark, from a read that succeeded, and compares both."""
+
+    def locations(self, code: int, output: str) -> Any:
+        module = runner()
+        calls: list[tuple[str, ...]] = []
+
+        def compose_out(*arguments: str, timeout: float = 0) -> tuple[int, str]:
+            calls.append(arguments)
+            return code, output
+
+        found = module.engine_locations(SimpleNamespace(compose_out=compose_out))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ("--profile", "batch"))
+        self.assertIn("config", calls[0])
+        return found
+
+    def test_the_settings_of_both_engines_are_read_from_a_read_that_exited_0(self) -> None:
+        self.assertEqual(self.locations(0, rendered_config("s3://a/", "s3://b/")), {"trino": "s3://a/", "spark": "s3://b/"})
+
+    def test_a_read_that_failed_is_a_failure_whatever_it_printed(self) -> None:
+        unread = runner().Unread
+        for code in (1, 255):
+            with self.subTest(code=code):
+                self.assertIsInstance(self.locations(code, rendered_config("s3://wh/", "s3://wh/")), unread)
+
+    def test_an_empty_or_unparseable_or_incomplete_document_is_a_failure(self) -> None:
+        unread = runner().Unread
+        for text in ("", "not json", "[]", "{}", '{"services": {}}', rendered_config(None, "s3://wh/"), rendered_config("s3://wh/", None), '{"services": 1}'):
+            with self.subTest(text=text):
+                self.assertIsInstance(self.locations(0, text), unread)
+
+    def run_host(self, trino: str | None, spark: str | None, code: int = 0, text: str | None = None) -> Record:
+        module = runner()
+        run = record()
+
+        class HostStack(Stack):
+            def health(self, service: str) -> str:
+                return "healthy"
+
+            def docker(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+                return 0, ""
+
+            def compose_out(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+                return code, rendered_config(trino, spark) if text is None else text
+
+        class Refusing(HostNessie):
+            def reference(self, name: str, *args: Any, **keywords: Any) -> Any:
+                raise NessieError("stop after the setup case")
+
+        with (
+            mock.patch.multiple(
+                module,
+                Remote=lambda: SimpleNamespace(remove_file=lambda path: None),
+                Stack=lambda target, rec, lg: HostStack(),
+                load_configuration=lambda: {"S3_BUCKET": BUCKET},
+                configured_warehouse_location=lambda: "s3://wh/",
+                ExecNessie=lambda stack: Refusing(),
+                ExecTrino=lambda stack: HostTrino(),
+            ),
+            contextlib.suppress(NessieError),
+        ):
+            module.run_host(run, [])
+        return run
+
+    def test_both_engines_on_the_project_location_pass_the_setup_case(self) -> None:
+        run = self.run_host("s3://wh/", "s3://wh/")
+        self.assertEqual(failed(run), [])
+
+    def test_a_read_that_failed_fails_the_setup_case_although_it_printed_the_location(self) -> None:
+        run = self.run_host("s3://wh/", "s3://wh/", code=255)
+        self.assertEqual(failed(run), ["deployed stack"])
+
+    def test_an_engine_on_another_location_fails_the_setup_case(self) -> None:
+        for trino, spark in (("s3://wh/", "s3://other/"), ("s3://other/", "s3://wh/"), ("s3://wh/", "s3://wh"), ("s3://wh/", "")):
+            with self.subTest(trino=trino, spark=spark):
+                self.assertEqual(failed(self.run_host(trino, spark)), ["deployed stack"])
+
+    def test_an_engine_with_no_setting_fails_the_setup_case_although_the_location_is_in_the_text(self) -> None:
+        self.assertEqual(failed(self.run_host("s3://wh/", None)), ["deployed stack"])
+        text = json.dumps({"services": {"trino": {"environment": {"WAREHOUSE_LOCATION": "s3://wh/"}}, "spark": {"labels": {"x": "s3://wh/"}}}})
+        self.assertEqual(failed(self.run_host("s3://wh/", "s3://wh/", text=text)), ["deployed stack"])
+
+    def test_the_observation_shows_flags_and_no_location(self) -> None:
+        run = self.run_host("s3://wh/", "s3://other/")
+        observed = observation(run, "deployed stack").observed
+        self.assertNotIn("s3://", observed)
+        self.assertNotIn("other", observed)
+
+    def test_running_services_that_cannot_be_listed_is_a_failure_and_not_none_running(self) -> None:
+        module = runner()
+        unread = module.Unread
+        for code, out in ((1, ""), (255, "postgres\n")):
+            with self.subTest(code=code):
+                stack = SimpleNamespace(compose=["docker", "compose"], target=SimpleNamespace(run=lambda *a, code=code, out=out, **k: (code, out, "")))
+                self.assertIsInstance(module.running_services(stack), unread)
+        stack = SimpleNamespace(compose=["docker", "compose"], target=SimpleNamespace(run=lambda *a, **k: (0, "postgres\nnessie\n", "")))
+        self.assertEqual(module.running_services(stack), {"postgres", "nessie"})
+        stack = SimpleNamespace(compose=["docker", "compose"], target=SimpleNamespace(run=lambda *a, **k: (0, "", "")))
+        self.assertEqual(module.running_services(stack), set())
+
+    def test_the_spark_job_is_stopped_only_when_the_listing_succeeded_and_does_not_name_it(self) -> None:
+        module = runner()
+
+        def stack(code: int, out: str) -> Any:
+            return SimpleNamespace(compose=["docker", "compose"], target=SimpleNamespace(run=lambda *a, **k: (code, out, "")))
+
+        self.assertTrue(module.spark_stopped(stack(0, "postgres\nnessie\n")))
+        self.assertTrue(module.spark_stopped(stack(0, "")))
+        self.assertFalse(module.spark_stopped(stack(0, "postgres\nspark\n")))
+        self.assertFalse(module.spark_stopped(stack(1, "")))
+        self.assertFalse(module.spark_stopped(stack(255, "postgres\n")))
 
 
 if __name__ == "__main__":
