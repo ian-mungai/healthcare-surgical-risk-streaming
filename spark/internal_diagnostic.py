@@ -43,7 +43,7 @@ import os
 import re
 import sys
 import types
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import cast
 
 from spark.internal_classes import LIBRARY_CLASSES, NAME_LIMIT, PATH_LIMIT, PROJECT_CLASSES, PYSPARK_CLASSES, PYSPARK_MODULE
@@ -81,6 +81,7 @@ _FUNCTION_CODE = types.FunctionType.__dict__["__code__"]
 _FUNCTION_CLOSURE = types.FunctionType.__dict__["__closure__"]
 _CELL_CONTENTS = types.CellType.__dict__["cell_contents"]
 _CACHED = type(functools.cache(len))  # the type of a function that ``functools.cache`` or ``lru_cache`` wraps
+_CACHED_DICT = _CACHED.__dict__["__dict__"]
 
 
 def mro_of(kind: type) -> tuple[type, ...]:
@@ -164,52 +165,72 @@ def loaded_modules() -> list[types.ModuleType]:
     return [module for module in found if type(module) is types.ModuleType]
 
 
-def add_code(code: types.CodeType, held: dict[int, types.CodeType]) -> None:
-    """Put ``code`` and the code objects in its constants (nested functions, lambdas, generator expressions) into ``held``."""
-    stack = [code]
-    while stack:
-        current = stack.pop()
-        held[id(current)] = current
-        stack.extend(item for item in current.co_consts if type(item) is types.CodeType)
+def exact_tuple(value: object) -> tuple[object, ...]:
+    """``value`` when it is an exact ``tuple``, else an empty tuple. A tuple subclass (in ``co_consts`` or ``__closure__``) is never iterated or truth-tested,
+    because its ``__iter__``, ``__len__`` and ``__bool__`` are code of an object: what it holds is skipped, so a frame that it would hold is ``other``."""
+    return value if type(value) is tuple else ()
+
+
+def wrapped_of(cached: object) -> object:
+    """The function that a cached function wraps: the value of the key ``__wrapped__`` in its dictionary, found by a scan for an exact ``str`` key. A lookup by
+    key would run the ``__eq__`` of a key of another type that has the same hash, and would take a ``str`` subclass."""
+    namespace = _CACHED_DICT.__get__(cached)
+    if type(namespace) is not dict:
+        return None
+    for key, value in dict.items(namespace):
+        if type(key) is str and key == "__wrapped__":
+            return value
+    return None
+
+
+def _contents(cell: object) -> object:
+    """The value of a closure cell, or none when the cell is empty or is not a cell."""
+    if type(cell) is not types.CellType:
+        return None
+    try:
+        return _CELL_CONTENTS.__get__(cell)
+    except ValueError:
+        return None
 
 
 def held_code() -> dict[int, types.CodeType]:
     """The code objects that the loaded project modules hold, by ``id``: the functions of the namespace of each module and of its classes (methods, static
     and class methods, properties), the functions that a cached function or a closure wraps, and the code nested in each. A new code object (``compile``,
     ``replace`` or ``types.CodeType``: what PySpark makes for a rebuilt frame) is never in it, because only code that a module reaches is. The walk reads each
-    type from its slot and runs no code of an object. It stops after ``REGISTRY_LIMIT`` objects, and a frame that it has not found is ``other``."""
+    type from its slot, iterates only exact tuples and dictionaries and runs no code of an object. One budget of ``REGISTRY_LIMIT`` is charged for each entry
+    that the walk takes (a namespace entry, a function, a code object, a constant, a cell), and every namespace and tuple is read lazily, one entry at a time,
+    so a long walk stops after that many entries and the frames that it has not found are ``other``."""
     held: dict[int, types.CodeType] = {}
     seen: set[int] = set()
-    pending: list[object] = [item for module in loaded_modules() for item in module.__dict__.values()]
+    stack: list[Iterator[object]] = [iter(dict.values(module.__dict__)) for module in loaded_modules()]
     budget = REGISTRY_LIMIT
-    while pending and budget > 0:
-        item = pending.pop()
+    while stack and budget > 0:
+        try:
+            item = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        budget -= 1
         if id(item) in seen:
             continue
         seen.add(id(item))
-        budget -= 1
         kind = type(item)
-        if kind is types.FunctionType:
-            add_code(_FUNCTION_CODE.__get__(item), held)
-            closure = _FUNCTION_CLOSURE.__get__(item)
-            pending.extend(_contents(cell) for cell in closure or ())
+        if kind is types.CodeType:
+            code = cast(types.CodeType, item)
+            held[id(code)] = code
+            stack.append(iter(exact_tuple(code.co_consts)))
+        elif kind is types.FunctionType:
+            stack.append(iter((_FUNCTION_CODE.__get__(item),)))
+            stack.append(map(_contents, exact_tuple(_FUNCTION_CLOSURE.__get__(item))))
         elif kind is staticmethod or kind is classmethod:
-            pending.append(item.__func__)  # type: ignore[attr-defined]
+            stack.append(iter((item.__func__,)))  # type: ignore[attr-defined]
         elif kind is property:
-            pending.extend((item.fget, item.fset, item.fdel))  # type: ignore[attr-defined]
+            stack.append(iter((item.fget, item.fset, item.fdel)))  # type: ignore[attr-defined]
         elif kind is _CACHED:
-            pending.append(item.__wrapped__)  # type: ignore[attr-defined]
+            stack.append(iter((wrapped_of(item),)))
         elif is_class(item):
-            pending.extend(_CLASS_DICT.__get__(item).values())
+            stack.append(iter(_CLASS_DICT.__get__(item).values()))
     return held
-
-
-def _contents(cell: object) -> object:
-    """The value of a closure cell, or none when the cell is empty."""
-    try:
-        return _CELL_CONTENTS.__get__(cell)
-    except ValueError:
-        return None
 
 
 def is_held(code: object, held: dict[int, types.CodeType]) -> bool:
@@ -254,7 +275,7 @@ def internal_error_line(error: BaseException) -> str:
     """The diagnostic line (without the job name) of an error that ended a sealed job. It never raises."""
     try:
         return f"internal_error class={' <- '.join(class_chain(error))} frames={' | '.join(frames_of(error))}"
-    except Exception:
+    except BaseException:  # noqa: BLE001 (nothing that the walk raises, a SystemExit included, may change the exit code of the job)
         return UNAVAILABLE_LINE
 
 
