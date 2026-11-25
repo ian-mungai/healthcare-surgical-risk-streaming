@@ -11,13 +11,14 @@ Failure modes covered here (the runner itself is untracked, so these tests skip 
 from __future__ import annotations
 
 import ast
-import importlib
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
+
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "signal_profile.py"
@@ -43,7 +44,7 @@ def log_of(*entries: dict[str, Any]) -> dict[str, Any]:
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class HistoryReader(unittest.TestCase):
     def setUp(self) -> None:
-        self.module = importlib.import_module("tests.e2e.signal_profile")
+        self.module = import_runner("signal_profile")
 
     def test_the_reader_keeps_the_type_and_the_key_of_each_operation_newest_first(self) -> None:
         log = log_of(entry("2", operation("PUT")), entry("1", operation("DELETE"), operation("PUT", OTHER)), entry(PLANTED))
@@ -66,7 +67,7 @@ class HistoryReader(unittest.TestCase):
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class MigrationCheck(unittest.TestCase):
     def setUp(self) -> None:
-        self.module = importlib.import_module("tests.e2e.signal_profile")
+        self.module = import_runner("signal_profile")
 
     def check(
         self, commits: list[list[tuple[str, tuple[str, ...]]]], *, planted_before: str = PLANTED, planted_now: str = PLANTED, built_base: str = PLANTED
@@ -201,7 +202,7 @@ class MigrationCaseRun(unittest.TestCase):
     """``schema_cases`` is run with a stub stack, Nessie and record, so the verdict of the migration case is read from what it records."""
 
     def setUp(self) -> None:
-        self.module = importlib.import_module("tests.e2e.signal_profile")
+        self.module = import_runner("signal_profile")
 
     def verdict(self, build: dict[str, Any]) -> bool:
         record = FakeRecord()
@@ -232,7 +233,7 @@ class MigrationCaseRun(unittest.TestCase):
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class OracleCaseNumber(unittest.TestCase):
     def setUp(self) -> None:
-        self.module = importlib.import_module("tests.e2e.signal_profile")
+        self.module = import_runner("signal_profile")
         tree = ast.parse(self.module.STAND_IN)
         self.dump = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "dump")
         helper = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "grid_by_case")

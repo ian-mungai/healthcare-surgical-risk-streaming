@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import importlib
 import io
 import json
 import tempfile
@@ -32,6 +31,7 @@ from tests.e2e import run_record
 from tests.e2e.run_record import Record
 from tests.fast import test_silver_acceptance as accept
 from tests.fast.outcome_accept import CASES_SNAPSHOT_TABLES
+from tests.fast.runner_import import import_runner
 from tests.fast.sealed_record import Sealed, sealed_observed
 from tests.fast.silver_accept import Catalog
 from tests.fast.test_runner_catalog_facts import FakeNessie as TaggedNessie
@@ -43,9 +43,7 @@ MARKERS = ("60917", "77123", "SECRET_4417", "4417")
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def texts(run: Any) -> str:

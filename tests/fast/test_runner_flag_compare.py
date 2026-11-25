@@ -34,7 +34,6 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
-import importlib
 import io
 import json
 import sys
@@ -46,6 +45,7 @@ from typing import Any
 from spark.split_table import COLUMNS, RULE_VERSION, SplitRow, build_assignments
 from tests.e2e.run_record import Record
 from tests.fast.fake_spark import Functions, Session
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 NAMES = ("cases_with_arterial_waveform", "tracks")
@@ -65,9 +65,7 @@ ALLOWED_NAMES = {"STEPS"}
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def texts(record: Record) -> str:

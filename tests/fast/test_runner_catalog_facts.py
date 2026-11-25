@@ -14,7 +14,6 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import importlib
 import json
 import unittest
 from pathlib import Path
@@ -24,6 +23,7 @@ from typing import Any
 from tests.e2e.run_record import Record
 from tests.fast import test_outcome_acceptance as accept
 from tests.fast.outcome_accept import CASES_SNAPSHOT_TABLES
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 BASE, HEAD, OTHER, CHECKED = "a" * 64, "b" * 64, "c" * 64, "e" * 64
@@ -32,9 +32,7 @@ MERGED = "d" * 64
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 class FakeNessie:

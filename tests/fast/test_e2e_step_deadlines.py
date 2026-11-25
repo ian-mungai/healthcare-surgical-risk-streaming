@@ -16,7 +16,6 @@ the tests of their handling of a timeout run only where a runner is on disk, wit
 from __future__ import annotations
 
 import ast
-import importlib
 import io
 import json
 import shutil
@@ -36,6 +35,7 @@ from scripts.infra.terraform_wrapper import APPLY_TIMEOUT_SECONDS, INIT_TIMEOUT_
 from scripts.process import TimeoutExpired
 from tests.e2e import run_record
 from tests.e2e.run_record import StepTimedOut, command_deadline, timed_command
+from tests.fast.runner_import import import_runner, present
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 MARGIN = 10 * AWS_TIMEOUT_SECONDS
@@ -174,7 +174,7 @@ class TimedCommandTest(unittest.TestCase):
 
 
 def runner(name: str) -> ModuleType | None:
-    return importlib.import_module(f"tests.e2e.{name}") if (REPOSITORY / "tests" / "e2e" / f"{name}.py").is_file() else None
+    return import_runner(name) if present(name) else None
 
 
 CONFIGURATION = {

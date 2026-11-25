@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib
 import json
 import os
 import tempfile
@@ -32,6 +31,7 @@ from unittest import mock
 
 from tests.fast.git_fixture import git_in
 from tests.fast.label_accept import accepted, empty_exit_ok, refusal_ok
+from tests.fast.runner_import import import_runner
 from tests.fast.test_outcome_acceptance import split_run
 from tests.fast.test_silver_acceptance import written
 from tests.fast.test_silver_labels_acceptance import HEAD
@@ -260,9 +260,7 @@ class EveryRunner(unittest.TestCase):
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def place(command: list[str], content: Any) -> str | None:
