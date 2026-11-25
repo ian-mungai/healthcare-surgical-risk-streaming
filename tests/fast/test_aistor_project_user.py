@@ -108,7 +108,7 @@ FIRST_ACTIONS = [
 ]
 OTHER_VALUE = "example-older-password-0123456789abcdef"
 LOST_VALUE = "example-regenerated-password-0123456789abcdef"
-APPROVAL = "AISTOR_REPAIR=1"
+APPROVAL = "--aistor-repair"
 
 
 def raw_error(code: str, status: int) -> Any:

@@ -674,7 +674,9 @@ def main() -> int:
     parser.add_argument("--instance-id", default="", help="check: the EC2 instance ID that the host must answer with")
     parser.add_argument("--confirm", default="", help="up: the confirmation code of the reviewed plan")
     parser.add_argument(
-        "--aistor-repair", action="store_true", help="up: let this one run repair AIStor's accounts with the root pair (make host-up AISTOR_REPAIR=1)"
+        "--aistor-repair",
+        action="store_true",
+        help="up: let this one run repair AIStor's accounts with the root pair (python -m scripts.infra.host up --aistor-repair; make never passes it)",
     )
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()

@@ -3,7 +3,8 @@
 THE ONLY USE OF THE ROOT PAIR, AND ONLY ONCE PER HOST. The owner decided that root credentials are kept in a file, are secured on the disk and are not used
 for the project's work. This module's root calls make the project user, the project policy and the attachment of one to the other, and the read-only audit
 identity of the next paragraph. They run only on the FIRST bootstrap of a host, which ends when a root-only marker file is written on the host
-(``marker_file``), and again only for one run that the owner approved with ``make host-up AISTOR_REPAIR=1``. The launcher gives that approval as the extra
+(``marker_file``), and again only for one run that the owner approved with ``python -m scripts.infra.host up --aistor-repair``.
+The launcher gives that approval as the extra
 variable ``aistor_repair_once`` of that one run, which is the module's ``repair``, and no inventory file holds it. Everything
 else (Terraform, the storage command, the checks, the workloads) signs in as the project user, or through STS, and never as root. After the marker exists, a
 refused sign-in, a missing OpenBao entry or any difference in the live state fails the deploy with a fixed message that names what differs, and changes
@@ -84,7 +85,7 @@ NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
 SIGN_IN_REFUSALS = {"Invalid" + "Access" + "KeyId", "SignatureDoesNotMatch"}
 SIGNED_IN_CODES = {"NoSuchBucket"}
 EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-APPROVAL = "AISTOR_REPAIR=1 on the one run of make host-up"
+APPROVAL = "--aistor-repair on the one run of python -m scripts.infra.host up"
 PUBLISH = "write the project user's sign-in to OpenBao"
 PUBLISH_AUDIT = "write the audit identity's sign-in to OpenBao"
 RECORD = "record the first bootstrap on the host"

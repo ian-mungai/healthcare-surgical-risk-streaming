@@ -708,7 +708,7 @@ class HostUpTest(unittest.TestCase):
         calls["report_aistor_state"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net", "placed")
         calls["place_project_key"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net", "example_project_dev")
         self.assertEqual(
-            calls["run_ansible"].call_args_list[0].args[2] | {"aistor_licence_placement": "placed"},
+            calls["run_ansible"].call_args_list[0].args[2] | {"aistor_licence_placement": "placed", "aistor_repair_once": False},
             calls["run_ansible"].call_args_list[1].args[2],
             "the AIStor playbook gets the placement as a non-secret fact and nothing else more",
         )
@@ -775,22 +775,22 @@ class HostUpTest(unittest.TestCase):
             self.assertEqual(0, host.main())
         self.assertEqual([True, False], seen)
 
-    def test_the_makefile_passes_the_flag_for_host_up_alone_and_only_when_the_run_names_it(self) -> None:
+    def test_make_never_approves_the_aistor_repair_whatever_its_command_line_environment_or_makeflags_hold(self) -> None:
         text = (ROOT / "Makefile").read_text()
-        self.assertEqual(1, text.count("--aistor-repair"))
-        clean = {key: value for key, value in os.environ.items() if key != "AISTOR_REPAIR"}
+        self.assertNotIn("--aistor-repair", text, "the approval is the launcher's own flag, typed on the one command that runs the repair")
+        self.assertNotIn("AISTOR_REPAIR", text)
+        clean = {key: value for key, value in os.environ.items() if key not in {"AISTOR_REPAIR", "MAKEFLAGS", "MAKELEVEL"}}
         cases = [
-            ("command line 1", ["AISTOR_REPAIR=1"], clean, True),
-            ("command line 0", ["AISTOR_REPAIR=0"], clean, False),
-            ("command line yes", ["AISTOR_REPAIR=yes"], clean, False),
-            ("not named", [], clean, False),
-            ("exported 1", [], clean | {"AISTOR_REPAIR": "1"}, False),
+            ("command line 1", ["AISTOR_REPAIR=1"], clean),
+            ("command line words", ["AISTOR_REPAIR=0 1"], clean),
+            ("exported 1", [], clean | {"AISTOR_REPAIR": "1"}),
+            ("makeflags", [], clean | {"MAKEFLAGS": "-- AISTOR_REPAIR=1"}),
         ]
-        for label, words, environment, wanted in cases:
+        for label, words, environment in cases:
             with self.subTest(label):
                 shown = run_command("make", ["-n", "host-up", *words], cwd=ROOT, env=environment, timeout=60)
                 self.assertEqual(0, shown.returncode, shown.stderr)
-                self.assertEqual(wanted, "--aistor-repair" in shown.stdout, shown.stdout)
+                self.assertNotIn("--aistor-repair", shown.stdout)
 
     def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

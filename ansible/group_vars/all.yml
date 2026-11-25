@@ -94,7 +94,7 @@ compose_stack_aistor_bootstrap_marker: "{{ compose_stack_compose_directory }}/ai
 # else, so the audit path is read and written by the admin role of the deploy only, after the sign-in has been verified.
 compose_stack_aistor_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/aistor"
 compose_stack_aistor_audit_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/audit"
-# AIStor's use of the root pair for a repair is no inventory variable: the owner approves it for one run with `make host-up AISTOR_REPAIR=1`, and no later run keeps it.
+# AIStor's use of the root pair for a repair is no inventory variable: the owner approves it for one run with `python -m scripts.infra.host up --aistor-repair`, and no later run keeps it.
 compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.

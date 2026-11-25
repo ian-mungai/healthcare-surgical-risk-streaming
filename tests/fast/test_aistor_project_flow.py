@@ -434,8 +434,9 @@ class OrderTest(unittest.TestCase):
                 self.assertIs(False, evaluate_assertions(guard, compose_stack_aistor_root_repair=value), "any value of it is refused, even false")
         message = guard["ansible.builtin.assert"]["fail_msg"]
         self.assertIn("compose_stack_aistor_root_repair", message)
-        self.assertIn("make host-up", message)
-        self.assertIn("AISTOR_REPAIR=1", message)
+        self.assertIn("scripts.infra.host up", message)
+        self.assertIn("--aistor-repair", message)
+        self.assertNotIn("make host-up", message)
 
     def test_the_marker_is_a_root_only_file_beside_the_state_file_and_the_audit_identity_has_names_and_paths_of_its_own(self) -> None:
         variables = group_variables()
