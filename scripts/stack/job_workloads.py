@@ -11,7 +11,8 @@ and the profile of a job from here and never types them.
   writes nothing.
 - ``gold``: reads Silver and Bronze (``bronze.tracks`` feeds ``dim_track``) and writes the Gold tables.
 - ``stream``: writes the ``feature`` and ``stream`` tables of the streaming job, which no batch job writes. It has no Compose service until the job has one.
-- ``maintenance``: rewrites the files of every table and proves the tags, and deletes nothing. The catalog proof job writes its own namespace and runs here.
+- ``maintenance``: reads every table to prove the tags, rewrites the files of the layer folders (``spark.maintenance.COMPACTED_NAMESPACES``, never
+  ``raw_records``) and deletes nothing. The catalog proof job writes its own namespace and runs here.
 """
 
 from __future__ import annotations

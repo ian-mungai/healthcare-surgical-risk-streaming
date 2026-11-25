@@ -41,19 +41,20 @@ variable "records_writer" {
 }
 
 variable "layer_writers" {
-  description = "The warehouse prefixes that each hold the tables of one lake layer, each with the name of the one workload that may write and delete it. Nessie's catalog puts a table in a folder of the warehouse prefix that is named for its namespace and the table, so the prefix of a layer is the folder of its namespace."
+  description = "The warehouse prefixes that each hold the tables of one lake layer (and the catalog proof's own namespace), each with the name of the one workload that may write and delete it. Nessie's catalog puts a table in a folder of the warehouse prefix that is named for its namespace and the table, so the prefix of a layer is the folder of its namespace."
   type        = map(string)
   default = {
-    "warehouse/bronze"  = "bronze"
-    "warehouse/silver"  = "silver"
-    "warehouse/gold"    = "gold"
-    "warehouse/feature" = "stream"
-    "warehouse/stream"  = "stream"
+    "warehouse/bronze"        = "bronze"
+    "warehouse/silver"        = "silver"
+    "warehouse/gold"          = "gold"
+    "warehouse/feature"       = "stream"
+    "warehouse/stream"        = "stream"
+    "warehouse/catalog_proof" = "maintenance"
   }
 }
 
-variable "warehouse_writer" {
-  description = "Name of the one workload that may write the whole warehouse prefix, which the table maintenance needs to rewrite the files of every layer. It may not delete there."
+variable "compaction_workload" {
+  description = "Name of the one workload that may also write every warehouse layer prefix, which the table maintenance needs to rewrite the files of every layer. It reads the whole warehouse prefix for its tag checks, never deletes, and never writes the whole warehouse prefix or raw_records."
   type        = string
   default     = "maintenance"
 }
@@ -81,8 +82,13 @@ variable "workloads" {
   }
 
   validation {
-    condition     = alltrue([for name, workload in var.workloads : alltrue([for prefix, writer in var.layer_writers : writer == name || length(setintersection(lookup(workload.access, prefix, []), ["write", "delete"])) == 0])])
-    error_message = "Only the workload that layer_writers names for a warehouse layer prefix may write or delete it."
+    condition = alltrue([
+      for name, workload in var.workloads : alltrue([
+        for prefix, writer in var.layer_writers :
+        writer == name || (name == var.compaction_workload && !contains(lookup(workload.access, prefix, []), "delete")) || length(setintersection(lookup(workload.access, prefix, []), ["write", "delete"])) == 0
+      ])
+    ])
+    error_message = "Only the workload that layer_writers names for a warehouse layer prefix may write or delete it, and the compaction workload may also write it, never delete it."
   }
 
   validation {
@@ -91,8 +97,13 @@ variable "workloads" {
   }
 
   validation {
-    condition     = alltrue([for name, workload in var.workloads : name == var.warehouse_writer || !contains(lookup(workload.access, "warehouse", []), "write")])
-    error_message = "Only the workload named in warehouse_writer may write the whole warehouse prefix."
+    condition     = alltrue([for workload in values(var.workloads) : !contains(lookup(workload.access, "warehouse", []), "write")])
+    error_message = "No workload may write the whole warehouse prefix: a role writes the layer prefixes it owns or compacts, so it can never write raw_records."
+  }
+
+  validation {
+    condition     = alltrue([for name, workload in var.workloads : name != var.compaction_workload || !contains(flatten(values(workload.access)), "delete")])
+    error_message = "The compaction workload deletes nothing: the owner decided that maintenance deletes nothing before teardown."
   }
 
   validation {

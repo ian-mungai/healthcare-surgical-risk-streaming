@@ -7,6 +7,10 @@ for each table of the trunk, or for the tables named. Each rewrite writes new fi
 snapshots, and the tags that point to them, still reference them. The job never sets a table property and calls no procedure that deletes a snapshot
 or a file.
 
+The job compacts only the namespaces that its role may write (``COMPACTED_NAMESPACES`` in ``spark/maintenance.py``). The default selection leaves out
+the ``raw_records`` namespace, which the Airbyte load owns, and names the namespaces it left out in ``skipped_namespaces``. A table of another namespace asked
+for by name is refused (``table_not_compactable``). The tag checks still read every table, ``raw_records`` included.
+
 Each run:
 
 1. takes the trunk from Nessie's configuration, which names the default branch (``--trunk`` only asserts it and another branch is refused), and refuses to
@@ -50,6 +54,7 @@ from spark.maintenance import (
     parse,
     public_reads,
     sealed_report,
+    select_tables,
     table_identifier,
 )
 from spark.preconditions import PROPERTY_KEYS, precondition_problems
@@ -152,7 +157,7 @@ def maintain(arguments: Any) -> dict[str, Any]:
     missing = sorted(set(arguments.tables) - set(on_trunk))
     if missing:
         raise RetentionError(f"the tables {', '.join(missing)} are not on {trunk}", code="tables_not_on_trunk")
-    tables = [table_identifier(table) for table in (arguments.tables or on_trunk)]
+    tables, skipped = select_tables([table_identifier(table) for table in arguments.tables], [table_identifier(table) for table in on_trunk])
     tags_before = list_tags(client)
     tagged_before = {tag: table_snapshots(client, tag) for tag in sorted(tags_before)}
     session = build_session(JOB, trunk)
@@ -177,6 +182,7 @@ def maintain(arguments: Any) -> dict[str, Any]:
         "dry_run": arguments.dry_run,
         "tags": sorted(tags_before),
         "tags_added": added,
+        "skipped_namespaces": skipped,
         "checks_run": list(CHECKS_RUN),
         "tables": {table: sealed_report(table, report, dry_run=arguments.dry_run) for table, report in compacted.items()},
         "tagged_reads_before": public_reads(before),

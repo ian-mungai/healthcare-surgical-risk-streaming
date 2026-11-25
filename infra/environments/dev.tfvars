@@ -41,7 +41,15 @@ workloads = {
     }
   }
   maintenance = {
-    access = { warehouse = ["read", "write"] }
+    access = {
+      warehouse                 = ["read"]
+      "warehouse/bronze"        = ["write"]
+      "warehouse/silver"        = ["write"]
+      "warehouse/gold"          = ["write"]
+      "warehouse/feature"       = ["write"]
+      "warehouse/stream"        = ["write"]
+      "warehouse/catalog_proof" = ["write"]
+    }
   }
   trino = {
     access = { warehouse = ["read"] }

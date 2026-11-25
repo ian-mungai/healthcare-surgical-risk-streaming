@@ -18,9 +18,10 @@ from scripts.infra.host import PROJECT_WORKLOAD_GIDS
 TFVARS = Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars"
 # The design's grants: Airbyte lands the copy and reads the publisher; the checksum check reads the copy and writes the manifests; each Spark layer workload
 # reads what its layer is built from and writes its own layer's folder of the warehouse (Bronze also reads the copy and the manifests, and the loaded tables;
-# Silver reads the loaded tables and Bronze; Gold reads Silver and Bronze); the streaming job writes its own two folders; the maintenance job rewrites the files
-# of every layer and deletes nothing; Trino reads the tables; the replay reads the copy and the manifests; the orchestrator's record load reads the copy and
-# the manifests and makes, reads and deletes the versions of its own read copies under records_input.
+# Silver reads the loaded tables and Bronze; Gold reads Silver and Bronze); the streaming job writes its own two folders; the maintenance job reads the whole
+# warehouse for its tag checks and writes the files of every layer and of the catalog proof's namespace, never raw_records, and deletes nothing; Trino reads
+# the tables; the replay reads the copy and the manifests; the orchestrator's record load reads the copy and the manifests and makes, reads and deletes the
+# versions of its own read copies under records_input.
 DECLARED: dict[str, dict[str, Any]] = {
     "airbyte": {"access": {"landing": {"write"}}, "publisher_read": True},
     "ingestion_check": {"access": {"landing": {"read"}, "manifests": {"read", "write"}}, "publisher_read": False},
@@ -42,7 +43,18 @@ DECLARED: dict[str, dict[str, Any]] = {
         "publisher_read": False,
     },
     "stream": {"access": {"warehouse/feature": {"read", "write", "delete"}, "warehouse/stream": {"read", "write", "delete"}}, "publisher_read": False},
-    "maintenance": {"access": {"warehouse": {"read", "write"}}, "publisher_read": False},
+    "maintenance": {
+        "access": {
+            "warehouse": {"read"},
+            "warehouse/bronze": {"write"},
+            "warehouse/silver": {"write"},
+            "warehouse/gold": {"write"},
+            "warehouse/feature": {"write"},
+            "warehouse/stream": {"write"},
+            "warehouse/catalog_proof": {"write"},
+        },
+        "publisher_read": False,
+    },
     "trino": {"access": {"warehouse": {"read"}}, "publisher_read": False},
     "replay": {"access": {"landing": {"read"}, "manifests": {"read"}}, "publisher_read": False},
     "orchestrator": {"access": {"landing": {"read"}, "manifests": {"read"}, "records_input": {"read", "write", "delete"}}, "publisher_read": False},
@@ -210,9 +222,14 @@ class PlantedGrantTest(unittest.TestCase):
                 "bronze: warehouse/raw_records ['write']",
             ),
             "maintenance deletes": (
-                'access = { warehouse = ["read", "write"] }',
-                'access = { warehouse = ["read", "write", "delete"] }',
-                "maintenance: warehouse ['delete']",
+                '"warehouse/silver"        = ["write"]',
+                '"warehouse/silver"        = ["write", "delete"]',
+                "maintenance: warehouse/silver ['delete']",
+            ),
+            "maintenance writes the whole warehouse": (
+                'warehouse                 = ["read"]',
+                'warehouse                 = ["read", "write"]',
+                "maintenance: warehouse ['write']",
             ),
             "trino writes": (
                 'trino = {\n    access = { warehouse = ["read"] }',

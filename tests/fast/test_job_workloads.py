@@ -16,6 +16,7 @@ from pathlib import Path
 from scripts.infra.host import PROJECT_WORKLOAD_GIDS
 from scripts.stack.job_workloads import JOB_WORKLOADS, SERVICE_WORKLOADS, JobWorkloadError, profile_of_job, service_of, workload_of
 from scripts.stack.limits import load_limits
+from spark.maintenance import COMPACTED_NAMESPACES
 from tests.fast.test_workload_grants import TFVARS, read_workloads
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,13 +35,14 @@ JOB_TABLES: dict[str, tuple[set[str], set[str], set[str]]] = {
     "gold_dimensions": ({"silver", "bronze"}, {"gold"}, set()),
     "stream_features": (set(), {"feature", "stream"}, set()),
     "catalog_proof": ({"catalog_proof"}, {"catalog_proof"}, set()),
-    "table_maintenance": ({"*"}, {"*"}, set()),
+    "table_maintenance": ({"*"}, set(COMPACTED_NAMESPACES), set()),
 }
 WIDE = "*"
 
 
 def needed(workload: str, jobs: dict[str, str], tables: dict[str, tuple[set[str], set[str], set[str]]]) -> dict[str, set[str]]:
-    """The modes that the jobs of ``workload`` need on each prefix, from the table. A layer writer needs read, write and delete there, maintenance no delete."""
+    """The modes that the jobs of ``workload`` need on each prefix, from the table. A layer writer needs read, write and delete in its own folders. The
+    maintenance workload reads the whole warehouse for its tag checks and only writes the folders it compacts, with no delete."""
     found: dict[str, set[str]] = {}
     for job, owner in jobs.items():
         if owner != workload:
@@ -51,12 +53,10 @@ def needed(workload: str, jobs: dict[str, str], tables: dict[str, tuple[set[str]
         for namespace in reads:
             found.setdefault("warehouse" if namespace == WIDE else f"warehouse/{namespace}", set()).add("read")
         for namespace in writes:
-            if namespace in (WIDE, "catalog_proof"):
-                found.setdefault("warehouse", set()).update({"read", "write"})
-            else:
-                found.setdefault(f"warehouse/{namespace}", set()).update({"read", "write", "delete"})
-    if "warehouse" in found:
-        found = {prefix: modes for prefix, modes in found.items() if not prefix.startswith("warehouse/")} | {"warehouse": found["warehouse"]}
+            modes = {"write"} if workload == "maintenance" else {"read", "write", "delete"}
+            found.setdefault(f"warehouse/{namespace}", set()).update(modes)
+    if workload == "maintenance" and "warehouse" in found:
+        found = {prefix: modes - {"read"} if prefix != "warehouse" else modes for prefix, modes in found.items() if prefix == "warehouse" or modes - {"read"}}
     return found
 
 
@@ -135,7 +135,8 @@ class GrantTest(unittest.TestCase):
             "the Silver cases job under Bronze": ("silver_cases", "bronze", "bronze: lacks ['delete', 'read', 'write'] on warehouse/silver"),
             "the Gold dimensions under Silver": ("gold_dimensions", "silver", "silver: lacks ['delete', 'read', 'write'] on warehouse/gold"),
             "the table checks under Gold": ("table_checks", "gold", "gold: lacks ['read'] on warehouse/raw_records"),
-            "the maintenance under Bronze": ("table_maintenance", "bronze", "bronze: lacks ['read', 'write'] on warehouse"),
+            "the maintenance under Bronze": ("table_maintenance", "bronze", "bronze: lacks ['read'] on warehouse"),
+            "the catalog proof under Bronze": ("catalog_proof", "bronze", "bronze: lacks ['delete', 'read', 'write'] on warehouse/catalog_proof"),
             "the streaming job under Gold": ("stream_features", "gold", "gold: lacks ['delete', 'read', 'write'] on warehouse/feature"),
         }
         for label, (job, workload, named) in cases.items():
@@ -159,10 +160,22 @@ class GrantTest(unittest.TestCase):
                 "gold: has ['read'] on landing",
             ),
             (
-                "maintenance deletes",
-                'access = { warehouse = ["read", "write"] }',
-                'access = { warehouse = ["read", "write", "delete"] }',
-                "maintenance: has ['delete'] on warehouse",
+                "maintenance deletes in a layer",
+                '"warehouse/silver"        = ["write"]',
+                '"warehouse/silver"        = ["write", "delete"]',
+                "maintenance: has ['delete'] on warehouse/silver",
+            ),
+            (
+                "maintenance writes the whole warehouse",
+                'warehouse                 = ["read"]',
+                'warehouse                 = ["read", "write"]',
+                "maintenance: has ['write'] on warehouse",
+            ),
+            (
+                "maintenance writes raw_records",
+                'warehouse                 = ["read"]',
+                'warehouse                 = ["read"]\n      "warehouse/raw_records"   = ["write"]',
+                "maintenance: has ['write'] on warehouse/raw_records",
             ),
         ):
             with self.subTest(label):

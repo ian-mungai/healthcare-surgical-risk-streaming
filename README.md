@@ -83,9 +83,9 @@ Each Spark job runs under the AWS role of one lake layer, so a job reaches only 
 | `silver` | `warehouse/raw_records`, `warehouse/bronze`, `warehouse/silver` | `warehouse/silver` | `spark_silver`, `batch_silver` |
 | `gold` | `warehouse/bronze`, `warehouse/silver`, `warehouse/gold` | `warehouse/gold` | `spark_gold`, `batch_gold` |
 | `stream` | `warehouse/feature`, `warehouse/stream` | the same two prefixes | none yet |
-| `maintenance` | `warehouse` | writes `warehouse`, deletes nothing | `spark_maintenance`, `batch_maintenance` |
+| `maintenance` | `warehouse` (every table, for the tag checks) | writes the five layer folders and `warehouse/catalog_proof`, deletes nothing | `spark_maintenance`, `batch_maintenance` |
 
-The Airbyte load owns `warehouse/raw_records`, and no workload role writes it. The table checks job runs as `bronze`, the reconciliation job as `silver` and the catalog proof as `maintenance`. Terraform refuses a grant that lets a workload write another layer's prefix, write `raw_records`, or delete in the whole warehouse prefix.
+The Airbyte load owns `warehouse/raw_records`, and no workload role writes it. The table checks job runs as `bronze`, the reconciliation job as `silver` and the catalog proof as `maintenance`. Terraform refuses a grant that lets a workload write another layer's prefix (maintenance may write each layer's folder but never delete), write the whole warehouse prefix or `raw_records`, or delete in the whole warehouse prefix. The table maintenance job compacts only those folders and leaves `raw_records` out of its default table selection.
 
 ## Credit
 
