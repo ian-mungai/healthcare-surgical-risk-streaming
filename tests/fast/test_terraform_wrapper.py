@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -40,10 +41,12 @@ from scripts.infra.terraform_wrapper import (
     plan_changes,
     plan_label,
     prepare_configuration,
+    region_problem,
     run_variables,
     sanitized,
     save_plan,
     stale_inputs_problem,
+    stale_pin_problem,
     state_json,
     state_location,
     write_private,
@@ -92,9 +95,23 @@ class PlanBindingTest(unittest.TestCase):
 
     def test_terraform_is_given_the_bound_bucket_and_no_other_run_value(self) -> None:
         self.assertEqual(
-            {"data_bucket_name": "example-project", "aws_profile": "example_project_dev", "provision_host": "true"},
+            {"data_bucket_name": "example-project", "aws_profile": "example_project_dev", "provision_host": "true", "aws_region": "us-west-2"},
             run_variables(RUN, {"AWS_PROFILE": "example_project_dev"}),
         )
+
+    def test_terraform_takes_its_region_from_the_run_binding_and_not_from_the_variable_file(self) -> None:
+        elsewhere = replace(RUN, region="eu-west-1")
+        self.assertEqual("eu-west-1", run_variables(elsewhere, {"AWS_PROFILE": "example_project_dev"})["aws_region"])
+
+    def test_the_environments_variable_file_names_no_region_so_the_binding_is_the_only_source(self) -> None:
+        text = (Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars").read_text()
+        self.assertNotRegex(text, r"(?m)^\s*aws_region\b")
+
+    def test_a_region_that_differs_between_the_binding_and_the_env_file_is_refused_with_a_fixed_message(self) -> None:
+        self.assertIsNone(region_problem(RUN, {"AWS_REGION": "us-west-2"}))
+        problem = region_problem(RUN, {"AWS_REGION": "eu-west-1"})
+        self.assertEqual("the run is bound to a region other than the AWS_REGION of .env; bind the run again or correct AWS_REGION", problem)
+        self.assertNotIn("eu-west-1", problem or "")
 
     def test_plan_saved_for_the_s3_backend_is_refused_under_the_local_backend(self) -> None:
         self.assertEqual(
@@ -244,7 +261,7 @@ class PrivateFilesTest(unittest.TestCase):
                 mock.patch.object(terraform_wrapper, "run_command", side_effect=AssertionError("Terraform started")),
                 self.assertRaisesRegex(WrapperError, "limits.*memory_limit_mib"),
             ):
-                save_plan(RUN, {"AWS_PROFILE": "example_project_dev"}, action)
+                save_plan(RUN, {"AWS_PROFILE": "example_project_dev", "AWS_REGION": "us-west-2"}, action)
         self.assertFalse((self.root / "runs").exists())
 
     def test_a_plan_runs_in_a_copy_that_holds_the_loaders_numbers_and_a_state_read_in_one_that_holds_none(self) -> None:
@@ -269,6 +286,7 @@ class PrivateFilesTest(unittest.TestCase):
 
         configuration = {
             "AWS_PROFILE": "example_project_dev",
+            "AWS_REGION": "us-west-2",
             "ENVIRONMENT": "dev",
             "TAILSCALE_CLIENT_ID": "example-id",
             "TAILSCALE_AUDIENCE": "example-audience",
@@ -297,7 +315,7 @@ class PrivateFilesTest(unittest.TestCase):
             mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None),
             mock.patch.object(terraform_wrapper, "terraform", side_effect=lambda run, arguments, timeout: answers[arguments[0]]),
         ):
-            self.assertEqual({"values": {}}, state_json(RUN, {"AWS_PROFILE": "example_project_dev"}))
+            self.assertEqual({"values": {}}, state_json(RUN, {"AWS_PROFILE": "example_project_dev", "AWS_REGION": "us-west-2"}))
 
     def test_each_invocation_gets_its_own_owner_only_copy_of_the_approved_plan(self) -> None:
         (self.root / ".tools" / "terraform" / RUN.run_id / "config").mkdir(parents=True)
@@ -389,6 +407,105 @@ class StaleInputsTest(unittest.TestCase):
         self.assertIsNotNone(stale_inputs_problem(plan_with(HEAVY_INPUTS | {"spark_limit_mib": True})))
 
 
+# Opaque names: the wrapper compares the text and never reads an AMI ID, and no file but the pin may hold an ID.
+PINNED_AMI = "ami-pinned-now"
+OTHER_AMI = "ami-pinned-before"
+
+
+def host_plan(ami: object, *, region: object = "us-west-2", actions: tuple[str, ...] = ("create",)) -> dict[str, object]:
+    """A plan's JSON that changes the host instance with the given actions and AMI, made for the given region."""
+    change = {
+        "address": "module.host[0].aws_instance.host",
+        "type": "aws_instance",
+        "name": "host",
+        "change": {"actions": list(actions), "after": {"ami": ami}},
+    }
+    variables = {name: {"value": value} for name, value in HEAVY_INPUTS.items()} | {"aws_region": {"value": region}}
+    return {"variables": variables, "resource_changes": [change]}
+
+
+def write_pin(root: Path, amis: object) -> None:
+    (root / "infra").mkdir(exist_ok=True)
+    (root / "infra" / "ubuntu_build.json").write_text(json.dumps({"serial": "20260101", "amis": amis}))
+
+
+class StalePinTest(unittest.TestCase):
+    """A saved plan that creates the host holds the AMI it was made with. When the pin file now gives another AMI for its region, the plan is stale. A host
+    that already exists ignores a later AMI (its ``ignore_changes``), so a plan that does not create the host is never stale for this cause."""
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+        write_pin(self.root, {"us-west-2": PINNED_AMI})
+
+    def test_a_host_plan_made_with_the_pinned_ami_passes(self) -> None:
+        self.assertIsNone(stale_pin_problem(host_plan(PINNED_AMI)))
+
+    def test_a_host_plan_made_with_another_ami_is_refused_with_both_amis_in_the_form_of_the_limits_refusal(self) -> None:
+        problem = stale_pin_problem(host_plan(OTHER_AMI)) or ""
+        for text in ("the Ubuntu pin changed after this plan was saved; save a new plan", OTHER_AMI, PINNED_AMI):
+            self.assertIn(text, problem)
+
+    def test_a_plan_that_replaces_the_host_is_checked_like_one_that_creates_it(self) -> None:
+        self.assertIsNotNone(stale_pin_problem(host_plan(OTHER_AMI, actions=("delete", "create"))))
+
+    def test_a_plan_that_does_not_create_the_host_is_never_stale_for_this_cause(self) -> None:
+        for actions in (("no-op",), ("update",), ("delete",), ("read",)):
+            with self.subTest(actions=actions):
+                self.assertIsNone(stale_pin_problem(host_plan(OTHER_AMI, actions=actions)))
+        self.assertIsNone(stale_pin_problem(plan_with(HEAVY_INPUTS)))
+
+    def test_a_region_that_the_pin_no_longer_names_makes_a_host_plan_stale(self) -> None:
+        write_pin(self.root, {"eu-west-1": PINNED_AMI})
+        self.assertIsNotNone(stale_pin_problem(host_plan(PINNED_AMI)))
+
+    def test_a_host_plan_of_another_region_is_compared_with_the_pin_of_that_region(self) -> None:
+        write_pin(self.root, {"us-west-2": OTHER_AMI, "eu-west-1": PINNED_AMI})
+        self.assertIsNone(stale_pin_problem(host_plan(PINNED_AMI, region="eu-west-1")))
+        self.assertIsNotNone(stale_pin_problem(host_plan(PINNED_AMI, region="us-west-2")))
+
+    def test_a_host_plan_whose_ami_or_region_cannot_be_read_is_refused(self) -> None:
+        for plan in (host_plan(None), host_plan(7), host_plan(PINNED_AMI, region=None), host_plan(PINNED_AMI, region=["us-west-2"])):
+            with self.subTest(plan=plan):
+                self.assertIn("save a new plan", stale_pin_problem(plan) or "")
+        broken = host_plan(PINNED_AMI)
+        broken["variables"] = {}
+        self.assertIn("save a new plan", stale_pin_problem(broken) or "")
+        broken["resource_changes"] = [{"type": "aws_instance", "name": "host", "change": {"actions": ["create"]}}]
+        self.assertIn("save a new plan", stale_pin_problem(broken) or "")
+
+    def test_a_missing_or_unreadable_pin_file_refuses_a_host_plan_and_a_plan_without_a_host_never_reads_it(self) -> None:
+        pin = self.root / "infra" / "ubuntu_build.json"
+        for text in (None, "not json", "[]", '{"amis": []}', '{"amis": {"us-west-2": 5}}'):
+            with self.subTest(text=text):
+                pin.unlink(missing_ok=True)
+                if text is not None:
+                    pin.write_text(text)
+                self.assertIn("save a new plan", stale_pin_problem(host_plan(PINNED_AMI)) or "")
+                self.assertIsNone(stale_pin_problem(plan_with(HEAVY_INPUTS)))
+
+    def test_a_plan_document_of_any_other_shape_does_not_raise(self) -> None:
+        shapes: tuple[object, ...] = (
+            None,
+            "text",
+            [],
+            5,
+            {},
+            {"resource_changes": None},
+            {"resource_changes": [None, 5, "x", {}]},
+            {"resource_changes": [{"type": "aws_instance"}]},
+        )
+        for plan in shapes:
+            with self.subTest(plan=plan):
+                self.assertIsNone(stale_pin_problem(plan))
+
+    def test_the_deploy_check_of_the_limits_does_not_look_at_the_pin(self) -> None:
+        """``host.py`` re-reads the applied plan to deploy: a pin that moved after the host was created must not stop the deploy to that host."""
+        (self.root / "compose").mkdir()
+        (self.root / "compose" / "limits.yml").write_text(LIMITS)
+        self.assertIsNone(stale_inputs_problem(host_plan(OTHER_AMI)))
+
+
 class ConfirmedPlanTest(unittest.TestCase):
     """Confirming a saved plan compares the numbers it was made with against the limits now, before any apply."""
 
@@ -421,6 +538,17 @@ class ConfirmedPlanTest(unittest.TestCase):
     def test_a_plan_saved_before_a_limits_change_is_refused_before_any_apply(self) -> None:
         (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("host_reserve_mib: 4096", "host_reserve_mib: 5120"))
         with self.assertRaisesRegex(WrapperError, "the limits changed after this plan was saved; save a new plan"):
+            apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
+        self.assertNotIn("apply", self.calls)
+
+    def test_a_host_plan_saved_before_the_pin_changed_is_refused_before_any_apply_and_a_current_one_is_applied(self) -> None:
+        write_pin(self.root, {"us-west-2": PINNED_AMI})
+        self.plan_text = json.dumps(host_plan(PINNED_AMI))
+        self.assertEqual(0, apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"}))
+        self.assertIn("apply", self.calls)
+        self.calls.clear()
+        self.plan_text = json.dumps(host_plan(OTHER_AMI))
+        with self.assertRaisesRegex(WrapperError, "refused before any change: the Ubuntu pin changed after this plan was saved; save a new plan"):
             apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
         self.assertNotIn("apply", self.calls)
 
@@ -479,7 +607,7 @@ class CallerVariableTest(unittest.TestCase):
                     mock.patch.dict(os.environ, {f"TF_VAR_{name}": "1"}),
                     self.assertRaisesRegex(WrapperError, f"TF_VAR_{name}"),
                 ):
-                    save_plan(RUN, {"AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev"}, "apply")
+                    save_plan(RUN, {"AWS_PROFILE": "example_project_dev", "AWS_REGION": "us-west-2", "ENVIRONMENT": "dev"}, "apply")
 
 
 class SavedPlanTest(unittest.TestCase):
@@ -487,7 +615,13 @@ class SavedPlanTest(unittest.TestCase):
     confirmation code, whatever overrode them. That notice is a convenience and writes no state: the check that matters runs when a plan is applied. The
     figure has no effect when the host is destroyed, so a destroy plan is not checked."""
 
-    CONFIGURATION = {"AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "TAILSCALE_CLIENT_ID": "example-id", "TAILSCALE_AUDIENCE": "example-audience"}
+    CONFIGURATION = {
+        "AWS_PROFILE": "example_project_dev",
+        "AWS_REGION": "us-west-2",
+        "ENVIRONMENT": "dev",
+        "TAILSCALE_CLIENT_ID": "example-id",
+        "TAILSCALE_AUDIENCE": "example-audience",
+    }
 
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -505,6 +639,7 @@ class SavedPlanTest(unittest.TestCase):
         record.parent.mkdir(parents=True)
         record.write_text(json.dumps(S3_RECORD))
         self.plan_inputs: Mapping[str, object] = dict(HEAVY_INPUTS)
+        self.calls: list[list[str]] = []
         self.plans = self.root / "runs" / RUN.run_id / "plans"
         self.output = io.StringIO()
         self.enterContext(mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None))
@@ -512,6 +647,7 @@ class SavedPlanTest(unittest.TestCase):
         self.enterContext(contextlib.redirect_stdout(self.output))
 
     def fake_terraform(self, run: RunBinding, arguments: list[str], timeout: float) -> str:
+        self.calls.append(arguments)
         if arguments[0] == "plan":
             Path(next(item for item in arguments if item.startswith("-out="))[5:]).write_bytes(b"plan bytes")
         if arguments[0] == "show" and arguments[1] == "-json" and len(arguments) == 3:
@@ -524,6 +660,21 @@ class SavedPlanTest(unittest.TestCase):
         self.assertIn("apply --confirm", self.output.getvalue())
         self.assertTrue((self.plans / "apply.tfplan").is_file())
         self.assertFalse((self.plans / "apply_refused.json").exists())
+
+    def test_the_plan_gets_the_bound_region_after_the_variable_file_so_the_variable_file_never_names_the_region(self) -> None:
+        elsewhere = replace(RUN, region="eu-west-1", state_keys=RUN.state_keys)
+        record = configuration_folder_of(self.root) / ".terraform" / "terraform.tfstate"
+        record.write_text(json.dumps({"backend": {"type": "s3", "config": {"bucket": RUN.bucket, "key": RUN.state_keys[0], "region": "eu-west-1"}}}))
+        save_plan(elsewhere, self.CONFIGURATION | {"AWS_REGION": "eu-west-1"}, "apply")
+        arguments = next(call for call in self.calls if call[0] == "plan")
+        self.assertIn("-var=aws_region=eu-west-1", arguments)
+        self.assertLess(arguments.index("-var-file=environments/dev.tfvars"), arguments.index("-var=aws_region=eu-west-1"))
+        self.assertNotIn("-var=aws_region=us-west-2", arguments)
+
+    def test_a_run_bound_to_another_region_than_the_env_file_is_refused_before_terraform_starts(self) -> None:
+        with self.assertRaisesRegex(WrapperError, "bound to a region other than the AWS_REGION of .env"):
+            save_plan(RUN, self.CONFIGURATION | {"AWS_REGION": "eu-west-1"}, "apply")
+        self.assertEqual([], self.calls)
 
     def test_an_up_plan_whose_json_carries_another_number_gets_no_confirmation_code_and_writes_no_state(self) -> None:
         for name in HEAVY_INPUT_NAMES:

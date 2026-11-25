@@ -14,6 +14,8 @@ makes a plan, and of no other call, so a limits file that the loader refuses sto
 variable file. Before it applies a plan it reads that plan's own JSON, and a plan whose three heavy inputs are not the whole numbers that
 the loader gives is refused. A plan that was made with other numbers gets no confirmation code when it is saved, as a courtesy that writes no state.
 A destroy plan is not checked: the figure has no effect when the host is destroyed.
+Terraform gets the run's bound region as ``aws_region`` after the variable file, which names no region, and ``.env``'s AWS_REGION must equal it. Before it
+applies a plan that creates the host, the wrapper also refuses a plan whose AMI is not the one ``infra/ubuntu_build.json`` names now for the plan's region.
 A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this command never applies one.
 """
 
@@ -103,7 +105,19 @@ def backend_override(run: RunBinding) -> str | None:
 
 def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, str]:
     """The Terraform variables that come from the run and not from the environment's variable file."""
-    return {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    return {
+        "data_bucket_name": run.bucket,
+        "aws_profile": configuration["AWS_PROFILE"],
+        "provision_host": "true" if run.provision_host else "false",
+        "aws_region": run.region,
+    }
+
+
+def region_problem(run: RunBinding, configuration: dict[str, str]) -> str | None:
+    """Why the run may not go on: its bound region is not the AWS_REGION of ``.env``. The binding's region is the one that Terraform and the backend get."""
+    if run.region != configuration["AWS_REGION"]:
+        return "the run is bound to a region other than the AWS_REGION of .env; bind the run again or correct AWS_REGION"
+    return None
 
 
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:
@@ -174,6 +188,48 @@ def stale_inputs_problem(plan: object) -> str | None:
         return None
     planned, current = difference
     return f"the limits changed after this plan was saved; save a new plan: the plan was made with {planned} and the limits now give {current}"
+
+
+def pinned_ami(region: object) -> str | None:
+    """The AMI that the Ubuntu pin file names now for ``region``, or None when the file, the region or the AMI is missing or not text."""
+    try:
+        amis = json.loads((ROOT / "infra" / UBUNTU_BUILD_FILE).read_text()).get("amis")
+        ami = amis.get(region) if isinstance(amis, dict) and isinstance(region, str) else None
+    except OSError, ValueError, AttributeError:
+        return None
+    return ami if isinstance(ami, str) else None
+
+
+def planned_host_image(plan: object) -> tuple[bool, object, object]:
+    """Whether the plan creates the host, the AMI that it gives the host and the region it was made for. A document of any other shape creates no host."""
+    if not isinstance(plan, dict):
+        return False, None, None
+    changes = plan.get("resource_changes")
+    for change in changes if isinstance(changes, list) else []:
+        if not isinstance(change, dict) or change.get("type") != "aws_instance" or change.get("name") != "host":
+            continue
+        inner = change.get("change")
+        actions = inner.get("actions") if isinstance(inner, dict) else None
+        if not isinstance(actions, list) or "create" not in actions:
+            continue
+        after = inner.get("after") if isinstance(inner, dict) else None
+        variables = plan.get("variables")
+        region = variables.get("aws_region") if isinstance(variables, dict) else None
+        return True, after.get("ami") if isinstance(after, dict) else None, region.get("value") if isinstance(region, dict) else None
+    return False, None, None
+
+
+def stale_pin_problem(plan: object) -> str | None:
+    """The refusal for a plan that creates the host with another AMI than the Ubuntu pin names now for the plan's region, or None.
+
+    A host that already exists ignores a later AMI, so only a plan that creates the host is checked, and only an apply asks: a deploy to a host that was
+    created has no use for the pin.
+    """
+    creates, planned, region = planned_host_image(plan)
+    current = pinned_ami(region)
+    if not creates or (isinstance(planned, str) and planned == current):
+        return None
+    return f"the Ubuntu pin changed after this plan was saved; save a new plan: the plan creates the host from {planned!r} and the pin now gives {current!r}"
 
 
 def environment_override_problems(environment: Mapping[str, str]) -> list[str]:
@@ -267,6 +323,9 @@ def initialise(run: RunBinding, configuration: dict[str, str], inputs: str | Non
     mode_problem = bucket_problem(run, configuration)
     if mode_problem:
         raise WrapperError(f"refused before any plan or change: {mode_problem}")
+    mismatch = region_problem(run, configuration)
+    if mismatch:
+        raise WrapperError(f"refused before any plan or change: {mismatch}")
     folder = prepare_configuration(run, inputs)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
     record_file = folder / ".terraform" / "terraform.tfstate"
@@ -389,6 +448,9 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         stale = stale_inputs_problem(applied_plan)
         if stale:
             raise WrapperError(f"refused before any change: {stale}")
+        moved = stale_pin_problem(applied_plan)
+        if moved:
+            raise WrapperError(f"refused before any change: {moved}")
         output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
         kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
         sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")
