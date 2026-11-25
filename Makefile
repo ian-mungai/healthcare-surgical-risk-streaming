@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 override TERRAFORM := .tools/bin/terraform
 
-.PHONY: setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
+.PHONY: setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start storage-up inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -56,6 +56,9 @@ test-deadline:
 
 host-up:
 	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM))
+
+storage-up:
+	$(PYTHON) -m scripts.infra.storage up $(if $(CONFIRM),--confirm $(CONFIRM))
 
 host-stop:
 	$(PYTHON) -m scripts.infra.host stop
