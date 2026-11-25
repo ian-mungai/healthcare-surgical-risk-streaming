@@ -68,7 +68,10 @@ class Folder(unittest.TestCase):
     }
 
     def setUp(self) -> None:
-        self.folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="manifest_")))
+        # The checkout and every file that a test puts beside it live in one temporary directory that this test owns, so nothing is written to a shared place.
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="manifest_")))
+        self.folder = self.base / "checkout"
+        self.folder.mkdir()
         for name, text in self.FILES.items():
             self.put(name, text)
         self.put(".venv/bin/python", "environment\n")
@@ -83,6 +86,16 @@ class Folder(unittest.TestCase):
         (self.folder / MANIFEST).write_text(text)
         document: dict[str, Any] = json.loads(text)
         return document
+
+
+class OwnedDirectoryTest(Folder):
+    def test_the_checkout_is_the_only_entry_of_the_temporary_directory_that_the_test_owns_and_a_sibling_stays_inside_it(self) -> None:
+        self.assertEqual(["checkout"], sorted(path.name for path in self.base.iterdir()))
+        self.assertTrue(self.base.name.startswith("manifest_"))
+        self.assertNotEqual(Path(tempfile.gettempdir()).resolve(), self.folder.parent.resolve(), "a sibling would be written to the shared temporary folder")
+        sibling = self.base / "outside.txt"
+        sibling.write_text("outside\n")
+        self.assertEqual(self.base.resolve(), sibling.resolve().parent)
 
 
 class ContentTest(Folder):
@@ -118,7 +131,7 @@ class ContentTest(Folder):
                 self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
     def test_a_link_to_a_file_or_a_folder_and_a_special_file_are_refused_by_name(self) -> None:
-        outside = self.folder.parent / "outside.txt"
+        outside = self.base / "outside.txt"
         outside.write_text("outside\n")
         cases: dict[str, Callable[[Path], object]] = {
             "link_to_file": lambda path: path.symlink_to(outside),
@@ -211,7 +224,7 @@ class CheckTest(Folder):
                 self.assertRegex(found[0], r"^manifest: ")
 
     def test_a_path_that_leaves_the_folder_or_is_not_in_the_one_form_is_found_and_the_file_it_names_is_never_read(self) -> None:
-        secret = self.folder.parent / "secret.txt"
+        secret = self.base / "secret.txt"
         secret.write_text("secret\n")
         for path in ("../secret.txt", "/etc/hostname", "./app/a.py", "app//a.py", "app\\a.py", "app/../app/a.py", "", ".venv/bin/python", MARKER, MANIFEST):
             with self.subTest(path=path):
