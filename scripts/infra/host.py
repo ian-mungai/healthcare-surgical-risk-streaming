@@ -57,7 +57,7 @@ SSH_ATTEMPT_SECONDS = 30
 # files and fails when this figure is lower. The connection step has its own budget from the same sum over ansible/connection.yml (the Airbyte connection step
 # and the start of the orchestration services).
 HOST_SETUP_TIMEOUT_SECONDS = 28800
-CONNECTION_TIMEOUT_SECONDS = 4800
+CONNECTION_TIMEOUT_SECONDS = 5100
 PLAYBOOKS = {
     "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),
     "connection.yml": ("connection step", "ansible_connection_output.txt", CONNECTION_TIMEOUT_SECONDS),

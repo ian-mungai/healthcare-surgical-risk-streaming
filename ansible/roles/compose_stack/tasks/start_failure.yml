@@ -1,0 +1,28 @@
+# Reads compose_stack_failure_subject (what waited for health), compose_stack_docker, compose_stack_tools_file, compose_stack_secrets_directory and the deadlines.
+# Both waits of start.yml, the start and the forced recreate of the stale services, stop here, so each failure leads with the same diagnosis.
+- name: Read each service's state without logs
+  ansible.builtin.command:
+    argv: "{{ compose_stack_docker + ['ps', '--all', '--format', 'table {{ .Service }}\\t{{ .State }}\\t{{ .Status }}'] }}"
+  register: compose_stack_diagnosis
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# A tool that cannot connect shows PostgreSQL's refusal only in its own log, which this role never prints (it can hold a value). The server's counts by account name
+# tell the same cause with no secret in them (live host, Nov 25 2026: the code location stayed unhealthy while Airbyte, Apicurio and Temporal held every slot).
+- name: Read how many PostgreSQL connection slots each account holds
+  postgres_accounts:
+    step: slots
+    tools_file: "{{ compose_stack_tools_file }}"
+    secrets_directory: "{{ compose_stack_secrets_directory }}"
+    compose_command: "{{ compose_stack_docker }}"
+  register: compose_stack_slots
+  failed_when: false
+  timeout: 60
+
+- name: Stop with the service and its state
+  ansible.builtin.fail:
+    msg: >-
+      {{ compose_stack_slots.message | default('The PostgreSQL connection slots could not be read.') }} {{ compose_stack_failure_subject }} did not become healthy within
+      {{ compose_stack_health_deadline_seconds }} seconds (start deadline {{ compose_stack_start_deadline_seconds }} seconds). State of each service:
+      {{ compose_stack_diagnosis.stdout | default('unreadable') }}

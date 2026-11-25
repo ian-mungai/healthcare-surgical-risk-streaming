@@ -9,8 +9,8 @@ mode or owner is given the right ones, and its password is kept.
 password or attributes differ from the file and removes every grant on a tool's databases, so that only the tool's own account (and the administrator)
 can connect. A server that already matches needs no change and the step reports none.
 
-``step: slots`` reads how many connections each account holds and how many the server allows to ordinary accounts, and reports whether they are all held. It
-changes nothing and prints counts by account name only, never a query, an address or a password.
+``step: slots`` reads how many client sessions each account holds (a superuser's too, but not this read's own) and how many the server admits for
+ordinary accounts, and reports whether they are all held. It changes nothing and prints counts by account name only, never a query, an address or a password.
 
 A line of the tool list is a bare tool name, which owns one database named for the tool, or ``tool: database database ...``, which owns the databases it
 lists. A database belongs to one tool: a name listed twice or owned by another tool is refused.
@@ -186,10 +186,11 @@ FROM pg_database d WHERE d.datname = ANY (string_to_array(:'databases', ',')) OR
 """
 
 
+SLOT_SETTINGS = ("max_connections", "reserved_connections", "superuser_reserved_connections")
 SLOTS_QUERY = """\
-SELECT 'setting', name, setting FROM pg_settings WHERE name IN ('max_connections', 'superuser_reserved_connections') ORDER BY name;
+SELECT 'setting', name, setting FROM pg_settings WHERE name IN ('max_connections', 'reserved_connections', 'superuser_reserved_connections') ORDER BY name;
 SELECT 'held', r.rolname, count(*) FROM pg_stat_activity a JOIN pg_roles r ON r.oid = a.usesysid
-WHERE a.backend_type = 'client backend' AND NOT r.rolsuper GROUP BY r.rolname ORDER BY r.rolname;
+WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() GROUP BY r.rolname ORDER BY r.rolname;
 """
 BUDGET_FILE_NAME = "compose/postgres_connections.yml"
 
@@ -198,6 +199,7 @@ BUDGET_FILE_NAME = "compose/postgres_connections.yml"
 class Slots:
     max_connections: int
     reserved: int
+    role_reserved: int
     held: dict[str, int]
 
 
@@ -206,29 +208,38 @@ def parse_slots(output: str) -> Slots:
     held: dict[str, int] = {}
     for line in output.splitlines():
         parts = line.split("|")
-        if len(parts) == 3 and parts[0] == "setting" and parts[1] in ("max_connections", "superuser_reserved_connections") and parts[2].isdigit():
+        if len(parts) == 3 and parts[0] == "setting" and parts[1] in SLOT_SETTINGS and parts[2].isdigit():
             settings[parts[1]] = int(parts[2])
         elif len(parts) == 3 and parts[0] == "held" and parts[2].isdigit():
             held[parts[1]] = int(parts[2])
         else:
             raise AccountError("the slots query returned a line of an unexpected shape")
-    if set(settings) != {"max_connections", "superuser_reserved_connections"}:
-        raise AccountError("the slots query did not return both settings")
-    return Slots(settings["max_connections"], settings["superuser_reserved_connections"], held)
+    if set(settings) != set(SLOT_SETTINGS):
+        raise AccountError("the slots query did not return all three settings")
+    return Slots(settings["max_connections"], settings["superuser_reserved_connections"], settings["reserved_connections"], held)
 
 
 def slots_report(slots: Slots) -> tuple[bool, str]:
-    """Whether every slot for ordinary accounts is held, and the sentence for a failed start: cause, figures, holders and budget file."""
-    usable = slots.max_connections - slots.reserved
+    """Whether PostgreSQL now refuses an ordinary account, and the sentence for a failed start: cause, figures, holders and budget file.
+
+    PostgreSQL gives an ordinary account a slot while the sessions of every account, a superuser's too, number fewer than ``max_connections`` less
+    ``superuser_reserved_connections`` and ``reserved_connections``. The count leaves out the session of this read, which ends before a tool connects.
+    """
+    usable = slots.max_connections - slots.reserved - slots.role_reserved
     used = sum(slots.held.values())
     holders = ", ".join(f"{name} {count}" for name, count in sorted(slots.held.items())) or "none"
     if used >= usable:
         return True, (
-            f"PostgreSQL connection slots are full: {used} of {usable} slots for ordinary accounts are held ({holders}), "
+            f"PostgreSQL connection slots are full: {used} of {usable} slots that an ordinary account may use are held by sessions of every account "
+            f"({holders}), "
             f"so a tool that connects now is refused with 'remaining connection slots are reserved for roles with the SUPERUSER attribute'. "
             f"Each tool's maximum is in {BUDGET_FILE_NAME}."
         )
-    return False, f"PostgreSQL connection slots are not full now: {used} of {usable} slots for ordinary accounts are held ({holders})."
+    return (
+        False,
+        f"PostgreSQL connection slots are not full now: {used} of {usable} slots that an ordinary account may use are held by sessions of every account "
+        f"({holders}).",
+    )
 
 
 def tool_variable(tools: dict[str, list[str]]) -> str:
