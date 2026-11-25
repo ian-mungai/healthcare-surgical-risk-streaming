@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib
+import inspect
 import io
 import json
 import shutil
@@ -322,17 +323,75 @@ class TagAndSnapshots(EvidenceCase):
         self.assertFalse(all(item.passed for item in record.observations))
 
     def run_tag(self, nessie: Any) -> tuple[list[str], list[str], Any]:
+        """The tag's three callbacks as the stack wires them: ``unsure`` marks a tag pending, ``settle`` takes the mark off. Returns what is declared and what
+        is still pending at the end."""
         declared: list[str] = []
-        unsure: list[str] = []
+        pending: list[str] = []
         record = Record(feature="stand-in", slug="stand_in", rerun="none")
         outcome = None
         try:
             self.features.tag_run(
-                record, nessie, "b", self.lake(), SUFFIX, folder=self.scratch, read_tag=lambda name: self.lake(), declare=declared.append, unsure=unsure.append
+                record,
+                nessie,
+                "b",
+                self.lake(),
+                SUFFIX,
+                folder=self.scratch,
+                read_tag=lambda name: self.lake(),
+                declare=declared.append,
+                unsure=lambda what: pending.append(what) if what not in pending else None,
+                settle=lambda what: pending.remove(what) if what in pending else None,
             )
         except Exception as error:
             outcome = error
-        return declared, unsure, outcome
+        return declared, pending, outcome
+
+    def test_a_tag_is_marked_pending_before_the_create_request_is_sent(self) -> None:
+        events: list[str] = []
+        nessie = FakeNessie({"b": Reference("BRANCH", "b", HASH_A)})
+
+        def create(name: str, hash_value: str, from_name: str = "main") -> Reference:
+            events.append("create")
+            nessie.references[name] = Reference("TAG", name, hash_value)
+            return nessie.references[name]
+
+        nessie.create_tag = create  # type: ignore[method-assign]
+        record = Record(feature="stand-in", slug="stand_in", rerun="none")
+        self.features.tag_run(record, nessie, "b", self.lake(), SUFFIX, folder=self.scratch, unsure=lambda what: events.append(f"pending {what}"))
+        self.assertEqual([f"pending tag stream_features_{SUFFIX}", "create"], events[:2])
+
+    def test_an_interrupt_during_the_create_request_leaves_the_tag_pending_and_undeclared(self) -> None:
+        for interrupt in (KeyboardInterrupt(), SystemExit(1), GeneratorExit()):
+            with self.subTest(interrupt=type(interrupt).__name__):
+                nessie = FakeNessie({"b": Reference("BRANCH", "b", HASH_A)})
+
+                def cut(name: str, hash_value: str, from_name: str = "main", interrupt: BaseException = interrupt) -> Reference:
+                    raise interrupt
+
+                nessie.create_tag = cut  # type: ignore[method-assign]
+                declared: list[str] = []
+                pending: list[str] = []
+                record = Record(feature="stand-in", slug="stand_in", rerun="none")
+                with self.assertRaises(type(interrupt)):
+                    self.features.tag_run(
+                        record, nessie, "b", self.lake(), SUFFIX, folder=self.scratch, declare=declared.append, unsure=pending.append, settle=pending.remove
+                    )
+                self.assertEqual(([], [f"tag stream_features_{SUFFIX}"]), (declared, pending))
+
+    def test_the_stack_hands_the_tag_its_three_callbacks_and_the_control_uses_them(self) -> None:
+        stack = self.features.StreamStack.__new__(self.features.StreamStack)
+        stack.references, stack.ambiguous = [], []
+        hooks = stack.tag_ownership()
+        self.assertEqual({"declare", "unsure", "settle"}, set(hooks))
+        hooks["unsure"]("tag x")
+        hooks["unsure"]("tag x")
+        self.assertEqual(["tag x"], stack.ambiguous)
+        hooks["declare"]("x")
+        self.assertEqual(["x"], stack.references)
+        hooks["settle"]("tag x")
+        hooks["settle"]("tag x")
+        self.assertEqual([], stack.ambiguous)
+        self.assertIn("**stack.tag_ownership()", inspect.getsource(self.features.control))
 
     def test_a_tag_is_the_runs_only_after_its_creation_is_confirmed(self) -> None:
         declared, unsure, outcome = self.run_tag(FakeNessie({"b": Reference("BRANCH", "b", HASH_A)}))

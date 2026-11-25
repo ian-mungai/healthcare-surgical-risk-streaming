@@ -14,6 +14,8 @@ Failure modes covered here:
 - The overlap is judged from the replay time that a message carries (the schedule again, in the payload) and not from the time at which the broker appended it.
 - The ten-room run is accepted with final offsets for fewer than ten partitions, with no reading taken while the replay played, or with no final reading of the
   lag against the end offsets that were fixed when the replay ended.
+- A reading of the lag that holds fewer than the ten partitions (the offsets tool listed some of them) counts as the reading taken while the replay played, sets
+  the peak lag or the memory peak, or is dropped without a trace.
 - An occurrence ID that another room or another run reuses shares the state of the first (the late event, the readings or the count of one leaks into the
   other), and the check looks at the occurrence ID only.
 """
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
 import json
 import unittest
 from types import ModuleType
@@ -112,8 +115,10 @@ class FinalOffsets(RoomsCase):
 
 
 class Measurement(RoomsCase):
-    def sample(self, seconds: float, lag: int = 1, usage: bool = True) -> Any:
-        return self.host.Sample(seconds, {0: lag}, {"stream": (1.0, 2.0)} if usage else {})
+    TEN = tuple(range(10))
+
+    def sample(self, seconds: float, lag: int = 1, usage: bool = True, partitions: tuple[int, ...] = TEN) -> Any:
+        return self.host.Sample(seconds, {partition: lag if partition == 0 else 0 for partition in partitions}, {"stream": (1.0, 2.0)} if usage else {})
 
     def problems(self, samples: list[Any], window: tuple[float, float] = (10.0, 40.0), final: int = 5) -> list[str]:
         ends = {partition: 7 for partition in range(10)}
@@ -133,6 +138,20 @@ class Measurement(RoomsCase):
         found = self.problems([self.sample(20.0, usage=False)], final=7)
         self.assertTrue(any("while the replay played" in item for item in found), found)
 
+    def test_a_reading_of_fewer_than_ten_partitions_does_not_count_as_a_reading_while_the_replay_played(self) -> None:
+        for partitions in ((0, 1, 2), tuple(range(9)), tuple(range(11)), (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)):
+            with self.subTest(partitions=partitions):
+                found = self.problems([self.sample(20.0, partitions=partitions)], final=7)
+                self.assertTrue(any("complete ten-partition" in item and "while the replay played" in item for item in found), found)
+
+    def test_one_complete_reading_among_partial_ones_is_enough(self) -> None:
+        samples = [self.sample(12.0, partitions=(0, 1)), self.sample(20.0), self.sample(30.0, partitions=(0,))]
+        self.assertEqual([], self.problems(samples, final=7))
+
+    def test_a_complete_reading_outside_the_replay_does_not_make_up_for_partial_ones_during_it(self) -> None:
+        found = self.problems([self.sample(5.0), self.sample(20.0, partitions=(0, 1)), self.sample(55.0)], final=7)
+        self.assertTrue(any("complete ten-partition" in item for item in found), found)
+
     def test_a_final_lag_against_the_fixed_end_offsets_must_be_zero_in_every_partition(self) -> None:
         found = self.problems([self.sample(20.0)], final=5)
         self.assertTrue(any("final lag" in item for item in found), found)
@@ -143,10 +162,39 @@ class Measurement(RoomsCase):
 
     def test_the_drain_time_is_the_final_reading_against_the_fixed_ends_when_the_live_readings_never_reached_zero(self) -> None:
         samples = [self.sample(1.0, lag=50), self.sample(6.0, lag=3)]
-        samples.append(self.host.final_reading(9.0, {0: 7}, {0: 7}))
-        summary = self.host.summarize(samples)
+        samples.append(self.host.final_reading(9.0, {partition: 7 for partition in self.TEN}, {partition: 7 for partition in self.TEN}))
+        summary = self.host.summarize(samples, self.TEN)
         self.assertEqual(9.0, summary["drained_at_seconds"])
         self.assertEqual(8.0, summary["drain_seconds_after_peak"])
+
+    def test_a_partial_reading_sets_no_peak_and_no_drain_and_is_recorded_as_partial(self) -> None:
+        huge = self.host.Sample(2.0, {0: 9000, 1: 9000}, {"stream": (99.0, 9999.0), "kafka": (99.0, 9999.0)})
+        empty = self.host.Sample(7.0, {0: 0, 1: 0}, {"stream": (1.0, 1.0)})
+        samples = [self.sample(1.0, lag=40), huge, self.sample(6.0, lag=10), empty, self.sample(11.0, lag=0)]
+        summary = self.host.summarize(samples, self.TEN)
+        self.assertEqual(3, summary["samples"])
+        self.assertEqual(40, summary["peak_lag_events"])
+        self.assertEqual(1.0, summary["peak_lag_at_seconds"])
+        self.assertEqual(11.0, summary["drained_at_seconds"])
+        self.assertEqual({"stream": 2.0}, summary["peak_memory_mib"])
+        self.assertEqual({"stream": 1.0}, summary["peak_cpu_percent"])
+        self.assertEqual([{"seconds": 2.0, "partitions": [0, 1]}, {"seconds": 7.0, "partitions": [0, 1]}], summary["partial_samples"])
+
+    def test_a_summary_without_a_partial_reading_names_none(self) -> None:
+        self.assertEqual([], self.host.summarize([self.sample(1.0)], self.TEN)["partial_samples"])
+
+    def test_readings_that_are_all_partial_give_a_summary_with_no_peak_and_never_a_peak_of_the_partial_ones(self) -> None:
+        summary = self.host.summarize([self.sample(1.0, lag=500, partitions=(0, 1))], self.TEN)
+        self.assertEqual(0, summary["samples"])
+        self.assertIsNone(summary["peak_lag_events"])
+        self.assertIsNone(summary["drained_at_seconds"])
+        self.assertEqual({}, summary["peak_memory_mib"])
+        self.assertEqual(1, len(summary["partial_samples"]))
+
+    def test_the_run_gives_the_summary_the_ten_partitions_of_the_rooms(self) -> None:
+        self.assertTrue(
+            "summarize(sampler.samples, range(ROOMS))" in inspect.getsource(self.host.ten_rooms), "ten_rooms does not give summarize its ten partitions"
+        )
 
 
 class Sampling(RoomsCase):

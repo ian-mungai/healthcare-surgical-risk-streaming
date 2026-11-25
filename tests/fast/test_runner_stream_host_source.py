@@ -10,6 +10,9 @@ Failure modes covered here:
 - A file of the runner (its modules, its probes, its overlay) differs from the manifest, has no entry, or is missing, and the run goes on with code that no
   commit holds.
 - A probe file that is not in the manifest is copied to the probe folder and run in a container.
+- A required probe is deleted from the checkout (the folder is listed as it is, so what is gone is not looked for), or a file of ``features/`` that the replay
+  image mounts is changed, missing or extra, and the run goes on with code that no commit holds.
+- The files are checked, then the landed copy is downloaded for minutes, then the files are copied: a file changed in between is staged unchecked.
 - A service file of ``compose/`` differs from the manifest (the runner reads some of them) or its deployed copy does, and the run goes on.
 """
 
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import tempfile
 import unittest
@@ -48,11 +52,14 @@ class SourceCase(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
 
-    def checkout(self, *, probes: tuple[str, ...] = ("plant_late.py", "read_bounds.py")) -> dict[str, str]:
-        """A checkout of a few files whose names are the runner's own, and the manifest's digest of each. Returns the manifest's files."""
+    def checkout(self, *, probes: tuple[str, ...] | None = None) -> dict[str, str]:
+        """A checkout of the runner's own file names, with a few files of ``compose/``, and the manifest's digest of each. Returns the manifest's files."""
         files: dict[str, str] = {}
         names = [name for name in self.host.runner_files(ROOT) if not name.startswith("tests/e2e/stream_stack/")]
-        names += [f"tests/e2e/stream_stack/{probe}" for probe in probes] + ["tests/e2e/stream_stack/compose.host.yml"]
+        names += [f"tests/e2e/stream_stack/{probe}" for probe in (self.host.REQUIRED_PROBES if probes is None else probes)] + [
+            "tests/e2e/stream_stack/compose.host.yml"
+        ]
+        names += [f"features/{path.name}" for path in sorted((ROOT / "features").glob("*.py"))]
         names += ["compose/services/kafka.yml", "compose/kafka/topics.txt"]
         for name in dict.fromkeys(names):
             path = self.root / name
@@ -154,10 +161,109 @@ class RunnerFiles(SourceCase):
         self.assertIn("tests/e2e/stream_host.py", names)
         self.assertIn("tests/e2e/stack_replay.py", names)
 
+    def test_every_required_probe_is_a_runner_file_even_when_the_folder_lacks_it(self) -> None:
+        for name in self.host.REQUIRED_PROBES:
+            self.assertIn(f"tests/e2e/stream_stack/{name}", self.host.runner_files(self.root))
+        self.assertEqual(
+            {path.name for path in (ROOT / "tests" / "e2e" / "stream_stack").glob("*.py")},
+            set(self.host.REQUIRED_PROBES),
+            "a probe of the folder is not in REQUIRED_PROBES, or a required one is gone",
+        )
+
+    def test_a_required_probe_that_is_deleted_from_the_checkout_is_named_as_missing(self) -> None:
+        self.good()
+        (self.root / "tests/e2e/stream_stack/read_lake.py").unlink()
+        self.assertTrue(any("read_lake.py" in item and "missing" in item for item in self.problems()), self.problems())
+
+    def test_a_required_probe_that_is_gone_from_the_checkout_and_the_manifest_is_still_named(self) -> None:
+        document = self.good()
+        (self.root / "tests/e2e/stream_stack/read_lake.py").unlink()
+        del document["files"]["tests/e2e/stream_stack/read_lake.py"]
+        self.write_manifest(document)
+        self.assertTrue(any("read_lake.py" in item for item in self.problems()), self.problems())
+
+    def test_a_feature_file_that_is_changed_is_named(self) -> None:
+        self.good()
+        (self.root / "features/batch.py").write_text("changed\n")
+        found = self.problems()
+        self.assertEqual(1, len(found), found)
+        self.assertIn("features/batch.py", found[0])
+        self.assertIn("differs", found[0])
+
+    def test_a_feature_file_that_the_manifest_holds_and_the_checkout_lacks_is_named_as_missing(self) -> None:
+        self.good()
+        (self.root / "features/row.py").unlink()
+        self.assertTrue(any("features/row.py" in item and "missing" in item for item in self.problems()), self.problems())
+
+    def test_an_extra_feature_file_that_the_replay_would_mount_is_named(self) -> None:
+        self.good()
+        (self.root / "features/extra.py").write_text("print('x')\n")
+        self.assertTrue(any("features/extra.py" in item and "no entry" in item for item in self.problems()), self.problems())
+
+    def test_a_manifest_entry_of_the_probe_or_feature_folders_with_no_file_is_named_as_missing(self) -> None:
+        document = self.good()
+        document["files"]["features/gone.py"] = "0" * 64
+        document["files"]["tests/e2e/stream_stack/gone_probe.py"] = "0" * 64
+        self.write_manifest(document)
+        found = self.problems()
+        self.assertTrue(any("features/gone.py" in item and "missing" in item for item in found), found)
+        self.assertTrue(any("gone_probe.py" in item and "missing" in item for item in found), found)
+
     def test_a_service_file_that_the_manifest_holds_and_the_checkout_changed_is_named(self) -> None:
         self.good()
         (self.root / "compose/kafka/topics.txt").write_text("changed\n")
         self.assertTrue(any("compose/kafka/topics.txt" in item for item in self.problems()))
+
+
+class Staging(SourceCase):
+    """The files are checked again at the moment of staging, before the first copy, and a file that no longer equals the manifest stages nothing."""
+
+    def stage(self, work: Path) -> tuple[Path, Path, Path, Path]:
+        manifest = self.host.read_source_manifest(self.root)
+        landed = work / "landed"
+
+        def landed_copy(paths: dict[str, Path], target: Path) -> tuple[Path, Path]:
+            target.mkdir()
+            reference = work / "reference.json"
+            reference.write_text("{}")
+            return target, reference
+
+        with (
+            mock.patch.object(self.host, "ROOT", self.root),
+            mock.patch.object(self.host, "build_landed_copy", landed_copy),
+        ):
+            work.mkdir()
+            staged: tuple[Path, Path, Path, Path] = self.host.prepare_folders(work, {}, manifest, self.root)
+        self.assertEqual(landed, staged[0])
+        return staged
+
+    def test_files_that_equal_the_manifest_are_staged_with_the_bytes_that_it_lists(self) -> None:
+        files = self.good()["files"]
+        _, _, probe, features = self.stage(self.root / "work")
+        for folder, prefix in ((probe, "tests/e2e/stream_stack/"), (features, "features/")):
+            for path in folder.glob("*.py"):
+                self.assertEqual(files[f"{prefix}{path.name}"], hashlib.sha256(path.read_bytes()).hexdigest(), path.name)
+
+    def test_a_file_changed_after_the_first_check_stages_nothing(self) -> None:
+        self.good()
+        (self.root / "features/batch.py").write_text("changed after the check\n")
+        work = self.root / "work"
+        with self.assertRaisesRegex(self.host.Blocked, "features/batch.py"):
+            self.stage(work)
+        self.assertEqual([], sorted(path.name for path in work.iterdir()))
+
+    def test_a_probe_changed_after_the_first_check_stages_nothing(self) -> None:
+        self.good()
+        (self.root / "tests/e2e/stream_stack/plant_late.py").write_text("changed after the check\n")
+        work = self.root / "work"
+        with self.assertRaisesRegex(self.host.Blocked, "plant_late.py"):
+            self.stage(work)
+        self.assertEqual([], sorted(path.name for path in work.iterdir()))
+
+    def test_the_run_checks_the_manifest_before_it_downloads_and_the_staging_checks_it_again(self) -> None:
+        source = inspect.getsource(self.host.run_batch)
+        self.assertLess(source.index("source_problems("), source.index("fill_landed_cache("))
+        self.assertTrue("prepare_folders(work, paths, manifest_of_source)" in source, "run_batch does not give the manifest to the staging")
 
 
 class DeployedFiles(SourceCase):

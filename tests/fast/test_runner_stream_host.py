@@ -527,7 +527,7 @@ class Measurement(HostRunnerCase):
             self.module.Sample(10.0, {0: 20, 1: 0}, {"stream": (120.0, 3100.0), "kafka": (8.0, 1100.0)}),
             self.module.Sample(15.0, {0: 0, 1: 0}, {"stream": (30.0, 3000.0)}),
         ]
-        summary = self.module.summarize(samples)
+        summary = self.module.summarize(samples, (0, 1))
         self.assertEqual(410, summary["peak_lag_events"])
         self.assertEqual(5.0, summary["peak_lag_at_seconds"])
         self.assertEqual(15.0, summary["drained_at_seconds"])
@@ -539,20 +539,20 @@ class Measurement(HostRunnerCase):
 
     def test_a_lag_that_was_zero_before_its_peak_has_not_drained_after_it(self) -> None:
         samples = [self.module.Sample(0.0, {0: 0}, {}), self.module.Sample(5.0, {0: 100}, {}), self.module.Sample(10.0, {0: 90}, {})]
-        summary = self.module.summarize(samples)
+        summary = self.module.summarize(samples, (0,))
         self.assertEqual(5.0, summary["peak_lag_at_seconds"])
         self.assertIsNone(summary["drained_at_seconds"])
 
     def test_a_lag_that_never_drains_is_reported_as_not_drained(self) -> None:
         samples = [self.module.Sample(0.0, {0: 100}, {}), self.module.Sample(5.0, {0: 90}, {})]
-        summary = self.module.summarize(samples)
+        summary = self.module.summarize(samples, (0,))
         self.assertIsNone(summary["drained_at_seconds"])
         self.assertIsNone(summary["drain_seconds_after_peak"])
 
     def test_no_sample_is_refused_and_a_lag_free_run_has_no_peak_to_drain(self) -> None:
         with self.assertRaises(ValueError):
-            self.module.summarize([])
-        summary = self.module.summarize([self.module.Sample(0.0, {0: 0}, {"a": (1.0, 2.0)})])
+            self.module.summarize([], (0,))
+        summary = self.module.summarize([self.module.Sample(0.0, {0: 0}, {"a": (1.0, 2.0)})], (0,))
         self.assertEqual(0, summary["peak_lag_events"])
         self.assertEqual(0.0, summary["drain_seconds_after_peak"])
 

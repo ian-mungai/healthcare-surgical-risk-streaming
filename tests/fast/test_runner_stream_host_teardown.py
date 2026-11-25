@@ -10,6 +10,8 @@ Failure modes covered here:
 - A Nessie reference is still there after its deletion, and the teardown counts it as removed.
 - The inventory says that the run could not read its references (``references_error``), and the teardown reports success without knowing which exist.
 - The teardown cannot ask the broker (the listing fails) and reports success.
+- A tag whose creation gave no clear answer (or was cut by an interrupt) may be the run's, and the teardown deletes the lake volume that its snapshots are
+  read from, or says "every resource is gone" and exits 0 while it keeps the object.
 """
 
 from __future__ import annotations
@@ -61,8 +63,9 @@ class FakeNessie:
 class Broker:
     """The Docker commands of a teardown: the project's resources (none left), the deployed broker's topics and the host file."""
 
-    def __init__(self, topics: set[str], *, keep_topics: bool = False, listing_fails: bool = False) -> None:
+    def __init__(self, topics: set[str], *, keep_topics: bool = False, listing_fails: bool = False, volumes: tuple[str, ...] = ()) -> None:
         self.topics = set(topics)
+        self.volumes = set(volumes)
         self.keep_topics = keep_topics
         self.listing_fails = listing_fails
         self.calls: list[tuple[str, ...]] = []
@@ -78,6 +81,10 @@ class Broker:
                 return done(0, "")
             if "--list" in args:
                 return done(1, "", "no broker") if self.listing_fails else done(0, "".join(f"{name}\n" for name in sorted(self.topics)))
+        if args[2:4] == ["volume", "ls"]:
+            return done(0, "".join(f"{name}\n" for name in sorted(self.volumes)))
+        if args[2:4] == ["volume", "rm"]:
+            self.volumes -= set(args[4:])
         return done(0, "")
 
     def removals(self) -> list[tuple[str, ...]]:
@@ -223,13 +230,60 @@ class ReferencesAreVerified(TeardownCase):
         self.assertEqual(0, self.tear_down(Broker(set()), nessie), self.output.getvalue())
         self.assertEqual({}, nessie.references)
 
-    def test_objects_of_unconfirmed_ownership_are_reported_and_left_alone(self) -> None:
+    def test_a_topic_of_unconfirmed_ownership_is_left_alone_and_the_teardown_is_incomplete(self) -> None:
         self.inventory(unconfirmed=[f"topic replay_events_p8h_{SUFFIX}_late"])
         broker = Broker({f"replay_events_p8h_{SUFFIX}_late"})
-        self.assertEqual(0, self.tear_down(broker, self.branch()))
+        self.assertEqual(1, self.tear_down(broker, self.branch()))
         self.assertEqual([], broker.deletions())
-        self.assertIn(f"replay_events_p8h_{SUFFIX}_late", self.output.getvalue())
-        self.assertIn("kept", self.output.getvalue())
+        text = self.output.getvalue()
+        self.assertIn(f"replay_events_p8h_{SUFFIX}_late", text)
+        self.assertIn("INCOMPLETE", text)
+        self.assertNotIn("every resource is gone", text)
+
+
+class UnresolvedTags(TeardownCase):
+    VOLUME = f"{PROJECT}_lake_warehouse"
+    TAG = f"tag stream_features_{SUFFIX}"
+
+    def test_a_tag_of_unconfirmed_ownership_keeps_the_lake_volume_and_the_teardown_is_incomplete(self) -> None:
+        self.inventory(unconfirmed=[self.TAG])
+        broker = Broker(set(), volumes=(self.VOLUME,))
+        self.assertEqual(1, self.tear_down(broker, self.branch()))
+        self.assertEqual({self.VOLUME}, broker.volumes)
+        self.assertNotIn(("volume", "rm"), [call[2:4] for call in broker.calls])
+        text = self.output.getvalue()
+        self.assertIn("INCOMPLETE", text)
+        self.assertIn(self.TAG, text)
+        self.assertIn(self.VOLUME, text)
+        self.assertNotIn("every resource is gone", text)
+
+    def test_the_other_resources_of_the_project_are_still_removed(self) -> None:
+        self.inventory(unconfirmed=[self.TAG])
+        broker = Broker({INPUT}, volumes=(self.VOLUME,))
+        nessie = self.branch()
+        self.assertEqual(1, self.tear_down(broker, nessie))
+        self.assertEqual([INPUT], broker.deletions())
+        self.assertEqual({}, nessie.references)
+
+    def test_a_second_teardown_keeps_the_volume_again(self) -> None:
+        self.inventory(unconfirmed=[self.TAG])
+        broker = Broker(set(), volumes=(self.VOLUME,))
+        for _ in range(2):
+            self.assertEqual(1, self.tear_down(broker, self.branch()))
+        self.assertEqual({self.VOLUME}, broker.volumes)
+
+    def test_a_topic_alone_does_not_keep_the_volume(self) -> None:
+        self.inventory(unconfirmed=[f"topic replay_events_p8h_{SUFFIX}_late"])
+        broker = Broker(set(), volumes=(self.VOLUME,))
+        self.assertEqual(1, self.tear_down(broker, self.branch()))
+        self.assertEqual(set(), broker.volumes)
+
+    def test_a_run_with_nothing_unresolved_removes_the_volume_and_says_so(self) -> None:
+        self.inventory()
+        broker = Broker(set(), volumes=(self.VOLUME,))
+        self.assertEqual(0, self.tear_down(broker, self.branch()), self.output.getvalue())
+        self.assertEqual(set(), broker.volumes)
+        self.assertIn("every resource is gone", self.output.getvalue())
 
 
 if __name__ == "__main__":
