@@ -60,9 +60,11 @@ host-stop:
 host-start:
 	$(PYTHON) -m scripts.infra.host start
 
+# RUNNERS reaches the program in the environment and is split there on white space, so that no shell globs, splits or expands a name.
+export RUNNERS
 host-runners-place:
 	$(if $(RUNNERS),,$(error name the runner files: make host-runners-place RUNNERS="tests/e2e/silver_signals.py ..."))
-	$(PYTHON) -m scripts.infra.runner_place $(RUNNERS)
+	$(PYTHON) -m scripts.infra.runner_place --names-from-environment
 
 inventory:
 	$(PYTHON) -m scripts.infra.inventory

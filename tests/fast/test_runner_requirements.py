@@ -26,17 +26,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.infra.runner_imports import LOADED_BY_PATH, DiskSource, OverlaySource, closure, locked_distributions, unlocked
 from tests.fast.ansible_paths import ROLES, group_variables
-from tests.fast.runner_imports import closure, locked_distributions, unlocked
 
 ROOT = Path(__file__).resolve().parents[2]
 HOST_RUNNERS = ("tests/e2e/silver_signals.py", "tests/e2e/silver_hypotension.py", "tests/e2e/gold_dimensions.py", "tests/e2e/stream_host.py")
-# The tracked modules that the host runners share, and the module that stream_host.py loads by its path.
+# The tracked modules that the host runners share; the module that stream_host.py loads by its path is LOADED_BY_PATH of the placement tool.
 SHARED = ("tests/e2e/run_record.py", "tests/e2e/commit_guards.py", "tests/e2e/deadline.py")
-LOADED_BY_PATH = {"tests/e2e/stream_host.py": ("ansible/roles/compose_stack/library/kafka_topics.py",)}
 LOCK_PACKAGES = {"yaml": "pyyaml", "ansible": "ansible-core"}
-# The files that load a module at run time by a path or a name, so that a new one is read by a person.
-DYNAMIC = {"tests/e2e/stream_host.py", "ansible/roles/compose_stack/library/kafka_topics.py"} - {"ansible/roles/compose_stack/library/kafka_topics.py"}
 
 
 def installed_locks() -> list[str]:
@@ -44,27 +41,28 @@ def installed_locks() -> list[str]:
     return [(ROOT / name).read_text() for name in group_variables()["runner_checkout_requirements"]]
 
 
-def entry_files() -> list[Path]:
-    paths = [ROOT / name for name in SHARED]
-    paths += [ROOT / name for names in LOADED_BY_PATH.values() for name in names]
-    return paths
+def entry_files() -> list[str]:
+    return [*SHARED, *(name for names in LOADED_BY_PATH.values() for name in names)]
+
+
+DISK = DiskSource(ROOT)
 
 
 class RealRunnersTest(unittest.TestCase):
     def test_every_third_party_package_of_the_shared_modules_and_the_loaded_topic_parser_is_pinned_by_an_installed_lock_file(self) -> None:
-        found = closure(ROOT, entry_files())
+        found = closure(DISK, entry_files())
         self.assertEqual([], found.missing)
         self.assertEqual({"yaml", "ansible"}, set(found.third_party), "the host process's packages; a new one is a decision about the lock files")
         self.assertEqual([], unlocked(found.third_party, locked_distributions(installed_locks())))
 
     def test_every_third_party_package_of_each_host_runner_that_is_on_disk_is_pinned_by_an_installed_lock_file(self) -> None:
-        present = [ROOT / name for name in HOST_RUNNERS if (ROOT / name).is_file()]
+        present = [name for name in HOST_RUNNERS if (ROOT / name).is_file()]
         if not present:
             self.skipTest("the host runners are untracked and none is on disk here")
         locked = locked_distributions(installed_locks())
         for runner in present:
-            with self.subTest(runner=runner.name):
-                found = closure(ROOT, [runner, *entry_files()])
+            with self.subTest(runner=runner):
+                found = closure(DISK, [runner, *entry_files()])
                 self.assertEqual([], found.missing)
                 self.assertEqual([], unlocked(found.third_party, locked))
                 self.assertLessEqual(set(found.third_party), set(LOCK_PACKAGES), "only PyYAML and ansible-core are expected in the host process")
@@ -74,7 +72,7 @@ class RealRunnersTest(unittest.TestCase):
             if not (ROOT / name).is_file():
                 continue
             with self.subTest(runner=name):
-                found = closure(ROOT, [ROOT / name])
+                found = closure(DISK, [name])
                 self.assertEqual({name} if name in LOADED_BY_PATH else set(), {item for item in found.dynamic if item.startswith("tests/e2e/")})
 
 
@@ -108,16 +106,15 @@ class ChosenSetTest(unittest.TestCase):
 class ReaderTest(unittest.TestCase):
     """The read itself, on a small tree: each failure mode above has a file that breaks it and one that does not."""
 
-    def tree(self, files: dict[str, str]) -> Path:
+    def tree(self, files: dict[str, str]) -> DiskSource:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="imports_")))
         for name, text in files.items():
             (folder / name).parent.mkdir(parents=True, exist_ok=True)
             (folder / name).write_text(text)
-        return folder
+        return DiskSource(folder)
 
     def third(self, files: dict[str, str], entry: str = "tests/run.py") -> dict[str, set[str]]:
-        root = self.tree(files)
-        found = closure(root, [root / entry])
+        found = closure(self.tree(files), [entry])
         self.assertEqual([], found.missing)
         return {name: set(places) for name, places in found.third_party.items()}
 
@@ -152,11 +149,39 @@ class ReaderTest(unittest.TestCase):
         for call in ("importlib.util.spec_from_file_location('n', p)", "importlib.import_module(name)", "__import__(name)"):
             with self.subTest(call=call):
                 root = self.tree({**self.BASE, "tests/run.py": f"import importlib.util\nname = p = 'x'\n{call}\n"})
-                self.assertEqual({"tests/run.py"}, closure(root, [root / "tests/run.py"]).dynamic)
+                self.assertEqual({"tests/run.py"}, closure(root, ["tests/run.py"]).dynamic)
 
     def test_a_repository_module_with_no_file_is_reported(self) -> None:
         root = self.tree({**self.BASE, "tests/run.py": "from scripts.gone import x\n"})
-        self.assertEqual(["tests/run.py: scripts.gone has no file"], closure(root, [root / "tests/run.py"]).missing)
+        self.assertEqual(["tests/run.py: scripts.gone has no file"], closure(root, ["tests/run.py"]).missing)
+
+    def test_a_package_that_a_module_takes_through_a_relative_import_is_found_at_any_level(self) -> None:
+        files = {
+            **self.BASE,
+            "tests/sub/__init__.py": "",
+            "tests/run.py": "from . import sibling\nfrom .tool import go\nfrom .sub import deep\n",
+            "tests/sibling.py": "import vitaldb\n",
+            "tests/tool.py": "import boto3\n\ndef go():\n    pass\n",
+            "tests/sub/deep.py": "from .. import above\nfrom ..scripts_like import x\n",
+            "tests/above.py": "import fastavro\n",
+            "tests/scripts_like.py": "import pyarrow\nx = 1\n",
+        }
+        self.assertEqual(
+            {"vitaldb": {"tests/sibling.py"}, "boto3": {"tests/tool.py"}, "fastavro": {"tests/above.py"}, "pyarrow": {"tests/scripts_like.py"}},
+            self.third(files),
+        )
+
+    def test_a_relative_import_with_no_file_or_one_that_climbs_out_of_the_repository_is_reported(self) -> None:
+        root = self.tree({**self.BASE, "tests/run.py": "from .gone import x\nfrom ... import y\n"})
+        found = closure(root, ["tests/run.py"]).missing
+        self.assertEqual(["tests/run.py: tests.gone has no file", "tests/run.py: a relative import leaves the repository"], found)
+
+    def test_a_file_that_the_source_does_not_hold_is_reported_and_an_overlay_replaces_the_text_that_the_base_holds(self) -> None:
+        base = self.tree({**self.BASE, "tests/run.py": "import json\n"})
+        overlay = OverlaySource(base, {"tests/run.py": "import vitaldb\n", "tests/new.py": "import boto3\n"})
+        self.assertEqual({"vitaldb": {"tests/run.py"}}, {name: set(places) for name, places in closure(overlay, ["tests/run.py"]).third_party.items()})
+        self.assertEqual({"boto3": {"tests/new.py"}}, {name: set(places) for name, places in closure(overlay, ["tests/new.py"]).third_party.items()})
+        self.assertEqual(["tests/none.py: the file is not there"], closure(base, ["tests/none.py"]).missing)
 
     def test_a_package_is_unlocked_when_no_lock_file_pins_its_distribution_or_no_distribution_is_known(self) -> None:
         found = {"yaml": {"a.py"}, "vitaldb": {"b.py"}, "mystery": {"c.py"}}
