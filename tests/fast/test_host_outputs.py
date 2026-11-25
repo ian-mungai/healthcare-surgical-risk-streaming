@@ -22,13 +22,19 @@ from pathlib import Path
 INFRA = Path(__file__).resolve().parents[2] / "infra"
 ADDRESS_TEST = INFRA / "tests" / "changing_address.tftest.hcl"
 MARKERS = ("198.51.100.77", "marker-ip.invalid")
-OUTPUT_START = re.compile(r'^\s*output\s+"([^"]+)"\s*\{', re.MULTILINE)
+OUTPUT_START = re.compile(r'(?:^|(?<=[\s;}]))output\s+"([^"]+)"\s*\{', re.MULTILINE)
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 COMMENT_LINE = re.compile(r"^\s*(?:#|//).*$", re.MULTILINE)
 
 
 def root_output_names(texts: list[str]) -> set[str]:
-    """The name of every root output in the given Terraform texts. A commented line declares none."""
-    return {match.group(1) for text in texts for match in OUTPUT_START.finditer(COMMENT_LINE.sub("", text))}
+    """The name of every root output in the given Terraform texts. A commented line or a block comment declares none, and a block comment or a line break
+    inside an output's header does not hide it."""
+    found: set[str] = set()
+    for text in texts:
+        bare = COMMENT_LINE.sub("", BLOCK_COMMENT.sub(" ", text))
+        found.update(match.group(1) for match in OUTPUT_START.finditer(bare))
+    return found
 
 
 def unchecked_outputs(names: set[str], test_text: str) -> list[str]:
@@ -77,7 +83,11 @@ class RootOutputChecksTest(unittest.TestCase):
                 self.assertEqual(["host_role_arn"], unchecked_outputs(names, text))
 
     def test_a_commented_output_declares_nothing(self) -> None:
-        self.assertEqual(set(), root_output_names(['# output "x" {\n']))
+        self.assertEqual(set(), root_output_names(['# output "x" {\n', '/* output "y" {\n} */\n']))
+
+    def test_an_output_header_with_block_comments_or_line_breaks_is_found(self) -> None:
+        texts = ['output /* moved */ "a" {\n', 'output\n"b" /* c */ {\n', '/* x */ output "c" {\n', 'output "d"\n{\n']
+        self.assertEqual({"a", "b", "c", "d"}, root_output_names(texts))
 
 
 if __name__ == "__main__":
