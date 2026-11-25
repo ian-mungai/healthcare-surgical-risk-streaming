@@ -1091,6 +1091,26 @@ class HostRunnerCase(unittest.TestCase):
                 self.assertEqual(accepted, any(words.startswith("image tag") for words in calls.words()))
                 self.assertEqual(accepted, self.passed(record, "image source"))
 
+    def test_the_docker_ignore_file_is_read_as_docker_reads_it_before_the_run_accepts_an_image(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        answer = lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else ""  # noqa: E731
+        without_x = f"{SHA_Y} spark/silver/y.py\n{SHA_Z} scripts/stack/nessie.py\n"
+        for label, files, ignore, accepted in (
+            ("a hash after a space is a rule of a form that is not read", IMAGE_FILES, DOCKERIGNORE + " #*/drop.py\n", False),
+            ("a hash after a tab is a rule of a form that is not read", IMAGE_FILES, DOCKERIGNORE + "\t#spark/jobs/*.py\n", False),
+            ("a hash in the first column is a comment", IMAGE_FILES, DOCKERIGNORE + "#*/drop.py\n", True),
+            ("a mark before the rule leaves the file out and the image holds it", IMAGE_FILES, "\ufeffspark/jobs/x.py\n", False),
+            ("a mark before the rule leaves the file out and the image lacks it", without_x, "\ufeffspark/jobs/x.py\n", True),
+            ("a mark alone on the first line changes no rule", without_x, "\ufeff\nspark/jobs/x.py\n", True),
+            ("a mark before a comment is a comment", IMAGE_FILES, "\ufeff# spark/jobs/x.py\n", True),
+            ("line ends of a carriage return and a line feed change no rule", without_x, DOCKERIGNORE.replace("\n", "\r\n") + "spark/jobs/x.py\r\n", True),
+        ):
+            with self.subTest(case=label):
+                result, calls, record = self.image_run(module, given=True, answer=answer, files=files, dockerignore=ignore)
+                self.assertEqual((accepted, accepted), result)
+                self.assertEqual(accepted, any(words.startswith("image tag") for words in calls.words()))
+                self.assertEqual(accepted, self.passed(record, "image source"))
+
     def test_a_given_image_with_the_recorded_id_but_other_files_than_the_commit_is_refused_and_nothing_is_tagged(self) -> None:
         module = self.module(**{self.flag: "1"})
         for label, files in (

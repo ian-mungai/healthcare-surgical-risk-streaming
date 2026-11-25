@@ -200,6 +200,9 @@ def dockerfile_copies(dockerfile: str) -> list[tuple[list[str], str]] | None:
 # One line of a Docker ignore file: whether it is an exception (``!``), whether it starts with ``**/``, and the names of its path.
 IgnoreRule = tuple[bool, bool, tuple[str, ...]]
 IGNORE_NOT_READ = re.compile(r"[?\[\\]|\*\*")
+BYTE_ORDER_MARK = "\ufeff"
+# The characters that Go's ``strings.TrimSpace`` trims (``unicode.IsSpace``): not those of Python's ``str.strip`` (it also trims U+001C to U+001F).
+DOCKER_SPACE = "\t\n\v\f\r \x85\xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000"
 
 
 def dockerignore_rules(text: str) -> list[IgnoreRule] | None:
@@ -209,14 +212,25 @@ def dockerignore_rules(text: str) -> list[IgnoreRule] | None:
     and only the forms that ``spark/Dockerfile.dockerignore`` uses are read: a blank line and a ``#`` comment (skipped), a path from the root of the context
     whose names are plain or are a lone ``*`` (any one name), a leading ``**/`` (any number of folders), and ``!`` before a pattern (an exception). Anything
     else (``*`` or ``**`` inside a name, ``?``, ``[``, a backslash, a rooted, ``.``, ``..``, empty or trailing-slash name, a bare ``!``) makes the check
-    unreadable, so that a form that it does not know is never read as a rule that it does."""
+    unreadable, so that a form that it does not know is never read as a rule that it does.
+
+    The lines are read as ``ReadAll`` of moby's ``ignorefile`` package reads them at the engine that builds the image (Docker 29.9.3, file
+    https://github.com/moby/moby/blob/docker-v29.9.3/vendor/github.com/moby/patternmatcher/ignorefile/ignorefile.go): a line ends at a line feed only, and
+    the default split function of ``bufio.NewScanner`` (``ScanLines``, line 33) drops one carriage return before it (the trim of line 46 would drop it too);
+    a byte order mark is taken off the first line only (lines 36-39); a line whose first character is ``#`` is a comment, so a ``#`` after white space starts
+    a pattern (lines 42-45); the white space around the rest is trimmed with ``strings.TrimSpace`` (line 46), then once more after a ``!`` (lines 52-55). A
+    pattern that this reading gives and that the check does not implement     makes the check unreadable."""
     rules: list[IgnoreRule] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    lines = text.split("\n")
+    lines[0] = lines[0].removeprefix(BYTE_ORDER_MARK)
+    for line in lines:
+        if line.startswith("#"):
+            continue
+        line = line.strip(DOCKER_SPACE)
+        if not line:
             continue
         exception = line.startswith("!")
-        names = (line[1:].strip() if exception else line).split("/")
+        names = (line[1:].strip(DOCKER_SPACE) if exception else line).split("/")
         anywhere = names[0] == "**"
         if anywhere:
             names = names[1:]

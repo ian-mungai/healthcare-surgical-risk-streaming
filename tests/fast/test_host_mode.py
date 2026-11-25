@@ -540,13 +540,17 @@ def kept(ignore: str, dockerfile: str, *paths: str) -> list[str] | None:
 
 
 APP = "COPY app /opt/jobs/app\n"
+HASH_COPY = "COPY #b.py /opt/jobs/b.py\n"
 
 
 class DockerIgnoreTest(unittest.TestCase):
     """The Docker ignore file is applied to the build context before ``COPY`` reads it. The rules are those of the Docker documentation, "Build context",
     ".dockerignore files" (https://docs.docker.com/build/concepts/context/#dockerignore-files): a pattern is read from the root of the context, ``*`` matches
-    any characters of one name, a leading ``**/`` matches any number of folders, a line that starts with ``!`` is an exception, a line that starts with ``#``
-    is a comment, and the last line that matches a path decides. A path is also matched by its folders (a rule for a folder is a rule for what is in it)."""
+    any characters of one name, a leading ``**/`` matches any number of folders, a line that starts with ``!`` is an exception, a line whose first character is
+    ``#`` (after a byte order mark on the first line, and with no white space before it) is a comment, and the last line that matches a path decides. The lines
+    are read as ``ReadAll`` of moby's ``ignorefile`` package reads them at Docker 29.9.3
+    (https://github.com/moby/moby/blob/docker-v29.9.3/vendor/github.com/moby/patternmatcher/ignorefile/ignorefile.go#L24-L73). A path is also matched by its
+    folders (a rule for a folder is a rule for what is in it)."""
 
     def test_a_file_that_no_rule_names_is_in_the_image_and_an_empty_ignore_file_has_no_rule(self) -> None:
         for ignore in ("", "\n\n", "# only a comment\n", "  \n"):
@@ -605,6 +609,85 @@ class DockerIgnoreTest(unittest.TestCase):
     def test_a_comment_is_only_a_line_that_starts_with_a_hash(self) -> None:
         self.assertEqual(["app/a.py", "app/b.py"], kept("app/b.py # not a comment here\napp/a.py\n!app/a.py\n", APP, "app/a.py", "app/b.py"))
         self.assertEqual(["app/a.py", "app/b.py"], kept("#app/a.py\n#!app/b.py\n", APP, "app/a.py", "app/b.py"))
+
+    def test_a_hash_after_white_space_is_a_pattern_and_not_a_comment_as_the_docker_reader_reads_it(self) -> None:
+        for label, ignore in (("a space", " #b.py\n"), ("a tab", "\t#b.py\n"), ("a carriage return", "\r#b.py\n"), ("a no-break space", "\xa0#b.py\n")):
+            with self.subTest(before_the_hash=label):
+                self.assertIsNone(kept(ignore, HASH_COPY, "#b.py"))
+                self.assertEqual(["b.py"], kept(ignore + "!#b.py\n", HASH_COPY, "#b.py"))
+        self.assertEqual(["b.py"], kept("#b.py\n", HASH_COPY, "#b.py"))
+
+    def test_a_pattern_that_starts_with_a_hash_after_white_space_and_is_not_read_makes_the_listing_unreadable_and_never_a_comment(self) -> None:
+        tree = tree_of("app/a.py", "app/drop.py")
+        listing = f"{'01' * 20} app/a.py\n{'02' * 20} app/drop.py\n"
+        for ignore in (" #*/drop.py\n", "\t#app/a?.py\n", "  #app/[ab].py\n", "app/a.py\n #**\n"):
+            with self.subTest(ignore=ignore):
+                self.assertIsNone(kept(ignore, APP, "app/a.py", "app/drop.py"))
+                self.assertEqual("image_source_unreadable", source_problem(listing, tree, APP, ignore))
+
+    def test_a_carriage_return_ends_no_line_and_is_part_of_the_line_end_only_before_a_line_feed(self) -> None:
+        self.assertEqual(["app/a.py"], kept("app/b.py\r\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept("#app/b.py\r\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept("app/b.py\r\n!app/b.py\r\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept("app/b.py\r\n\r\n! app/b.py \r\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py"], kept("app/b.py\r\r\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py"], kept("app/b.py\r", APP, "app/a.py", "app/b.py"))
+
+    def test_only_a_line_feed_ends_a_line_so_another_line_separator_inside_a_line_is_part_of_its_pattern(self) -> None:
+        for mark in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            with self.subTest(mark=ascii(mark)):
+                ignore = f"app/a.py{mark}app/b.py\n"
+                self.assertEqual(["app/a.py", "app/b.py"], kept(ignore, APP, "app/a.py", "app/b.py"))
+
+    def test_the_white_space_around_a_pattern_is_the_white_space_that_the_docker_reader_trims_and_no_other(self) -> None:
+        for mark in (" ", "\t", "\x0b", "\x0c", "\x85", "\xa0", "\u1680", "\u2003", "\u200a", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000"):
+            with self.subTest(trimmed=ascii(mark)):
+                self.assertEqual(["app/a.py"], kept(f"{mark}app/b.py{mark}\n", APP, "app/a.py", "app/b.py"))
+                self.assertEqual(["app/a.py", "app/b.py"], kept(f"{mark}!{mark}app/b.py\napp/b.py\n{mark}!{mark}app/b.py{mark}\n", APP, "app/a.py", "app/b.py"))
+        for mark in ("\x1c", "\x1d", "\x1e", "\x1f", "\u200b", "\u2060"):
+            with self.subTest(kept_in_the_name=ascii(mark)):
+                self.assertEqual(["app/a.py", "app/b.py"], kept(f"{mark}app/b.py\n", APP, "app/a.py", "app/b.py"))
+                self.assertEqual(["app/a.py", "app/b.py"], kept(f"app/b.py{mark}\n", APP, "app/a.py", "app/b.py"))
+                self.assertEqual(["app/a.py"], kept(f"app/b.py\n!{mark}app/b.py\n", APP, "app/a.py", "app/b.py"))
+
+    def test_a_byte_order_mark_is_taken_off_the_first_line_only_and_once(self) -> None:
+        mark = "\ufeff"
+        for label, ignore in (
+            ("before a rule", f"{mark}app/b.py\n"),
+            ("before a rule and a carriage return", f"{mark}app/b.py\r\n"),
+            ("before a rule that follows a comment", f"{mark}# comment\napp/b.py\n"),
+            ("alone on the first line", f"{mark}\napp/b.py\n"),
+            ("alone on the first line with a carriage return", f"{mark}\r\napp/b.py\r\n"),
+            ("before white space and a rule", f"{mark}  app/b.py\n"),
+        ):
+            with self.subTest(mark=label):
+                self.assertEqual(["app/a.py"], kept(ignore, APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept(f"{mark}", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept(f"{mark}\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept(f"{mark}# comment\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept(f"{mark}{mark}app/a.py\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept(f"app/a.py\n!app/a.py\n{mark}app/b.py\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept(f"\n{mark}app/b.py\n", APP, "app/a.py", "app/b.py"))
+
+    def test_a_byte_order_mark_before_a_rule_is_that_rule_in_the_check_of_the_image(self) -> None:
+        tree = tree_of("app/a.py", "app/b.py")
+        only_a = f"{'01' * 20} app/a.py\n"
+        both = only_a + f"{'02' * 20} app/b.py\n"
+        for ignore in ("\ufeffapp/b.py\n", "\ufeff\napp/b.py\n"):
+            with self.subTest(ignore=ignore):
+                self.assertIsNone(source_problem(only_a, tree, APP, ignore))
+                self.assertEqual("image_source_differs", source_problem(both, tree, APP, ignore))
+        self.assertEqual("image_source_unreadable", source_problem(both, tree, APP, "\ufeffapp/*.py\n"))
+
+    def test_the_real_ignore_file_is_read_the_same_with_a_byte_order_mark_and_with_line_ends_of_a_carriage_return_and_a_line_feed(self) -> None:
+        tree = committed("ls-tree", "-r", "HEAD")
+        dockerfile = committed("show", "HEAD:spark/Dockerfile")
+        dockerignore = committed("show", "HEAD:spark/Dockerfile.dockerignore")
+        expected = host_mode.image_source_files(dockerfile, tree, dockerignore)
+        self.assertIsNotNone(expected)
+        self.assertEqual(expected, host_mode.image_source_files(dockerfile, tree, "\ufeff" + dockerignore))
+        self.assertEqual(expected, host_mode.image_source_files(dockerfile, tree, dockerignore.replace("\n", "\r\n")))
+        self.assertEqual(expected, host_mode.image_source_files(dockerfile, tree, "\ufeff" + dockerignore.replace("\n", "\r\n")))
 
     def test_a_form_that_the_check_does_not_implement_makes_the_listing_unreadable_and_never_a_match(self) -> None:
         forms = {
