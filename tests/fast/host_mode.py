@@ -49,9 +49,10 @@ SOURCE_SCRIPT = (
     "    data = path.read_bytes()\n"
     "    print(hashlib.sha1(b'blob %d\\0' % len(data) + data).hexdigest(), path.relative_to(root).as_posix())\n"
 )
-IMAGE_REFERENCE = re.compile(
-    r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
-)
+IMAGE_NAME = r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]+)?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+# A name with a tag, or a name with the digest that ``compose/image_pins.yml`` gives (the host pulls by digest, so it holds no tag of the publisher's).
+IMAGE_REFERENCE = re.compile(rf"{IMAGE_NAME}:[A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}}")
+DIGEST_REFERENCE = re.compile(rf"{IMAGE_NAME}@sha256:[0-9a-f]{{64}}")
 
 
 class HostSettingError(ValueError):
@@ -143,32 +144,42 @@ def pinned_folders(environ: Mapping[str, str], host: bool, landed_default: Path,
     return Folders(landed, extra, tuple(problems))
 
 
-def image_choice(environ: Mapping[str, str], tag: str) -> Image:
+def image_choice(environ: Mapping[str, str], tag: str, pinned: str | None = None) -> Image:
     """The image of the run. ``tag`` is the run's own tag. With ``SPARK_IMAGE`` the run reads that image (it must exist) and gives its own tag to the image
     whose immutable ID is ``SPARK_IMAGE_ID`` (the ID that the deploy recorded for the tested build), and it leaves the given image as it is. Without it the run
-    builds the image under its own tag. An empty setting is no setting. A reference without a tag, or one that ``docker`` could read as an option or as two
-    words, an ID that is not a full sha256 ID, a given image without an ID and an ID without an image are refused, and the text never holds the value."""
+    builds the image under its own tag. An empty setting is no setting. A reference with neither a tag nor a digest, or one that ``docker`` could read as an
+    option or as two words, an ID that is not a full sha256 ID, a given image with a tag and no ID and an ID with no image are refused, and the text never
+    holds the value.
+
+    A digest reference (``<repository>@sha256:<64 hex digits>``) names its content, so it needs no ID from the operator: ``expected_id`` is then the ID that
+    is given, or None, and the run only needs Docker to give a readable ID. ``pinned`` is the digest reference of the Spark image that the pin file of the
+    checkout names, which a host run takes as the given image when the operator gives none (the host builds nothing and holds no tag of the publisher's)."""
     given = environ.get("SPARK_IMAGE", "")
     identifier = environ.get("SPARK_IMAGE_ID", "")
+    if given == "" and pinned is not None:
+        if DIGEST_REFERENCE.fullmatch(pinned) is None:
+            raise HostSettingError("the pinned Spark image is not a digest reference")
+        given = pinned
     if given == "":
         if identifier != "":
             raise HostSettingError("SPARK_IMAGE_ID is set without SPARK_IMAGE")
         return Image(tag, True, None, None)
-    if IMAGE_REFERENCE.fullmatch(given) is None:
-        raise HostSettingError("SPARK_IMAGE is not an image name with a tag")
-    if identifier == "":
+    by_digest = DIGEST_REFERENCE.fullmatch(given) is not None
+    if not by_digest and IMAGE_REFERENCE.fullmatch(given) is None:
+        raise HostSettingError("SPARK_IMAGE is not an image name with a tag or a digest")
+    if identifier == "" and not by_digest:
         raise HostSettingError("SPARK_IMAGE_ID is not set")
-    if IMAGE_ID.fullmatch(identifier) is None:
+    if identifier != "" and IMAGE_ID.fullmatch(identifier) is None:
         raise HostSettingError("SPARK_IMAGE_ID is not an image ID (sha256: and 64 hexadecimal characters)")
-    return Image(tag, False, given, identifier)
+    return Image(tag, False, given, identifier or None)
 
 
-def image_id_problem(actual: str, expected: str) -> str | None:
+def image_id_problem(actual: str, expected: str | None) -> str | None:
     """A fixed code when the ID that Docker gave for the given image is not the one that the deploy recorded, or None. An ID that is not a full sha256 ID
-    (empty, a placeholder, with a line end) is never a match."""
+    (empty, a placeholder, with a line end) is never a match. With no recorded ID (a digest reference names its content) the ID only has to be readable."""
     if IMAGE_ID.fullmatch(actual) is None:
         return "image_id_unreadable"
-    return None if actual == expected else "image_id_mismatch"
+    return None if expected is None or actual == expected else "image_id_mismatch"
 
 
 def dockerfile_copies(dockerfile: str) -> list[tuple[list[str], str]] | None:

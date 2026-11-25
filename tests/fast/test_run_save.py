@@ -548,7 +548,8 @@ class SilverRunners(unittest.TestCase):
 
         patches: list[Any] = [
             mock.patch.object(module, "ROOT", folder),
-            mock.patch.object(module, "recorded_state", lambda _: ("revision", "0" * 64)),
+            mock.patch.object(module, "recorded_state", lambda _: ("revision", "0" * 64), create=True),
+            mock.patch.object(module, "checkout_state", lambda *_: ("revision", "0" * 64), create=True),
             mock.patch.object(module, "run_local", run_local),
             mock.patch.object(module, "stand_in_defined", lambda _: True, create=True),
             *([] if dry else [mock.patch.object(module, "planned_reference_names", planned, create=True)]),

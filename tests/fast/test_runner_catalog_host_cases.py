@@ -45,6 +45,7 @@ from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 BUCKET = "bucket-x"
+PINNED_SPARK = "example.invalid/spark@sha256:" + "a" * 64
 TAG_STATE = "ready"
 
 
@@ -293,10 +294,11 @@ class DeadlineLine(unittest.TestCase):
 
 def rendered_config(trino: str | None, spark: str | None) -> str:
     """The standard output of ``docker compose config --format json``: the WAREHOUSE_LOCATION of each engine's service, or none when its value is None."""
-    services = {
+    services: dict[str, dict[str, Any]] = {
         name: {"environment": {"WAREHOUSE_LOCATION": value, "AWS_REGION": "us-east-1"} if value is not None else {"AWS_REGION": "us-east-1"}}
         for name, value in (("trino", trino), ("spark", spark))
     }
+    services["spark"]["image"] = PINNED_SPARK
     return json.dumps({"name": "p", "services": services})
 
 
@@ -708,6 +710,7 @@ class FailingSeed(unittest.TestCase):
             mock.patch.multiple(
                 module,
                 Remote=lambda: SimpleNamespace(remove_file=lambda path: None),
+                committed_reference=lambda name: PINNED_SPARK,
                 Stack=lambda target, rec, lg: HostStack(),
                 load_configuration=lambda: {"S3_BUCKET": BUCKET},
                 configured_warehouse_location=lambda: "s3://wh/",
@@ -743,6 +746,7 @@ class FailingSeed(unittest.TestCase):
         with mock.patch.multiple(
             module,
             Remote=lambda: SimpleNamespace(remove_file=lambda path: None),
+            committed_reference=lambda name: PINNED_SPARK,
             Stack=lambda target, rec, lg: HostStack(),
             load_configuration=lambda: {"S3_BUCKET": BUCKET},
             configured_warehouse_location=lambda: "s3://wh/",
@@ -837,6 +841,7 @@ class WarehouseSettings(unittest.TestCase):
             mock.patch.multiple(
                 module,
                 Remote=lambda: SimpleNamespace(remove_file=lambda path: None),
+                committed_reference=lambda name: PINNED_SPARK,
                 Stack=lambda target, rec, lg: HostStack(),
                 load_configuration=lambda: {"S3_BUCKET": BUCKET},
                 configured_warehouse_location=lambda: "s3://wh/",

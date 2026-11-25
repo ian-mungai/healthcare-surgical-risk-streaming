@@ -152,7 +152,7 @@ class ImageChoiceTest(unittest.TestCase):
         for value in ("--rm", "-v", "a b", "image;rm", "image:", "UPPER:tag", "a:b:c", "image\n", "/abs/path"):
             with self.subTest(value=value), self.assertRaises(HostSettingError) as caught:
                 image_choice({"SPARK_IMAGE": value, "SPARK_IMAGE_ID": self.IMAGE_ID}, self.TAG)
-            self.assertEqual("SPARK_IMAGE is not an image name with a tag", str(caught.exception))
+            self.assertEqual("SPARK_IMAGE is not an image name with a tag or a digest", str(caught.exception))
 
     def test_a_registry_name_with_a_port_and_a_tag_is_accepted(self) -> None:
         given = {"SPARK_IMAGE": "registry.local:5000/team/spark:1.2", "SPARK_IMAGE_ID": self.IMAGE_ID}
@@ -161,6 +161,61 @@ class ImageChoiceTest(unittest.TestCase):
     def test_a_name_without_a_tag_is_refused_because_it_would_follow_latest(self) -> None:
         with self.assertRaises(HostSettingError):
             image_choice({"SPARK_IMAGE": "surgical-risk-spark", "SPARK_IMAGE_ID": self.IMAGE_ID}, self.TAG)
+
+
+class PinnedImageChoiceTest(unittest.TestCase):
+    """The host runs the digest that ``compose/image_pins.yml`` names (the host builds nothing and has no tag of the publisher's)."""
+
+    TAG = "surgical-risk-spark:p6-sig-1a2b3c4d"
+    IMAGE_ID = "sha256:" + "ab" * 32
+    PINNED = "ianmungai/healthcare_surgical_risk_streaming@sha256:" + "cd" * 32
+
+    def test_a_pinned_digest_reference_is_a_given_image_and_the_id_is_the_matching_one_that_is_given(self) -> None:
+        given = {"SPARK_IMAGE": self.PINNED, "SPARK_IMAGE_ID": self.IMAGE_ID}
+        self.assertEqual(host_mode.Image(self.TAG, False, self.PINNED, self.IMAGE_ID), image_choice(given, self.TAG))
+
+    def test_a_digest_reference_names_its_content_so_it_needs_no_id_from_the_operator(self) -> None:
+        self.assertEqual(host_mode.Image(self.TAG, False, self.PINNED, None), image_choice({"SPARK_IMAGE": self.PINNED}, self.TAG))
+
+    def test_an_id_that_is_given_with_a_digest_reference_is_still_checked_for_its_form(self) -> None:
+        with self.assertRaises(HostSettingError) as caught:
+            image_choice({"SPARK_IMAGE": self.PINNED, "SPARK_IMAGE_ID": "sha256:abc"}, self.TAG)
+        self.assertEqual("SPARK_IMAGE_ID is not an image ID (sha256: and 64 hexadecimal characters)", str(caught.exception))
+
+    def test_a_digest_reference_of_another_form_is_refused_and_the_text_never_holds_the_value(self) -> None:
+        values = (
+            "repo@sha256:abc",
+            "repo@sha256:" + "CD" * 32,
+            "repo@sha256:" + "cd" * 33,
+            "repo@md5:" + "cd" * 16,
+            "@sha256:" + "cd" * 32,
+            "repo@",
+            "re po@sha256:" + "cd" * 32,
+        )
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(HostSettingError) as caught:
+                image_choice({"SPARK_IMAGE": value}, self.TAG)
+            self.assertEqual("SPARK_IMAGE is not an image name with a tag or a digest", str(caught.exception))
+
+    def test_a_host_that_is_given_the_pinned_reference_runs_it_without_any_setting_from_the_operator(self) -> None:
+        self.assertEqual(host_mode.Image(self.TAG, False, self.PINNED, None), image_choice({}, self.TAG, pinned=self.PINNED))
+        self.assertEqual(
+            host_mode.Image(self.TAG, False, self.PINNED, self.IMAGE_ID), image_choice({"SPARK_IMAGE_ID": self.IMAGE_ID}, self.TAG, pinned=self.PINNED)
+        )
+
+    def test_an_image_that_the_operator_gives_beats_the_pinned_reference(self) -> None:
+        given = {"SPARK_IMAGE": "surgical-risk-spark:4.1.4", "SPARK_IMAGE_ID": self.IMAGE_ID}
+        self.assertEqual("surgical-risk-spark:4.1.4", image_choice(given, self.TAG, pinned=self.PINNED).source)
+
+    def test_a_pinned_reference_that_is_not_a_digest_is_refused(self) -> None:
+        with self.assertRaises(HostSettingError) as caught:
+            image_choice({}, self.TAG, pinned="surgical-risk-spark:4.1.4")
+        self.assertEqual("the pinned Spark image is not a digest reference", str(caught.exception))
+
+    def test_without_a_recorded_id_the_run_only_needs_a_readable_one_from_docker(self) -> None:
+        self.assertIsNone(image_id_problem("sha256:" + "ab" * 32, None))
+        self.assertEqual("image_id_unreadable", image_id_problem("", None))
+        self.assertEqual("image_id_unreadable", image_id_problem("sha256:abc\n", None))
 
 
 class ImageIdTest(unittest.TestCase):

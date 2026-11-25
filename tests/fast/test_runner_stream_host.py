@@ -523,6 +523,27 @@ class Images(HostRunnerCase):
         self.assertEqual((replay, spark), (stack.env["REPLAY_IMAGE"], stack.env["SPARK_IMAGE"]))
         self.assertEqual(self.rendered()["IMAGE_REPLAY"], stack.env["REPLAY_IMAGE"])
 
+    def test_the_references_come_from_the_bytes_that_were_hashed_and_not_from_a_second_read(self) -> None:
+        root, manifest = self.checkout()
+        pinned = pins.load()
+        changed = pinned["spark"]["digest"].replace(pinned["spark"]["digest"][-64:], "e" * 64)
+        other = (COMPOSE / "image_pins.yml").read_text().replace(pinned["spark"]["digest"], changed)
+        self.assertNotEqual(other, (COMPOSE / "image_pins.yml").read_text())
+        original = Path.read_bytes
+        swapped: list[bool] = []
+
+        def swap_after_the_read(path: Path) -> bytes:
+            data = original(path)
+            if path.name == "image_pins.yml" and not swapped:
+                swapped.append(True)
+                path.write_text(other)
+            return data
+
+        with mock.patch.object(Path, "read_bytes", swap_after_the_read):
+            replay, spark = self.module.deployed_images(manifest, root)
+        self.assertEqual([True], swapped)
+        self.assertEqual((pinned["replay"]["digest"], pinned["spark"]["digest"]), (replay, spark))
+
     def test_a_pin_file_that_the_manifest_does_not_list_refuses_the_run(self) -> None:
         root, manifest = self.checkout(listed=False)
         with self.assertRaises(self.module.Blocked):

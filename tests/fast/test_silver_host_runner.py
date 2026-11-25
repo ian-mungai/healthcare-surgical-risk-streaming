@@ -65,6 +65,7 @@ GIB = 1024**3
 SETTING_NAMES = ("LANDED_CACHE", "SIGNAL_CASE_CACHE", "SPARK_IMAGE", "SPARK_IMAGE_ID", *FLAGS.values())
 IMAGE_ID = "sha256:" + "ab" * 32
 OTHER_ID = "sha256:" + "cd" * 32
+STAND_IN_DIGEST = "ianmungai/healthcare_surgical_risk_streaming@sha256:" + "ef" * 32
 SHA_X, SHA_Y, SHA_Z = "a1" * 20, "b2" * 20, "c3" * 20
 # What ``git ls-tree -r HEAD`` says of the reviewed commit, and what the image's own listing says of the Python files under /opt/jobs.
 TREE = (
@@ -155,7 +156,7 @@ def refused(module: ModuleType, **given: str) -> Iterator[io.StringIO]:
     with (
         mock.patch.dict(os.environ, clean_environment(**given), clear=True),
         mock.patch.object(module, "run_command", forbidden),
-        mock.patch.object(module, "recorded_state", forbidden),
+        mock.patch.object(module, "checkout_state", forbidden),
         contextlib.redirect_stderr(errors),
     ):
         yield errors
@@ -165,7 +166,11 @@ class HostRunnerCase(unittest.TestCase):
     NAME = ""
 
     def module(self, **given: str) -> ModuleType:
-        return load_copy(self.NAME, **given)
+        """A private copy of the runner. A host copy reads the pin file of its checkout through ``pinned_reference``, which here names a stand-in digest (the
+        tests of the pin file's own use give their own)."""
+        loaded = load_copy(self.NAME, **given)
+        vars(loaded)["pinned_reference"] = lambda _name: STAND_IN_DIGEST
+        return loaded
 
     @property
     def flag(self) -> str:
@@ -206,7 +211,7 @@ class HostRunnerCase(unittest.TestCase):
                 refused(module, **{self.flag: "1"}, LANDED_CACHE="/cache", SPARK_IMAGE=value, SPARK_IMAGE_ID=IMAGE_ID) as errors,
             ):
                 self.assertEqual(2, module.main())
-            self.assertEqual(f"{self.NAME}: SPARK_IMAGE is not an image name with a tag\n", errors.getvalue())
+            self.assertEqual(f"{self.NAME}: SPARK_IMAGE is not an image name with a tag or a digest\n", errors.getvalue())
 
     def test_a_given_image_without_the_id_that_the_deploy_recorded_is_refused_before_any_work(self) -> None:
         module = self.module(**{self.flag: "1"})
@@ -237,13 +242,73 @@ class HostRunnerCase(unittest.TestCase):
         self.assertEqual((False, "surgical-risk-spark:4.1.4", IMAGE_ID), (built, source, expected))
         self.assertTrue(tag.startswith(f"{module.IMAGE_TAG}-") and tag != module.IMAGE_TAG and tag != source)
 
-    def test_the_run_image_is_built_under_a_tag_that_is_new_for_every_run_when_none_is_given(self) -> None:
-        module = self.module(**{self.flag: "1"})
+    def test_the_run_image_is_built_under_a_tag_that_is_new_for_every_run_when_none_is_given_on_this_computer(self) -> None:
+        module = self.module()
         first, (tag, built, source, expected) = self.settings(module, SPARK_IMAGE="")
         self.assertEqual(None, first[-1])
         self.assertEqual((True, None, None), (built, source, expected))
         self.assertTrue(tag.startswith(f"{module.IMAGE_TAG}-") and tag != module.IMAGE_TAG)
         self.assertNotEqual(tag, self.settings(module)[1][0])
+
+    DIGEST = "ianmungai/healthcare_surgical_risk_streaming@sha256:" + "cd" * 32
+
+    def pinned(self, module: ModuleType, reference: Any) -> Any:
+        return mock.patch.object(module, "pinned_reference", reference, create=True)
+
+    def test_a_host_that_is_given_no_image_runs_the_digest_that_the_pin_file_of_its_checkout_names(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        asked: list[str] = []
+
+        def reference(name: str) -> str:
+            asked.append(name)
+            return self.DIGEST
+
+        with self.pinned(module, reference):
+            result, (tag, built, source, expected) = self.settings(module, SPARK_IMAGE="")
+        self.assertEqual(None, result[-1])
+        self.assertEqual(["spark"], asked)
+        self.assertEqual((False, self.DIGEST, None), (built, source, expected))
+        self.assertTrue(tag.startswith(f"{module.IMAGE_TAG}-") and tag != self.DIGEST)
+
+    def test_a_host_that_is_given_an_image_never_reads_the_pin_file(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        with self.pinned(module, mock.Mock(side_effect=AssertionError("the pin file was read"))):
+            result, (_, built, source, expected) = self.settings(module, **self.given_image())
+        self.assertEqual((None, False, "surgical-risk-spark:4.1.4", IMAGE_ID), (result[-1], built, source, expected))
+
+    def test_a_host_whose_pin_file_cannot_be_used_is_refused_in_fixed_words_before_any_work(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        failure = module.HostCheckoutError("compose/image_pins.yml differs from the source manifest")
+        with self.pinned(module, mock.Mock(side_effect=failure)), refused(module, **{self.flag: "1"}, LANDED_CACHE="/cache") as errors:
+            self.assertEqual(2, module.main())
+        self.assertEqual(f"{self.NAME}: compose/image_pins.yml differs from the source manifest\n", errors.getvalue())
+
+    def test_a_run_on_this_computer_that_builds_never_reads_the_pin_file(self) -> None:
+        module = self.module()
+        with self.pinned(module, mock.Mock(side_effect=AssertionError("the pin file was read"))):
+            result, (_, built, source, expected) = self.settings(module, SPARK_IMAGE="")
+        self.assertEqual((None, True, None, None), (result[-1], built, source, expected))
+
+    def test_a_given_digest_reference_needs_no_id_and_the_id_that_docker_reads_is_the_one_that_is_tagged(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        result, calls, record = self.image_run(
+            module,
+            given=True,
+            image_settings={"SPARK_IMAGE": self.DIGEST},
+            answer=lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else "",
+        )
+        self.assertEqual((True, True), result)
+        inspected = next(args for _, args, _ in calls.items if args[:2] == ["image", "inspect"])
+        self.assertEqual(self.DIGEST, inspected[-1])
+        tag = next(args for _, args, _ in calls.items if args[:2] == ["image", "tag"])
+        self.assertEqual(["image", "tag", IMAGE_ID, module.IMAGE], tag)
+        self.assertTrue(all(item.passed for item in record.observations))
+
+    def test_a_given_digest_reference_that_docker_cannot_read_an_id_for_is_refused(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        result, calls, _ = self.image_run(module, given=True, image_settings={"SPARK_IMAGE": self.DIGEST}, answer=lambda _: "not an id\n")
+        self.assertEqual((False, False), result)
+        self.assertFalse(any(words.startswith("image tag") for words in calls.words()))
 
     def test_the_case_folder_falls_back_to_the_landed_folder_on_the_host(self) -> None:
         module = self.module(**{self.flag: "1"})
@@ -955,6 +1020,7 @@ class HostRunnerCase(unittest.TestCase):
         tree: str = TREE,
         dockerfile: str = DOCKERFILE,
         dockerignore: str = DOCKERIGNORE,
+        image_settings: dict[str, str] | None = None,
     ) -> tuple[tuple[bool, bool], Calls, Record]:
         def with_source(args: list[str]) -> Any:
             """The answers of the four source calls (the commit's tree, its Dockerfile, its Docker ignore file and the Python files in the image) beside the
@@ -969,11 +1035,12 @@ class HostRunnerCase(unittest.TestCase):
 
         record = Record(feature="f", slug="s", rerun="r")
         calls = Calls(with_source, code)
-        settings = self.given_image() if given else {}
+        settings = image_settings if image_settings is not None else self.given_image() if given else {}
         with (
             mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **settings), clear=True),
             tempfile.TemporaryDirectory(prefix="host_runner_") as folder,
             calls.patches(module),
+            mock.patch.object(module, "HOST", given or image_settings is not None),
         ):
             module.select_settings()
             stack = self.stack(module, folder)
@@ -1215,6 +1282,7 @@ class HostRunnerCase(unittest.TestCase):
                     mock.patch.dict(os.environ, clean_environment(**{self.flag: "1"}, LANDED_CACHE="/cache", **settings), clear=True),
                     tempfile.TemporaryDirectory(prefix="host_runner_") as folder,
                     calls.patches(module),
+                    mock.patch.object(module, "HOST", given),
                 ):
                     module.select_settings()
                     stack = self.stack(module, folder)
