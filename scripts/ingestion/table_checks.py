@@ -70,7 +70,7 @@ from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
 from scripts.sample.candidates import RELEASE_FILE
 from scripts.stack.groups import Settings, compose_arguments, rendered_environment
-from scripts.stack.job_workloads import profile_of_job, service_of
+from scripts.stack.job_workloads import job_command, profile_of_job
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
 from scripts.stack.tags import paged
@@ -222,7 +222,7 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
             settings,
             profile_of_job(JOB),
             *["run", "--rm", "--no-TTY", "--no-deps", "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
-            *["--entrypoint", "python", service_of(JOB), "-m", f"spark.jobs.{JOB}", "--staging", f"/staging/{staging.name}"],
+            *job_command(JOB, "--staging", f"/staging/{staging.name}"),
         )
         environment = rendered_environment(load_limits(settings.limits_file))
         try:

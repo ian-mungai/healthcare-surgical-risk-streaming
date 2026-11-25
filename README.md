@@ -87,6 +87,8 @@ Each Spark job runs under the AWS role of one lake layer, so a job reaches only 
 
 The Airbyte load owns `warehouse/raw_records`, and no workload role writes it. The table checks job runs as `bronze`, the reconciliation job as `silver` and the catalog proof as `maintenance`. Terraform refuses a grant that lets a workload write another layer's prefix (maintenance may write each layer's folder but never delete), write the whole warehouse prefix or `raw_records`, or delete in the whole warehouse prefix. The table maintenance job compacts only those folders and leaves `raw_records` out of its default table selection.
 
+Every Spark service has the same entry point, `python -m spark.launcher <job> [arguments]`, and names its workload in `SPARK_WORKLOAD`. The launcher refuses a job that `job_workloads.py` does not map to that workload before Spark starts (`wrong_workload`, `unknown_job`, `no_workload`, exit 2), and with no job it prints its usage and exits 2. So `make group-up GROUP=batch_maintenance` starts no rewrite: a job is an explicit one-off, `docker compose run --rm spark_maintenance table_maintenance --dry-run`. A launcher builds that command with `job_command` in `scripts/stack/job_workloads.py` and never overrides the entry point.
+
 ## Credit
 
 The recordings come from VitalDB, an open dataset of monitor recordings from 6,388 surgical cases. Seoul National University Hospital recorded them and PhysioNet publishes them at <https://physionet.org/content/vitaldb/1.0.0/>.

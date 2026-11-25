@@ -15,8 +15,9 @@ services:
     depends_on:
       nessie:
         condition: service_healthy
-    entrypoint: [python, -m, spark.jobs.bronze_decode]
+    entrypoint: [python, -m, spark.launcher]
     environment:
+      SPARK_WORKLOAD: bronze
       NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
       WAREHOUSE_LOCATION: ${WAREHOUSE_LOCATION:-}
       AWS_REGION: ${AWS_REGION:-}

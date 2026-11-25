@@ -2073,7 +2073,8 @@ class ComposeRunnerTest(unittest.TestCase):
         self.assertIn("--project-name stack_example", text)
         self.assertIn("--profile batch_bronze run --rm --no-TTY --no-deps", text)
         self.assertIn("--volume stack_example_table_check_staging:/staging:ro", text)
-        self.assertTrue(text.endswith("--entrypoint python spark_bronze -m spark.jobs.table_checks --staging /staging/run_one"), text)
+        self.assertTrue(text.endswith("spark_bronze table_checks --staging /staging/run_one"), text)
+        self.assertNotIn("--entrypoint", text)
         self.assertEqual((0, "RESULT {}\n"), (reply.exit_code, reply.stdout))
 
     def test_the_command_runs_the_job_as_the_spark_user_with_the_launchers_group_and_the_environment_carries_the_memory_limit(self) -> None:

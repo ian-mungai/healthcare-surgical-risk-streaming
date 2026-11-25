@@ -113,7 +113,7 @@ class SparkServiceTest(unittest.TestCase):
                 (str(PROJECT_WORKLOAD_GIDS[workload]), "GID"),
             ):
                 text = text.replace(old, new)
-            return "\n".join(line for line in text.splitlines() if "entrypoint:" not in line)
+            return text
 
         shapes = {name: shape(name) for name in self.each()}
         for name, text in shapes.items():

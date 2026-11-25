@@ -9,7 +9,6 @@ another workload or widen one grant, and each is named.
 
 from __future__ import annotations
 
-import re
 import unittest
 from pathlib import Path
 
@@ -109,16 +108,21 @@ class JobTableTest(unittest.TestCase):
         with self.assertRaisesRegex(JobWorkloadError, "no workload"):
             workload_of("another_job")
 
-    def test_no_launcher_in_the_repository_names_a_spark_service_by_hand(self) -> None:
-        """A launcher that starts a job module takes its service and profile from ``job_workloads``, so no job starts under a layer's identity by chance."""
+    def test_no_launcher_in_the_repository_names_a_spark_service_by_hand_or_overrides_the_entry_point(self) -> None:
+        """A launcher that starts a job takes its service, its profile and its command from ``job_workloads``, so no job starts under a layer's identity by
+        chance, and it goes through the service's own entry point, the launcher that refuses a job of another workload."""
         launchers = []
         for folder in ("scripts", "orchestration"):
             for path in sorted((ROOT / folder).rglob("*.py")):
                 text = path.read_text()
-                if re.search(r"spark\.jobs\.", text) and path.name != "job_workloads.py":
+                if path.name == "job_workloads.py":
+                    continue
+                self.assertNotRegex(text, r'"spark_(bronze|silver|gold|maintenance)"', path.name)
+                self.assertNotRegex(text, r'"python",\s*"spark[a-z_]*"', path.name)
+                self.assertNotIn("--entrypoint", text, path.name)
+                self.assertNotRegex(text, r"spark\.jobs\.[a-z_]+[\"'`]", path.name)
+                if "job_command(" in text:
                     launchers.append(path.relative_to(ROOT).as_posix())
-                    self.assertIn("job_workloads", text, path.name)
-                    self.assertNotRegex(text, r'"python",\s*"spark[a-z_]*"', path.name)
         self.assertEqual(["scripts/ingestion/table_checks.py"], launchers)
 
 
