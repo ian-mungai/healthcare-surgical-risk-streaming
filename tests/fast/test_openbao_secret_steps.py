@@ -204,6 +204,17 @@ class GeneratedTest(StepCase):
         self.assertNotIn("leading-space-marker", str(caught.exception))
         self.assertIsNone(self.server.stored(f"services/{GRAFANA_NAME}"))
 
+    def test_a_password_file_with_no_byte_is_refused_by_name_like_any_empty_file_and_nothing_is_made_or_stored(self) -> None:
+        target = self.folder / "grafana" / "admin.password"
+        target.parent.mkdir()
+        target.write_text("")
+        with self.assertRaises(bootstrap.SecretFileError) as caught:
+            self.generated(target)
+        self.assertIn("admin.password", str(caught.exception))
+        self.assertIn("empty", str(caught.exception))
+        self.assertIsNone(self.server.stored(f"services/{GRAFANA_NAME}"))
+        self.assertEqual("", target.read_text())
+
     def test_a_missing_file_is_written_again_from_openbao_and_the_stored_secret_is_kept(self) -> None:
         self.server.versions[f"services/{GRAFANA_NAME}"] = ["stored-password-marker"]
         target = self.folder / "admin.password"

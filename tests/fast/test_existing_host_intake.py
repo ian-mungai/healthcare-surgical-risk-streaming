@@ -142,5 +142,44 @@ class OneDeployTest(ExistingHostCase):
         self.assertEqual(404, api.call("GET", f"secret/data/external/{NAME}", token)[0])
 
 
+class RetiredGrantTest(ExistingHostCase):
+    """A service that left the list keeps its role and its data, and the deploy takes its external grants away."""
+
+    GONE_POLICY = (
+        bootstrap.policy_text("gone", ["secret/data/external/dockerhub_read"])
+        + 'path "secret/data/external/other" { capabilities = ["read"] }\n'
+        + 'path "secret/metadata/external/other" { capabilities = ["read", "list"] }\n'
+    )
+
+    def make_server(self) -> StandIn:
+        server = super().make_server()
+        server.policies["service_gone"] = self.GONE_POLICY
+        server.approle["gone"] = {**bootstrap.role_settings("gone", TTL, MAX_TTL)}
+        server.secret_ids["gone"] = {"old-secret-id-of-gone"}
+        server.versions["services/gone/postgres"] = ["password of gone"]
+        return server
+
+    def test_the_deploy_drops_every_external_grant_of_a_policy_whose_service_left_the_list_and_keeps_its_other_rules(self) -> None:
+        result = self.deploy()
+        self.assertIn("drop the external grants of policy service_gone", result["actions"])
+        self.assertEqual(bootstrap.policy_text("gone"), self.server.policies["service_gone"])
+
+    def test_the_role_the_secret_ids_and_the_data_of_that_service_stay_and_it_is_reported_unlisted(self) -> None:
+        result = self.deploy()
+        self.assertEqual(["gone"], result["unlisted"])
+        self.assertEqual({**bootstrap.role_settings("gone", TTL, MAX_TTL)}, self.server.approle["gone"])
+        self.assertEqual({"old-secret-id-of-gone"}, self.server.secret_ids["gone"])
+        self.assertEqual(["password of gone"], self.server.versions["services/gone/postgres"])
+
+    def test_a_second_deploy_changes_nothing_and_a_retired_policy_without_an_external_grant_is_left_alone(self) -> None:
+        self.deploy()
+        self.assertFalse(self.deploy()["changed"])
+
+    def test_a_policy_of_another_name_than_the_managed_ones_is_not_touched(self) -> None:
+        self.server.policies["not_managed"] = 'path "secret/data/external/dockerhub_read" { capabilities = ["read"] }\n'
+        self.deploy()
+        self.assertEqual('path "secret/data/external/dockerhub_read" { capabilities = ["read"] }\n', self.server.policies["not_managed"])
+
+
 if __name__ == "__main__":
     unittest.main()

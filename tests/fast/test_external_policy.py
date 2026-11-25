@@ -128,6 +128,14 @@ class PlanTest(unittest.TestCase):
         state.policies["service_deploy"] = bootstrap.policy_text("deploy")
         self.assertEqual(["write policy service_deploy"], self.actions(names, paths, state))
 
+    def test_a_retired_policy_that_holds_an_external_grant_is_rewritten_without_it_and_one_that_holds_none_is_left_alone(self) -> None:
+        names, paths, state = self.state_with_policies()
+        with_grant = bootstrap.policy_text("old", ["secret/data/external/dockerhub_read"])
+        state.retired = {"old": with_grant, "older": bootstrap.policy_text("older")}
+        actions = bootstrap.plan(names, [], state, lambda name: "", TTL, MAX_TTL, paths)
+        self.assertEqual(["drop the external grants of policy service_old"], [action.description for action in actions])
+        self.assertEqual(bootstrap.policy_text("old"), actions[0].policy)
+
     def test_a_policy_widened_to_another_services_external_path_is_written_back(self) -> None:
         names, paths, state = self.state_with_policies()
         state.policies["service_nessie"] += 'path "secret/data/external/dockerhub_read" { capabilities = ["read"] }\n'

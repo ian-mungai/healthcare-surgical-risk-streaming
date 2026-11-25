@@ -8,7 +8,7 @@ and is given that owner and mode when it has others.
 only its own path, one AppRole named for the service with a renewable token, one secret ID in a file that only the service reads (mode 0400, owned by
 the numeric user on its list line, or by root when the line has none) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own
 path. A server that already matches needs no change and the step reports none. It reports every secret file with its owner, for the role's check. A
-service that left the list keeps its role and is reported as unlisted, never removed.
+service that left the list keeps its role and is reported as unlisted, never removed; its policy loses every external grant, and its other rules stay.
 
 ``step: fetch`` writes one external secret (``compose/external_secrets.txt``) from OpenBao to a file for its consumer, after the consumer logs in with
 its own AppRole: the pull of the images reads the Docker Hub token that way and removes the file right after. ``step: generated`` keeps a secret that
@@ -26,7 +26,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -47,6 +47,7 @@ from ansible.module_utils.secret_files import (
 )
 
 ADMIN_ROLE = "bootstrap"
+POLICY_RULE = re.compile(r'path\s+"([^"]+)"\s*\{[^}]*\}\n?')
 GENERATED_NAME = re.compile(r"[a-z][a-z0-9_]*(?:/[a-z][a-z0-9_]*)+")
 OPENBAO_FOLDER = "openbao"
 ADMIN_ID_FILE = "bootstrap.secret_id"
@@ -119,12 +120,19 @@ def role_settings(service: str, token_ttl: int, token_max_ttl: int) -> dict[str,
     }
 
 
+def without_external(policy: str) -> str:
+    """The policy text without any rule for an external path."""
+    return POLICY_RULE.sub(lambda rule: "" if "/external/" in rule.group(1) else rule.group(0), policy)
+
+
 @dataclass
 class State:
     policies: dict[str, str]
     roles: dict[str, dict[str, Any]]
     secret_id_valid: dict[str, bool]
     passwords: dict[str, str | None]
+    # The policies of services that left the list, by service name.
+    retired: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,7 @@ class Action:
     kind: str
     service: str
     description: str
+    policy: str = ""
 
 
 def plan(
@@ -156,6 +165,9 @@ def plan(
             actions.append(Action("secret_id", service, f"issue a secret ID for {service}"))
         if service in tools and state.passwords.get(service) != password_of(service):
             actions.append(Action("password", service, f"write the PostgreSQL password of {service}"))
+    for service, stored in state.retired.items():
+        if without_external(stored) != stored:
+            actions.append(Action("retire", service, f"drop the external grants of policy {policy_name(service)}", without_external(stored)))
     return actions
 
 
@@ -272,6 +284,17 @@ def read_state(api: Api, token: str, services: list[str], tools: list[str], secr
                 state.passwords[service] = str(((document.get("data") or {}).get("data") or {}).get("password") or "")
             elif status != 404:
                 raise BootstrapError(f"GET secret/data/services/{service}/postgres: HTTP {status}")
+    status, document = api.call("GET", "sys/policies/acl?list=true", token)
+    if status != 200:
+        raise BootstrapError(f"GET sys/policies/acl (list): HTTP {status}")
+    for key in sorted(str(item) for item in (document.get("data") or {}).get("keys") or []):
+        service = key.removeprefix("service_")
+        if not key.startswith("service_") or service in services:
+            continue
+        status, document = api.call("GET", f"sys/policies/acl/{key}", token)
+        if status not in (200, 404):
+            raise BootstrapError(f"GET sys/policies/acl/{key}: HTTP {status}")
+        state.retired[service] = str((document.get("data") or {}).get("policy") or "") if status == 200 else ""
     return state
 
 
@@ -286,7 +309,9 @@ def apply(
     external: Mapping[str, Sequence[str]] | None = None,
 ) -> None:
     service = action.service
-    if action.kind == "policy":
+    if action.kind == "retire":
+        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": action.policy})
+    elif action.kind == "policy":
         api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service, (external or {}).get(service, ()))})
     elif action.kind == "role":
         api.must("POST", f"auth/approle/role/{service}", token, role_settings(service, token_ttl, token_max_ttl))
@@ -417,7 +442,7 @@ def generated_secret(params: dict[str, Any], *, check_only: bool) -> dict[str, A
     value, stored = kv_value(api, token, path), True
     if value is None:
         stored = False
-        value = read_file(dest, f"password file {dest.name}") if dest.is_file() and dest.stat().st_size else secrets.token_urlsafe(SECRET_BYTES)
+        value = read_file(dest, f"password file {dest.name}") if dest.is_file() else secrets.token_urlsafe(SECRET_BYTES)
         if value != value.strip():
             raise BootstrapError(f"the file {dest.parent.name}/{dest.name} has whitespace at its start or its end, which its reader trims")
         if not check_only:
@@ -449,7 +474,7 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
             if action.kind == "access":
                 set_access(secret_file(secrets_directory, f"{action.service}.secret_id"), owners[action.service])
             else:
-                apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl, external)
+                apply(api, token, action, secrets_directory, owners.get(action.service, root_owner), ttl, max_ttl, external)
     files = [
         {"path": str(path), "owner": f"{owner[0]}:{owner[1]}"} for path, owner in secret_files(secrets_directory, entries, admin_owner, root_owner).items()
     ]
