@@ -5,7 +5,8 @@ Run from the repository root under the project profile in ``.env``, through ``ma
 ``make host-up`` creates the project's bucket when it is absent and saves a Terraform plan. When the plan changes
 anything, it prints the changes and a confirmation code and stops for the owner's review.
 ``make host-up CONFIRM=<CODE>`` applies exactly the reviewed plan, waits for the instance, for its Tailscale peer and
-for SSH, runs the Ansible host setup and writes the inventory. A run with nothing to change goes straight to those
+for SSH, runs the Ansible host setup (up to the host's OpenBao), gives that OpenBao the external secrets that it still lacks (the intake), runs the stack
+deployment, places the project profile's key, runs the connection step and writes the inventory. A run with nothing to change goes straight to those
 checks, so a second run changes nothing.
 ``make host-stop`` stops the instance, keeps its disk and prints what still bills.
 ``make host-start`` starts it and waits until it answers over Tailscale.
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from scripts.aws_cli import Aws, AwsError
-from scripts.infra import state_bootstrap
+from scripts.infra import external_intake, state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
@@ -51,12 +52,14 @@ POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 # The host setup may take the sum of the deadlines of every task on the path of ansible/host.yml (each include counted once per call, each retried task once
 # per attempt, each loop once per item) plus a tenth, in whole five minutes. tests/fast/test_host_budget.py walks the playbook, works the sum out from the task
-# files and fails when this figure is lower. The connection step has its own budget from the same sum over ansible/connection.yml (the Airbyte connection step
-# and the start of the orchestration services).
-HOST_SETUP_TIMEOUT_SECONDS = 24600
+# files and fails when this figure is lower. The stack deployment (ansible/stack.yml, after the launcher's intake of the external secrets) and the connection
+# step (ansible/connection.yml: the Airbyte connection step and the start of the orchestration services) each have their own budget from the same sum.
+HOST_SETUP_TIMEOUT_SECONDS = 6600
+STACK_TIMEOUT_SECONDS = 16800
 CONNECTION_TIMEOUT_SECONDS = 4800
 PLAYBOOKS = {
     "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),
+    "stack.yml": ("stack deployment", "ansible_stack_output.txt", STACK_TIMEOUT_SECONDS),
     "connection.yml": ("connection step", "ansible_connection_output.txt", CONNECTION_TIMEOUT_SECONDS),
 }
 KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
@@ -65,6 +68,19 @@ KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
 KEY_COMMAND = ["/usr/bin/python3", "-I", KEY_SCRIPT]
 SUDOERS_FILE = "/etc/sudoers.d/airbyte_key_install"
 KEY_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "airbyte" / "files" / "airbyte_key_install.sudoers"
+# The intake of external secrets runs the same way: the host's interpreter in isolated mode and the installed script, with a sudoers drop-in that turns
+# input recording off for exactly that command line (compared by SHA-256 before any value is read).
+INTAKE_SCRIPT = "/opt/platform/bin/external_secret_intake"
+INTAKE_COMMAND = ["/usr/bin/python3", "-I", INTAKE_SCRIPT]
+INTAKE_SUDOERS = "/etc/sudoers.d/external_secret_intake"
+INTAKE_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "openbao" / "files" / "external_secret_intake.sudoers"
+INTAKE_SEND_SECONDS = 60
+INTAKE_POLICY_MESSAGES = {
+    "ssh_failed": "the intake of external secrets could not reach the host (exit status {status})",
+    "ssh_timeout": "the intake of external secrets did not finish within {seconds} seconds",
+    "policy_missing": "the sudo policy file for the intake script is missing or cannot be read on the host; the host playbook installs it, so run it first",
+    "policy_differs": "the sudo policy file for the intake script on the host is not the repository's; the host playbook installs the right one, run it first",
+}
 KEY_EXPORT_SECONDS = 60
 KEY_SEND_SECONDS = 60
 KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
@@ -448,27 +464,33 @@ def exported_key(profile: str) -> dict[str, str]:
     return {"aws_access_key_id": key_id, "aws_secret_access_key": value}
 
 
+def sudo_policy_problem(run_id: str, address: str, source: Path, target: str, seconds: float) -> str | None:
+    """The code of a problem with a sudo drop-in on the host, or None when the host's file is the repository's file.
+
+    The check reads the file's SHA-256 with one remote call (``sudo -n sha256sum <file>``). The codes are ``ssh_timeout``, ``ssh_failed``,
+    ``policy_missing`` and ``policy_differs``."""
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    try:
+        result = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", target], timeout=seconds)
+    except TimeoutExpired:
+        return "ssh_timeout"
+    if result.returncode == 255:
+        return "ssh_failed"
+    if result.returncode != 0:
+        return "policy_missing"
+    words = result.stdout.split()
+    return None if words and words[0] == expected else "policy_differs"
+
+
 def check_sudo_policy(run_id: str, address: str) -> None:
     """Refuse, before the key is read, a host whose sudo policy file for the key script is missing or is not the repository's file.
 
-    The file turns sudo's recording of input and output off for the key script's command line, and the key arrives on standard input. The check reads
-    the file's SHA-256 with one remote call (``sudo -n sha256sum <file>``). It shows that the repository's file is in place unchanged. It does not
-    read sudo's effective settings, whose output format the sudoers manual does not define, so the first host run also proves the effect with a marker
-    test."""
-    expected = hashlib.sha256(KEY_POLICY_SOURCE.read_bytes()).hexdigest()
-    try:
-        result = run_command(
-            "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", SUDOERS_FILE], timeout=KEY_SEND_SECONDS
-        )
-    except TimeoutExpired:
-        raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
-    if result.returncode == 255:
-        raise HostError(KEY_MESSAGES["ssh_failed"].format(status=255))
-    if result.returncode != 0:
-        raise HostError(KEY_MESSAGES["policy_missing"])
-    words = result.stdout.split()
-    if not words or words[0] != expected:
-        raise HostError(KEY_MESSAGES["policy_differs"])
+    The file turns sudo's recording of input and output off for the key script's command line, and the key arrives on standard input. The check shows that the
+    repository's file is in place unchanged. It does not read sudo's effective settings, whose output format the sudoers manual does not define, so the first
+    host run also proves the effect with a marker test."""
+    problem = sudo_policy_problem(run_id, address, KEY_POLICY_SOURCE, SUDOERS_FILE, KEY_SEND_SECONDS)
+    if problem is not None:
+        raise HostError(KEY_MESSAGES[problem].format(status=255, seconds=KEY_SEND_SECONDS))
 
 
 def place_project_key(run_id: str, address: str, profile: str) -> None:
@@ -501,6 +523,32 @@ def place_project_key(run_id: str, address: str, profile: str) -> None:
     raise HostError(KEY_MESSAGES["script_unknown"])
 
 
+def place_external_secrets(run_id: str, address: str, configuration: dict[str, str]) -> None:
+    """Give the host's OpenBao each external secret that is still empty there (``scripts/infra/external_intake.py``), through one SSH command for each call.
+
+    The values travel on standard input of ``ssh <host> sudo /usr/bin/python3 -I <the intake script>`` and nowhere else. The source on this computer is the
+    kind that ``EXTERNAL_SECRETS_SOURCE`` names in ``.env`` (``openbao``, or the default ``prompt``). Every failure is a fixed message that names the secret
+    and never a value."""
+    problem = sudo_policy_problem(run_id, address, INTAKE_POLICY_SOURCE, INTAKE_SUDOERS, INTAKE_SEND_SECONDS)
+    if problem is not None:
+        raise HostError(INTAKE_POLICY_MESSAGES[problem].format(status=255, seconds=INTAKE_SEND_SECONDS))
+
+    def ask_host(document: str) -> tuple[int, str]:
+        try:
+            sent = run_command(
+                "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *INTAKE_COMMAND], input_text=document, timeout=INTAKE_SEND_SECONDS
+            )
+        except TimeoutExpired:
+            return external_intake.TIMED_OUT, ""
+        return sent.returncode, sent.stdout
+
+    source = external_intake.openbao_source() if configuration.get("EXTERNAL_SECRETS_SOURCE") == "openbao" else external_intake.prompt_source()
+    try:
+        external_intake.run_intake(external_intake.declared_secrets(), ask_host, source, external_intake.write_line)
+    except external_intake.IntakeError as error:
+        raise HostError(str(error)) from None
+
+
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
     existing = load_run(binding) if binding.is_file() else None
     backend, provision_host = (existing.backend, existing.provision_host) if existing else ("s3", True)
@@ -530,6 +578,8 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     require_current_inputs(plan)
     variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deployment
     run_ansible(run.run_id, address, variables)
+    place_external_secrets(run.run_id, address, configuration)
+    run_ansible(run.run_id, address, variables, "stack.yml")
     place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
     run_ansible(run.run_id, address, variables, "connection.yml")
     write_inventory(binding)

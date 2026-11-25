@@ -1,0 +1,48 @@
+# Reads openbao_bin_directory, openbao_intake_script, openbao_intake_sudoers, openbao_visudo, openbao_owner_user and openbao_owner_group. An external secret
+# (compose/external_secrets.txt) never enters Ansible: the launcher reads it on the owner's computer, or asks for it, and pipes it on standard input of one SSH command to
+# the script that this step installs. The script and the two helpers that it loads beside itself are placed in a folder that only root enters (mode 0700 for the folder, 0700
+# for the script, 0600 for the helpers). The sudoers drop-in beside them turns off sudo's input and output recording for exactly the command line that the launcher runs; it is
+# checked with visudo before it takes its place. A second run changes nothing.
+- name: Create the folder of the platform's scripts
+  ansible.builtin.file:
+    path: "{{ openbao_bin_directory }}"
+    state: directory
+    owner: "{{ openbao_owner_user }}"
+    group: "{{ openbao_owner_group }}"
+    mode: "0700"
+
+- name: Install the helpers that the intake script loads beside itself
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../secret_files/module_utils/{{ item }}"
+    dest: "{{ openbao_bin_directory }}/{{ item }}"
+    owner: "{{ openbao_owner_user }}"
+    group: "{{ openbao_owner_group }}"
+    mode: "0600"
+  loop:
+    - secret_files.py
+    - external_secrets.py
+
+- name: Install the script that stores an external secret
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/external_secret_intake.py"
+    dest: "{{ openbao_intake_script }}"
+    owner: "{{ openbao_owner_user }}"
+    group: "{{ openbao_owner_group }}"
+    mode: "0700"
+
+- name: Make sure that sudo's folder of drop-in files exists
+  ansible.builtin.file:
+    path: "{{ openbao_intake_sudoers | dirname }}"
+    state: directory
+    owner: "{{ openbao_owner_user }}"
+    group: "{{ openbao_owner_group }}"
+    mode: "0750"
+
+- name: Turn off sudo's recording of input and output for the intake script's command line
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/external_secret_intake.sudoers"
+    dest: "{{ openbao_intake_sudoers }}"
+    owner: "{{ openbao_owner_user }}"
+    group: "{{ openbao_owner_group }}"
+    mode: "0440"
+    validate: "{{ openbao_visudo }} -cf %s"

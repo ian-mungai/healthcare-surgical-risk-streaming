@@ -193,6 +193,11 @@ def total_seconds(found: list[Occurrence]) -> dict[str, int]:
     return dict(sums)
 
 
+def deployment() -> list[Occurrence]:
+    """The runs of the host playbook and the stack playbook together: what the host setup did before the playbooks were split around the launcher's intake."""
+    return playbook_occurrences("host.yml") + playbook_occurrences("stack.yml")
+
+
 def parts(playbook: str = "host.yml") -> dict[str, int]:
     return total_seconds(playbook_occurrences(playbook))
 
@@ -224,6 +229,9 @@ class HostSetupBudgetTest(unittest.TestCase):
     def test_the_host_setup_budget_covers_the_deadlines_of_every_task_on_the_playbook_path_plus_a_tenth_in_whole_five_minutes(self) -> None:
         self.assertIsNone(shortfall(host.HOST_SETUP_TIMEOUT_SECONDS))
 
+    def test_the_stack_playbook_budget_covers_the_deadlines_of_every_task_on_its_path_plus_a_tenth_in_whole_five_minutes(self) -> None:
+        self.assertIsNone(shortfall(host.STACK_TIMEOUT_SECONDS, "stack.yml"))
+
     def test_the_connection_step_budget_covers_the_deadlines_of_every_task_on_its_playbook_path_plus_a_tenth_in_whole_five_minutes(self) -> None:
         self.assertIsNone(shortfall(host.CONNECTION_TIMEOUT_SECONDS, "connection.yml"))
 
@@ -240,9 +248,11 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertEqual(0, required_seconds() % 300)
 
     def test_a_task_that_two_calls_reach_counts_twice_and_the_counts_come_from_the_calls_in_the_files(self) -> None:
-        found = playbook_occurrences("host.yml")
-        compose = (ROLES / "compose_stack" / "tasks" / "main.yml").read_text()
-        self.assertEqual(2, compose.count("include_tasks: start.yml"), "the Compose role starts PostgreSQL alone and then the remaining services")
+        found = deployment()
+        compose = (ROLES / "compose_stack" / "tasks" / "main.yml").read_text() + (ROLES / "compose_stack" / "tasks" / "deploy.yml").read_text()
+        self.assertEqual(
+            3, compose.count("include_tasks: start.yml"), "the Compose role starts OpenBao alone, PostgreSQL alone and then the remaining services"
+        )
         self.assertEqual(compose.count("include_tasks: start.yml"), runs_of_file(found, "compose_stack", "start.yml"))
         k3s = "".join(path.read_text() for path in (ROLES / "k3s" / "tasks").glob("*.yml"))
         self.assertEqual(k3s.count("include_tasks: wait_ready.yml"), runs_of_file(found, "k3s", "wait_ready.yml"))
@@ -250,17 +260,17 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertEqual(1, runs_of_file(found, "airbyte", RELEASE_FILE))
         self.assertEqual(2, runs_of_file(found, "airbyte", "cluster.yml"), "the Compose role and the Airbyte role each include it")
 
-    def test_the_second_compose_recreation_across_the_two_start_calls_is_in_the_sum(self) -> None:
-        found = playbook_occurrences("host.yml")
+    def test_the_recreation_of_each_of_the_three_start_calls_is_in_the_sum(self) -> None:
+        found = deployment()
         recreate = [item for item in found if item.file == "start.yml" and str(item.task.get("name")).startswith("Recreate the services")]
         start = [item for item in found if item.file == "start.yml" and item.task.get("name") == "Start the services"]
-        self.assertEqual(2, len(recreate))
-        self.assertEqual(2, len(start))
+        self.assertEqual(3, len(recreate))
+        self.assertEqual(3, len(start))
         deadline = int(group_variables()["compose_stack_start_deadline_seconds"])
-        self.assertEqual(4 * deadline, sum(task_seconds(item) for item in recreate + start))
+        self.assertEqual(6 * deadline, sum(task_seconds(item) for item in recreate + start))
 
     def test_an_until_task_counts_its_first_attempt_and_each_retry_with_its_delay(self) -> None:
-        found = playbook_occurrences("host.yml")
+        found = deployment()
         wait = one(found, "wait_ready.yml", "Wait for the k3s node to be ready")
         retries = int(group_variables()["k3s_ready_deadline_seconds"] / 25)
         self.assertEqual(12, retries)
@@ -269,7 +279,7 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertEqual(4 * 10 + 3 * 2, task_seconds(Occurrence("r", "f", unset, ())), "Ansible retries 3 times when until has no retries")
 
     def test_the_timeout_inside_a_request_or_a_download_is_the_deadline_of_its_task(self) -> None:
-        found = playbook_occurrences("host.yml")
+        found = deployment()
         health = one(found, "verify.yml", "Wait for the health path to answer on the local address")
         retries = int(group_variables()["airbyte_health_deadline_seconds"] / 5)
         self.assertEqual((retries + 1) * 10 + retries * 5, task_seconds(health), "25 requests of 10 s and 24 delays of 5 s")
@@ -277,7 +287,7 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertEqual(60, task_seconds(key))
 
     def test_a_loop_runs_a_timed_task_for_each_item_and_the_pull_waits_for_its_one_deadline(self) -> None:
-        found = playbook_occurrences("host.yml")
+        found = deployment()
         pull = one(found, "pull_images.yml", "Pull every image of the Compose files, each by its digest")
         self.assertEqual(int(group_variables()["compose_stack_pull_deadline_seconds"]), task_seconds(pull))
         listed = Occurrence("r", "f", {"name": "x", "timeout": 7, "loop": [1, 2, 3]}, ())
@@ -291,7 +301,7 @@ class HostSetupBudgetTest(unittest.TestCase):
                 task_seconds(Occurrence("r", "f", task, ()))
 
     def test_the_cold_package_installs_have_a_task_deadline_that_is_counted(self) -> None:
-        found = playbook_occurrences("host.yml")
+        found = deployment()
         installs = [item for item in found if APT in item.task]
         self.assertEqual({"docker", "metadata_guard"}, {item.role for item in installs}, "every package install on the host path is checked")
         for item in installs:
@@ -300,7 +310,7 @@ class HostSetupBudgetTest(unittest.TestCase):
                 self.assertGreater(task_seconds(item), int(item.task[APT]["lock_timeout"]))
 
     def test_the_rollback_and_the_uninstall_count_once_and_the_install_counts_beside_the_recovery(self) -> None:
-        found = playbook_occurrences("host.yml")
+        found = deployment()
         deadline = int(group_variables()["airbyte_release_deadline_seconds"])
         self.assertEqual(deadline + 120, task_seconds(one(found, RELEASE_FILE, INSTALL_TASK)))
         release = sum(task_seconds(item) for item in found if item.file == RELEASE_FILE)
@@ -309,7 +319,7 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertGreaterEqual(counted, 2 * (deadline + 120))
 
     def test_a_renamed_recovery_task_is_found_missing_and_not_counted_as_an_ordinary_task(self) -> None:
-        found = [item for item in playbook_occurrences("host.yml") if item.file == RELEASE_FILE and item.task.get("name") != RECOVERY_TASKS[0]]
+        found = [item for item in deployment() if item.file == RELEASE_FILE and item.task.get("name") != RECOVERY_TASKS[0]]
         with self.assertRaises(AssertionError):
             total_seconds(found)
 
@@ -320,8 +330,8 @@ class HostSetupBudgetTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             number("{{ no_such_variable }}")
 
-    def test_every_task_file_of_the_roles_is_reached_by_one_of_the_two_playbooks(self) -> None:
-        reached = {(item.role, item.file) for playbook in ("host.yml", "connection.yml") for item in playbook_occurrences(playbook) if item.role}
+    def test_every_task_file_of_the_roles_is_reached_by_one_of_the_three_playbooks(self) -> None:
+        reached = {(item.role, item.file) for playbook in ("host.yml", "stack.yml", "connection.yml") for item in playbook_occurrences(playbook) if item.role}
         roles = {role for role, _ in reached}
         present = {(path.parent.parent.name, path.name) for role in roles for path in (ROLES / role / "tasks").glob("*.yml")}
         self.assertEqual(
@@ -330,7 +340,7 @@ class HostSetupBudgetTest(unittest.TestCase):
 
     def test_each_playbook_has_its_own_named_budget_and_the_connection_step_keeps_its_own(self) -> None:
         self.assertEqual(
-            {"host.yml": host.HOST_SETUP_TIMEOUT_SECONDS, "connection.yml": host.CONNECTION_TIMEOUT_SECONDS},
+            {"host.yml": host.HOST_SETUP_TIMEOUT_SECONDS, "stack.yml": host.STACK_TIMEOUT_SECONDS, "connection.yml": host.CONNECTION_TIMEOUT_SECONDS},
             {name: budget for name, (_, _, budget) in host.PLAYBOOKS.items()},
         )
         self.assertGreater(host.CONNECTION_TIMEOUT_SECONDS, int(group_variables()["airbyte_connection_run_seconds"]))

@@ -1,8 +1,9 @@
 """The order of a clean deploy: every file that a Compose secret of a service names exists before the task that starts that service.
 
 The order is read from the real playbooks, not described: the roles and post tasks of ``ansible/host.yml`` are expanded in the order Ansible runs them, each
-role's dependencies first, each task file with the files it includes right after it; then the launcher's one step that places the project profile's key (it
-runs between the two playbooks in ``host_up``, which ``test_host_commands`` holds); then the tasks of ``ansible/connection.yml``. A service starts at the first
+role's dependencies first, each task file with the files it includes right after it; then the launcher's step that gives the host's OpenBao the external secrets
+(the intake), the tasks of ``ansible/stack.yml``, the launcher's step that places the project profile's key and the tasks of ``ansible/connection.yml``
+(the launcher runs the steps between the playbooks in ``host_up``, which ``test_host_commands`` holds). A service starts at the first
 ``start.yml`` that names it, or that names none and so starts every service that is not left out (``compose_stack_start_except``). A secret file is made by the
 task file that the tables below name for it or for its folder. On a redeploy a file can be new (a host deployed before the file existed) or replaced:
 the stale check reads only the files of the services that a start names, so a file made later in the order cannot stop an earlier start; a named service
@@ -22,6 +23,7 @@ from scripts.stack.yaml_text import load_yaml
 ROOT = Path(__file__).resolve().parents[2]
 ROLES = ROOT / "ansible" / "roles"
 HOST = ROOT / "ansible" / "host.yml"
+STACK = ROOT / "ansible" / "stack.yml"
 COMPOSE = ROOT / "compose"
 VARIABLES = ROOT / "ansible" / "group_vars" / "all.yml"
 PRODUCERS = {
@@ -33,6 +35,9 @@ PRODUCERS = {
 }
 # The two copies of the project profile's key are made by the launcher's step after the host playbook, never by a task, so Ansible never holds the key.
 KEY_STEP = ("launcher", "place_project_key")
+# The launcher's intake writes the external secrets into the host's OpenBao after the host playbook made OpenBao and its policies, and before the stack playbook
+# pulls the images with the Docker Hub token that the intake stored.
+INTAKE_STEP = ("launcher", "place_external_secrets")
 FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP}
 CONNECTION = ROOT / "ansible" / "connection.yml"
 
@@ -98,8 +103,8 @@ def play_events(path: Path) -> list[Event]:
 
 
 def playbook_events() -> list[Event]:
-    """The host playbook, the launcher's key step and the connection playbook, in the order ``host_up`` runs them."""
-    return [*play_events(HOST), Event(*KEY_STEP), *play_events(CONNECTION)]
+    """The host playbook, the launcher's intake, the stack playbook, the launcher's key step and the connection playbook, in the order ``host_up`` runs them."""
+    return [*play_events(HOST), Event(*INTAKE_STEP), *play_events(STACK), Event(*KEY_STEP), *play_events(CONNECTION)]
 
 
 def all_services() -> dict[str, dict[str, str]]:
@@ -163,6 +168,34 @@ class DeployOrderTest(unittest.TestCase):
                 elif positions[producer] >= starts[service]:
                     problems.append(f"{service}: {secret_file} is made by {producer[1]} after the service starts")
         self.assertEqual([], problems)
+
+    def test_the_intake_runs_after_openbao_has_its_policies_and_the_intake_script_and_before_the_images_are_pulled_with_the_stored_token(self) -> None:
+        events = playbook_events()
+        position = {
+            key: events.index(next(event for event in events if (event.role, event.file) == key))
+            for key in (
+                ("openbao", "prepare.yml"),
+                ("openbao", "bootstrap.yml"),
+                ("openbao", "intake_script.yml"),
+                INTAKE_STEP,
+                ("compose_stack", "pull_images.yml"),
+            )
+        }
+        openbao_start = next(
+            index for index, event in enumerate(events) if event.file == "start.yml" and "openbao" in (event.vars.get("compose_stack_start_services") or [])
+        )
+        self.assertLess(position[("openbao", "prepare.yml")], openbao_start, "OpenBao reads its admin secret ID file at its first start")
+        self.assertLess(openbao_start, position[("openbao", "bootstrap.yml")], "the policies and roles are made on a running server")
+        self.assertLess(position[("openbao", "bootstrap.yml")], position[INTAKE_STEP])
+        self.assertLess(position[("openbao", "intake_script.yml")], position[INTAKE_STEP])
+        self.assertLess(position[INTAKE_STEP], position[("compose_stack", "pull_images.yml")])
+
+    def test_the_grafana_password_is_made_from_the_running_openbao_before_grafana_starts(self) -> None:
+        events = playbook_events()
+        grafana = next(index for index, event in enumerate(events) if (event.role, event.file) == ("compose_stack", "grafana_password.yml"))
+        bootstrap = next(index for index, event in enumerate(events) if (event.role, event.file) == ("openbao", "bootstrap.yml"))
+        self.assertGreater(grafana, bootstrap)
+        self.assertLess(grafana, start_positions(events)["grafana"])
 
     def test_the_producers_in_the_table_are_the_files_that_write_those_folders(self) -> None:
         for folder, (role, file) in PRODUCERS.items():
