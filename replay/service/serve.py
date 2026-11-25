@@ -309,8 +309,8 @@ def folders_refusal(inbox: Path) -> str | None:
 
 
 def start_refusal(inbox: Path, health_path: Path) -> str | None:
-    """The fixed text that refuses the start, or None: a health file that the loop would take for a request (its write lands in the inbox, or replaces a link
-    there) or a folder of the service that is the inbox."""
+    """The fixed text that refuses the start, or None: a health file placed in the inbox by its folder or by where it resolves (``places.written_into``),
+    which the loop would take for a request, or a folder of the service that is the inbox."""
     try:
         return HEALTH_FILE_MESSAGE if places.written_into(health_path, inbox) else folders_refusal(inbox)
     except places.PathError:

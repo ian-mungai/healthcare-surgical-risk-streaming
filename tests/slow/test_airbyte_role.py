@@ -215,6 +215,8 @@ CONFIGMAP_A = "".join(f"{name}\n" for name in VALUES_FILES)
 CONFIGMAP_B = CONFIGMAP_A.replace("host.values.yaml\n", HOST_VALUES_B)
 LEAK = "LEAKED"
 RECORD = "release_inputs.sha256"
+# The form of the recorded inputs: the role writes it into the digest, so a record from a role that did not restart the deployments never matches.
+RECORD_FORM = "release-inputs-2"
 RESTART = [
     "kubectl rollout restart deployment",
     "kubectl get deployment",
@@ -250,9 +252,12 @@ class ReleaseSandbox:
         for name in VALUES_FILES:
             (self.directory / name).write_text(f"{name}\n")
         sums = [hashlib.sha256((self.directory / name).read_bytes()).hexdigest() for name in VALUES_FILES]
-        self.inputs = hashlib.sha256(":".join([CHART_SHA, *sums]).encode()).hexdigest()
+        self.inputs = hashlib.sha256(":".join([RECORD_FORM, CHART_SHA, *sums]).encode()).hexdigest()
         if recorded == "match":
             (self.directory / RECORD).write_text(f"{self.inputs}\n")
+        elif recorded == "legacy":
+            # The record that the role wrote before it restarted the deployments: the same inputs without the form, so it never matches now.
+            (self.directory / RECORD).write_text(hashlib.sha256(":".join([CHART_SHA, *sums]).encode()).hexdigest() + "\n")
         elif recorded == "other":
             (self.directory / RECORD).write_text("0" * 64 + "\n")
         self.playbook = folder / "check.yml"
@@ -440,6 +445,25 @@ class ReleaseRecoveryTest(unittest.TestCase):
                 self.assertIn("could not restart the Airbyte deployments", output)
                 self.assertNotIn(LEAK, output)
                 self.assertFalse(box.record().exists())
+
+    def test_a_record_written_before_the_restart_existed_upgrades_and_restarts_once_and_a_second_run_changes_nothing(self) -> None:
+        """A host whose last deploy ran the role without the restart (live host, Nov 24 2026) recorded the same inputs; its pods may hold old settings."""
+        with tempfile.TemporaryDirectory() as scratch:
+            box = ReleaseSandbox(scratch, "deployed", history("deployed"), "legacy", {})
+            code, output, log = box.run()
+            self.assertEqual(0, code, output)
+            self.assertEqual([UPGRADE, *RESTART], commands(log))
+            code, output, log = box.run()
+            self.assertEqual(0, code, output)
+            self.assertEqual([], log)
+
+    def test_every_rollout_wait_shares_the_release_deadline(self) -> None:
+        """Each deployment's rollout gets the time left on one deadline, so two waits together never pass the release deadline."""
+        text = (ROOT / "ansible" / "roles" / "airbyte" / "tasks" / "release.yml").read_text()
+        self.assertIn("end=$(( $(date +%s) + DEADLINE ))", text)
+        self.assertIn("left=$(( end - $(date +%s) ))", text)
+        self.assertIn('[ "$left" -gt 0 ] || exit 6', text)
+        self.assertIn('"--timeout=${left}s"', text)
 
     def test_a_first_install_restarts_nothing_because_every_pod_starts_with_the_new_settings(self) -> None:
         code, output, log = self.run_release(NOT_INSTALLED, recorded="none")
