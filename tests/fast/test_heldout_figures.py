@@ -28,18 +28,33 @@ import re
 import tempfile
 import traceback
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from scripts.process import run_command
 from spark import split_table
-from tests.fast.outcome_accept import sink_leaks
+from spark.profile.counts import BY_NAME
+from tests.fast.outcome_accept import (
+    EXPECTATION_CONSTANTS,
+    OUTCOME_RUNNERS,
+    call_argument,
+    call_name,
+    is_sealed_call,
+    saved_text_nodes,
+    sink_leaks,
+)
+from tests.fast.runner_import import safe_import
 
 ROOT = Path(__file__).resolve().parents[2]
 E2E = ROOT / "tests" / "e2e"
 FIGURE = split_table.PINNED_COUNTS["test"]
+# The held-out case count follows the same way from the totals of the prespecified counts: all cases less the development cases. It is made here from the
+# counts of the rule module's package and is written nowhere.
+CASE_FIGURE = int(BY_NAME["cases"].expected - BY_NAME["development_cases"].expected)
+FIGURES = (FIGURE, CASE_FIGURE)
 RULE_MODULE = "spark.split_table"
 RULE_NAMES = frozenset({"patient_part", "SET_NAMES"})
 FLAG_CALLS = frozenset({"all", "any", "bool", "len"})
@@ -50,15 +65,33 @@ GIT_SECONDS = 30
 EXPECTATION_POSITIONS = {2: "expected", 3: "observed"}
 
 
+NUMBER = re.compile(r"(?<![0-9A-Za-z_.])([0-9]+(?:[,_' \u00a0\u202f][0-9]+)*)(\.[0-9]+)?(?![0-9A-Za-z_])")
+SEPARATORS = re.compile(r"[,_' \u00a0\u202f]")
+
+
+def text_numbers(text: str) -> set[int]:
+    """The whole numbers that a text writes as a word of its own: a number with leading zeros, a number with a decimal part of zeros (``1209.0`` is 1209; a
+    number with another decimal part is not a whole number), and for a number with thousands separators (a comma, an underscore, an apostrophe or a space) each
+    group and the whole of it. A number inside a word or a hash is not one."""
+    found: set[int] = set()
+    for run, decimals in NUMBER.findall(text):
+        if decimals.strip("0.") != "":
+            continue
+        pieces = SEPARATORS.split(run)
+        found.update(int(piece) for piece in pieces)
+        found.add(int("".join(pieces)))
+    return found
+
+
 def numbers_of(document: Any) -> set[float]:
-    """Every number in a document that a stand-in prints: a number value, and each run of digits in a text (a comma or an underscore inside it is dropped)."""
+    """Every number in a document that a stand-in prints: a number value, and each whole number that a text writes (``text_numbers``)."""
     found: set[float] = set()
     if isinstance(document, bool):
         return found
     if isinstance(document, int | float):
         found.add(document)
     elif isinstance(document, str):
-        found.update(int(run.replace(",", "").replace("_", "")) for run in re.findall(r"[0-9][0-9,_]*", document) if run[-1].isdigit())
+        found.update(text_numbers(document))
     elif isinstance(document, dict):
         for key, item in document.items():
             found |= numbers_of(key) | numbers_of(item)
@@ -89,9 +122,10 @@ def figure_derivable(document: Any, figure: int = FIGURE) -> bool:
 
 
 def figure_pattern(figure: int) -> re.Pattern[str]:
-    """The figure as a whole number, written with or without a thousands separator, and not part of a longer number, a word, a hash or a decimal."""
+    """The figure as a number, written with or without a thousands separator (a comma, an underscore, an apostrophe or a space), with leading zeros or with a
+    decimal part of zeros (``1209.0``), and not part of a longer number, a word, a hash or another decimal (``1209.5``, ``0.1209``)."""
     groups = f"{figure:,}".split(",")
-    return re.compile(r"(?<![0-9A-Za-z_.])" + "[,_']?".join(groups) + r"(?![0-9A-Za-z_]|\.[0-9])")
+    return re.compile(r"(?<![0-9A-Za-z_.])0*" + "[,_' \u00a0\u202f]?".join(groups) + r"(?:\.0+)?(?![0-9A-Za-z_]|\.[0-9])")
 
 
 def holds(value: Any, figure: int, pattern: re.Pattern[str]) -> bool:
@@ -245,6 +279,103 @@ def figure_findings(source: str, figure: int = FIGURE) -> list[tuple[str, int]]:
         if isinstance(node, ast.Call):
             found += [("figure_in_expect", item.lineno) for item in expectation_arguments(node) if carriers.carries(item)]
     return sorted(set(found), key=lambda item: (item[1], item[0]))
+
+
+def text_holds_figure(text: str, figures: tuple[int, ...] = FIGURES) -> bool:
+    """Whether a text writes one of the figures in any spelling of ``figure_pattern`` or holds numbers from which one follows (``figure_derivable``): a set of
+    totals in one expectation is such a text."""
+    return any(figure_pattern(figure).search(text) is not None or figure_derivable(text, figure) for figure in figures)
+
+
+def constant_text(value: object) -> str | None:
+    """The text that a field of an f-string gives for the value of an allowed constant: a text, a number or a tuple or list of them. Anything else (a Boolean
+    too) is ``None``."""
+    scalar = isinstance(value, str | int | float) and not isinstance(value, bool)
+    if scalar or (isinstance(value, tuple | list) and all(isinstance(item, str | int | float) and not isinstance(item, bool) for item in value)):
+        return format(value, "")
+    return None
+
+
+def written_texts(node: ast.AST, values: Mapping[str, Any]) -> tuple[list[str], str | None]:
+    """The texts that the expression of a record's text can give, or the rule that it breaks. The text of a record is written text: a string constant, a choice
+    between two of them, or an f-string whose fields are each a name of ``EXPECTATION_CONSTANTS`` (no conversion, no format) that the runner defines as a
+    text or a number (``values``). A name, a call, a sum or a field of any other kind is ``expectation_not_literal``, and an allowed name with no usable value
+    is ``constant_unresolved``. A sealed text is judged by ``sink_leaks`` and gives no text here."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value], None
+    if isinstance(node, ast.IfExp):
+        first, rule = written_texts(node.body, values)
+        second, other = written_texts(node.orelse, values)
+        return first + second, rule or other
+    if is_sealed_call(node):
+        return [], None
+    if not isinstance(node, ast.JoinedStr):
+        return [], "expectation_not_literal"
+    parts: list[str] = []
+    for item in node.values:
+        if isinstance(item, ast.Constant):
+            parts.append(str(item.value))
+        elif not (
+            isinstance(item, ast.FormattedValue)
+            and item.conversion == -1
+            and item.format_spec is None
+            and isinstance(item.value, ast.Name)
+            and item.value.id in EXPECTATION_CONSTANTS
+        ):
+            return [], "expectation_not_literal"
+        elif (text := constant_text(values.get(item.value.id))) is None:
+            return [], "constant_unresolved"
+        else:
+            parts.append(text)
+    return ["".join(parts)], None
+
+
+def text_nodes_of(tree: ast.AST) -> list[ast.AST]:
+    """The expressions that give the written text of a record (``saved_text_nodes``) and each observation (a sealed text gives no text here)."""
+    nodes = list(saved_text_nodes(tree))
+    for call in ast.walk(tree):
+        if isinstance(call, ast.Call) and call_name(call) == "expect" and (observed := call_argument(call, 3, "observed")) is not None:
+            nodes.append(observed)
+    return nodes
+
+
+def expectation_findings(source: str, values: Mapping[str, Any], figures: tuple[int, ...] = FIGURES) -> list[tuple[str, int]]:
+    """The rule and the 1-based line of each written text of a sealed runner that is not written text (``written_texts``) or that, as it is written with the
+    values of the allowed constants, holds a figure or numbers from which one follows (``expectation_holds_figure``)."""
+    found: list[tuple[str, int]] = []
+    for node in text_nodes_of(ast.parse(source)):
+        texts, rule = written_texts(node, values)
+        if rule is not None:
+            found.append((rule, getattr(node, "lineno", 0)))
+        elif any(text_holds_figure(text, figures) for text in texts):
+            found.append(("expectation_holds_figure", getattr(node, "lineno", 0)))
+    return sorted(set(found), key=lambda item: (item[1], item[0]))
+
+
+def used_constants(tree: ast.AST) -> set[str]:
+    """The names of ``EXPECTATION_CONSTANTS`` that a runner puts into its written texts."""
+    return {
+        item.value.id
+        for node in text_nodes_of(tree)
+        for item in ast.walk(node)
+        if isinstance(item, ast.FormattedValue) and isinstance(item.value, ast.Name) and item.value.id in EXPECTATION_CONSTANTS
+    }
+
+
+def constant_values(path: Path, source: str) -> dict[str, Any]:
+    """The values of the allowed constants that a runner uses in its texts: the written constant where the runner assigns one at the top, and otherwise the
+    value that the imported runner holds (an import failure is named by file and line or class only)."""
+    tree = ast.parse(source)
+    wanted = used_constants(tree)
+    values: dict[str, Any] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in wanted:
+            with contextlib.suppress(ValueError):
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+    if wanted - values.keys():
+        module = safe_import(f"tests.e2e.{path.stem}", path.name)
+        values |= {name: getattr(module, name) for name in wanted - values.keys() if hasattr(module, name)}
+    return values
 
 
 class ScanFailed(Exception):
@@ -452,6 +583,13 @@ class ScannerFindsEveryWay(unittest.TestCase):
         ("figure_text", "a docstring with a thousands separator", f'"""The test set holds {FIGURE:,} patients."""\n'),
         ("figure_text", "a docstring without a separator", f'"""The test set holds {FIGURE} patients."""\n'),
         ("figure_text", "a comment", f"x = 1  # the test set has {FIGURE:,}\n"),
+        ("figure_text", "a decimal text", f'"""The test set holds {FIGURE}.0 patients."""\n'),
+        ("figure_text", "a decimal text of two zeros", f'"""The test set holds {FIGURE:,}.00 patients."""\n'),
+        ("figure_text", "leading zeros", f'"""The test set holds {FIGURE:08d} patients."""\n'),
+        ("figure_text", "leading zeros and a separator", f'"""The test set holds 0{FIGURE:,} patients."""\n'),
+        ("figure_text", "an apostrophe separator", 'text = "' + f"{FIGURE:,}".replace(",", "'") + '"\n'),
+        ("figure_text", "a space separator", 'text = "the set holds ' + f"{FIGURE:,}".replace(",", " ") + ' patients"\n'),
+        ("figure_text", "a narrow no-break space separator", 'text = "' + f"{FIGURE:,}".replace(",", "\u202f") + '"\n'),
         ("figure_text", "an underscore separator in a string", f'text = "{FIGURE:,}".replace(",", "_")\nother = "{str(FIGURE)[:1]}_{str(FIGURE)[1:]}"\n'),
         ("figure_text", "a split over two literals", f'text = "{str(FIGURE)[:1]}" "{str(FIGURE)[1:]}"\n'),
         ("figure_text", "an expectation text", f'record.expect("c", "k", "the test count is {FIGURE:,}", sealed_observed({{"a": True}}), ok is True)\n'),
@@ -565,7 +703,7 @@ class ScannerFindsEveryWay(unittest.TestCase):
         ("the import with no use in a record", "from spark.split_table import PINNED_COUNTS\nok = counts == PINNED_COUNTS\n"),
         (
             "numbers that only look like it",
-            f'x = "{FIGURE}0 and 0{FIGURE} and {FIGURE}.5 and 0.{FIGURE} and a{FIGURE}b and 1{FIGURE:,} and {FIGURE + 1}"\ny = {FIGURE + 1}\n',
+            f'x = "{FIGURE}0 and {FIGURE}.5 and 0.{FIGURE} and a{FIGURE}b and 1{FIGURE:,} and {FIGURE + 1}"\ny = {FIGURE + 1}\n',
         ),
         ("a hash that holds the digits", f'h = "9f{FIGURE}ac3e"\n'),
         ("a flag made from the split rule", "ok = all(SET_NAMES[patient_part(n)] != 'test' for n in ns)\n" + 'record.expect("c", "k", "e", f"{ok}", ok)\n'),
@@ -623,6 +761,173 @@ class ScannerFindsEveryWay(unittest.TestCase):
         ):
             with self.subTest(source=label):
                 self.assertEqual([], findings(source, label))
+
+
+PASSED_ON = "def check(self, text):\n    self.record.expect('c', 'k', text, sealed_observed({'a': True}), ok is True)\n"
+
+
+def expected_text(expression: str) -> str:
+    return f'record.expect("c", "k", {expression}, sealed_observed({{"a": True}}), ok is True)\n'
+
+
+class ExpectationTexts(unittest.TestCase):
+    """A sealed runner's text of a record is written text, or an f-string of allowed constants whose values are read from the runner. Each text, as it is
+    written with those values, is held to the figures: the test count of patients and the held-out count of cases, in any spelling and as the sum or
+    difference of the totals that a text holds (the reviewer's probes: a figure as decimal text, with leading zeros or with separators, and a set of totals in
+    one expectation)."""
+
+    PATIENTS = sum(split_table.PINNED_COUNTS.values())
+    TRAINING, VALIDATION = split_table.PINNED_COUNTS["training"], split_table.PINNED_COUNTS["validation"]
+    CASES, DEVELOPMENT_CASES = int(BY_NAME["cases"].expected), int(BY_NAME["development_cases"].expected)
+    USUAL = {
+        "IMAGE": "surgical-risk-spark:p6-cases",
+        "JOB_SECONDS": 900,
+        "NO_PROGRESS_SECONDS": 240,
+        "STALL_SECONDS": 420,
+        "NESSIE_USER": "10000:10001",
+        "CASE_COUNT": 4,
+        "FULL_CASES": CASES,
+        "CUTOFF_FRACTIONS": (25, 50, 75),
+    }
+
+    @staticmethod
+    def spellings(figure: int) -> dict[str, str]:
+        return {
+            "a decimal text": f"{figure}.0",
+            "a decimal text of two zeros": f"{figure:,}.00",
+            "leading zeros": f"{figure:08d}",
+            "leading zeros and a separator": f"0{figure:,}",
+            "a thousands separator": f"{figure:,}",
+            "an underscore": f"{figure:,}".replace(",", "_"),
+            "an apostrophe": f"{figure:,}".replace(",", "'"),
+            "a space": f"{figure:,}".replace(",", " "),
+            "no separator": str(figure),
+        }
+
+    def named(self, source: str, values: Mapping[str, Any] | None = None) -> set[str]:
+        return {name for name, _ in scanned("a plant", lambda text: expectation_findings(text, values or {}), source)}
+
+    def test_each_figure_in_each_spelling_in_a_written_text_is_named(self) -> None:
+        for figure, which in ((FIGURE, "the test count"), (CASE_FIGURE, "the held-out case count")):
+            for label, text in self.spellings(figure).items():
+                with self.subTest(figure=which, spelling=label):
+                    self.assertEqual({"expectation_holds_figure"}, self.named(expected_text(repr(f"the set holds {text} patients"))))
+
+    def test_a_set_of_totals_in_one_text_from_which_a_figure_follows_is_named(self) -> None:
+        for label, text in (
+            ("the patients and both development sets", f"{self.PATIENTS:,} patients, {self.TRAINING:,} in training and {self.VALIDATION:,} in validation"),
+            ("the same in digits only", f"{self.PATIENTS} {self.TRAINING} {self.VALIDATION}"),
+            ("the same with another order and decimal parts", f"{self.VALIDATION}.0 and {self.PATIENTS}.0 less {self.TRAINING}.0"),
+            ("the cases and the development cases", f"{self.CASES:,} cases of which {self.DEVELOPMENT_CASES:,} are development cases"),
+            ("the sets of patients in a tuple", f"{(self.PATIENTS, self.TRAINING, self.VALIDATION)}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual({"expectation_holds_figure"}, self.named(expected_text(repr(text))))
+                self.assertTrue(text_holds_figure(text), "the text does not give a figure by figure_derivable or figure_pattern")
+
+    def test_a_set_of_totals_that_is_made_by_allowed_constants_is_named(self) -> None:
+        for label, expression, values in (
+            (
+                "the cases and the development cases",
+                'f"{FULL_CASES} cases and {CASE_COUNT} development cases"',
+                {"FULL_CASES": self.CASES, "CASE_COUNT": self.DEVELOPMENT_CASES},
+            ),
+            ("the halves of the figure", 'f"{IMAGE}{JOB_SECONDS}"', {"IMAGE": str(FIGURE)[:2], "JOB_SECONDS": str(FIGURE)[2:]}),
+            ("the figure as a constant", 'f"after {JOB_SECONDS} seconds"', {"JOB_SECONDS": FIGURE}),
+            ("the figure as a decimal constant", 'f"after {JOB_SECONDS} seconds"', {"JOB_SECONDS": float(FIGURE)}),
+            ("the figure in a tuple", 'f"at {CUTOFF_FRACTIONS}"', {"CUTOFF_FRACTIONS": (FIGURE, 1)}),
+            ("a choice between a clean text and one with the figure", f'"clean" if ok else f"{{IMAGE}} {FIGURE}"', {"IMAGE": "x"}),
+        ):
+            with self.subTest(label):
+                self.assertEqual({"expectation_holds_figure"}, self.named(expected_text(expression), values))
+
+    def test_a_text_that_is_not_written_text_is_named(self) -> None:
+        for label, source in (
+            ("a name", expected_text("text")),
+            ("a helper's text", expected_text("describe(count)")),
+            ("a text made by str", expected_text("str(count)")),
+            ("a text made by format", expected_text('"rows {}".format(count)')),
+            ("a text made by a join", expected_text('", ".join(parts)')),
+            ("a sum of texts", expected_text('"rows " + count')),
+            ("a percent format", expected_text('"rows %d" % count')),
+            ("a capital name that is not allowed", expected_text('f"the set holds {TOTAL}"')),
+            ("a capital name alone", expected_text("TOTAL")),
+            ("a field that is a name", expected_text('f"the set holds {total}"')),
+            ("a field that is a call", expected_text('f"the set holds {len(rows)}"')),
+            ("a field with a conversion", expected_text('f"{IMAGE!r}"')),
+            ("a field with a format", expected_text('f"{JOB_SECONDS:>8}"')),
+            ("an allowed name and another", expected_text('f"{IMAGE} {TOTAL}"')),
+            ("a variable that was built", 'text = f"the set holds {total}"\n' + expected_text("text")),
+            (
+                "a text that a function passes on",
+                "def check(self, text):\n    self.record.expect('c', 'k', text, sealed_observed({'a': True}), ok is True)\nself.check(f'rows {n}')\n",
+            ),
+            ("a log line", 'log.append(f"rows {n}")\n'),
+            ("a limit", 'record.limits.append(f"within {SECONDS} seconds")\n'),
+            ("a limit list", 'record.limits = ["a", f"within {SECONDS} seconds"]\n'),
+            ("a cleanup line", "cleanup.append(describe(gone))\n"),
+            ("a command", 'record.commands.append(f"python {arguments}")\n'),
+            ("an observation text", 'record.expect("c", "k", "e", f"seen {n}", ok is True)\n'),
+        ):
+            with self.subTest(label):
+                self.assertEqual({"expectation_not_literal"}, self.named(source, self.USUAL), source)
+
+    def test_an_allowed_name_without_a_usable_value_is_named(self) -> None:
+        for label, values in (
+            ("no value", {}),
+            ("a Boolean", {"IMAGE": True}),
+            ("a list of objects", {"IMAGE": [object()]}),
+            ("a mapping", {"IMAGE": {"a": 1}}),
+            ("none", {"IMAGE": None}),
+        ):
+            with self.subTest(label):
+                self.assertEqual({"constant_unresolved"}, self.named(expected_text('f"built as {IMAGE}"'), values))
+
+    def test_written_text_and_the_allowed_constants_with_their_usual_values_are_quiet(self) -> None:
+        for label, source in (
+            ("a literal", expected_text('"the AWS command line and curl run and print a version"')),
+            ("an adjacent literal", expected_text('"a " "b"')),
+            ("a choice of two literals", expected_text('"one" if ok else "two"')),
+            ("the published totals", expected_text(f'"the clinical table has {self.CASES:,} cases of {self.PATIENTS:,} patients"')),
+            ("the development counts only", expected_text(f'"the training set has {self.TRAINING:,} patients and the validation set {self.VALIDATION:,}"')),
+            ("the development cases alone", expected_text(f'"the {self.DEVELOPMENT_CASES:,} development cases"')),
+            ("numbers that only look like the figures", expected_text(repr(f"{FIGURE}0 and {FIGURE}.5 and 0.{FIGURE} and a{FIGURE}b and {FIGURE + 1}"))),
+            ("a hash", expected_text(repr(f"the file {'9f' + str(FIGURE) + 'ac3e'} is pinned"))),
+            (
+                "every allowed constant",
+                expected_text('f"{IMAGE} {JOB_SECONDS} {NO_PROGRESS_SECONDS} {STALL_SECONDS} {NESSIE_USER} {CASE_COUNT} {FULL_CASES} {CUTOFF_FRACTIONS}"'),
+            ),
+            ("a sealed text", expected_text('sealed_observed({"a": True})')),
+            ("a limit that names a constant", 'record.limits.append(f"a step that gives no result within {JOB_SECONDS} seconds fails the run")\n'),
+            ("a cleanup that names a constant", 'cleanup.append(f"image tag {IMAGE} left alone")\n'),
+            (
+                "a text that a function passes on, given written text",
+                PASSED_ON + "self.check('rows')\nself.check(f'after {JOB_SECONDS}')\n",
+            ),
+        ):
+            with self.subTest(label):
+                self.assertEqual([], scanned(label, lambda text: expectation_findings(text, self.USUAL), source))
+
+    def test_the_findings_name_the_line_and_never_a_figure(self) -> None:
+        found = scanned("a plant", lambda text: expectation_findings(text, {}), "x = 1\n" + expected_text(repr(f"the set holds {FIGURE:,}")))
+        self.assertEqual([("expectation_holds_figure", 2)], found)
+        self.assertFalse(str(FIGURE) in repr(found) or str(CASE_FIGURE) in repr(found), "a finding holds a figure")
+
+    def test_the_figure_of_cases_is_the_difference_of_the_prespecified_counts_and_is_not_the_figure_of_patients(self) -> None:
+        self.assertGreater(CASE_FIGURE, 99)
+        self.assertNotEqual(FIGURE, CASE_FIGURE)
+        self.assertEqual({FIGURE, CASE_FIGURE}, set(FIGURES))
+
+    def test_each_text_of_each_sealed_runner_here_is_written_text_and_holds_no_figure(self) -> None:
+        paths = [E2E / name for name in (*OUTCOME_RUNNERS, "fixed_sample.py") if (E2E / name).is_file()]
+        if not paths:
+            self.skipTest("no sealed runner is in this checkout: the written texts of the ignored runners were not scanned")
+        for path in paths:
+            with self.subTest(runner=path.name):
+                source = path.read_text()
+                values: dict[str, Any] = scanned(path.name, partial(constant_values, path), source)
+                found = scanned(path.name, partial(expectation_findings, values=values), source)
+                self.assertEqual([], found, f"{path.name}: the rule and the line of each text that is not written text or that holds a figure")
 
 
 class FoldedConstants(unittest.TestCase):
