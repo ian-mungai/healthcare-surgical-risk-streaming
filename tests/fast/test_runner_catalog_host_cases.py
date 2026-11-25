@@ -315,7 +315,20 @@ class AwsOfTheHost:
     whose folder it mounted.
     """
 
-    def __init__(self, *, accept_write: bool = False, state_error: str = DENIED_LIST, write_error: str = DENIED_PUT, warning: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        accept_write: bool = False,
+        state_error: str = DENIED_LIST,
+        write_error: str = DENIED_PUT,
+        warning: str = "",
+        empty_listing: str = "0\n",
+        listing_exit: int = 0,
+        listing_error: str = "",
+    ) -> None:
+        self.empty_listing = empty_listing
+        self.listing_exit = listing_exit
+        self.listing_error = listing_error
         self.accept_write = accept_write
         self.bucket: set[str] = set()
         self.state_error = state_error
@@ -368,7 +381,9 @@ class AwsOfTheHost:
             if "--query" in after:
                 self.calls.append((workload, "probe list"))
                 self.listed_keys.append(prefix)
-                return 0, ("1\n" if prefix in self.bucket else "0\n"), ""
+                if self.listing_exit:
+                    return self.listing_exit, "", self.listing_error
+                return 0, ("1\n" if prefix in self.bucket else self.empty_listing), ""
             self.calls.append((workload, "warehouse list"))
             return 0, '{"KeyCount": 1}\n', ""
         raise AssertionError(after)
@@ -403,6 +418,41 @@ class TrinoWorkloadWrite(unittest.TestCase):
         self.assertTrue(aws.put_key.startswith("warehouse/catalog_proof_trino_write_probe_"))
         self.assertEqual(aws.listed_keys, [aws.put_key])
         self.assertIn("probe key absent: True", observation(run, "the Trino workload's own access").observed)
+
+    def test_the_cli_prints_none_for_the_key_count_of_an_empty_listing_and_that_is_absent(self) -> None:
+        for empty in ("0\n", "None\n"):
+            with self.subTest(empty=empty):
+                run, _ = self.run_case(AwsOfTheHost(empty_listing=empty))
+                self.assertEqual(failed(run), [])
+                self.assertIn("probe key absent: True", observation(run, "the Trino workload's own access").observed)
+
+    def test_any_other_answer_of_the_probe_listing_is_not_absent(self) -> None:
+        for answer in ("1\n", "5\n", "10\n", "\n", "none\n", "null\n", "None\nNone\n", "0 0\n", " 0\n", "00\n", "-0\n", "KeyCount\n"):
+            with self.subTest(answer=answer):
+                run, _ = self.run_case(AwsOfTheHost(empty_listing=answer))
+                self.assertEqual(failed(run), ["the Trino workload's own access"])
+                self.assertIn("probe key absent: False", observation(run, "the Trino workload's own access").observed)
+
+    def test_a_probe_listing_that_fails_is_not_absent_whatever_it_printed(self) -> None:
+        for code, out in ((1, "0\n"), (254, "None\n"), (255, "0\n")):
+            with self.subTest(code=code):
+                run, _ = self.run_case(AwsOfTheHost(listing_exit=code, empty_listing=out))
+                self.assertEqual(failed(run), ["the Trino workload's own access"])
+                self.assertIn("probe key absent: False", observation(run, "the Trino workload's own access").observed)
+
+    def test_a_probe_listing_that_is_an_error_is_not_absent(self) -> None:
+        run, _ = self.run_case(AwsOfTheHost(empty_listing=DENIED_LIST))
+        self.assertEqual(failed(run), ["the Trino workload's own access"])
+
+    def test_the_probe_key_that_exists_prints_its_count_and_is_not_absent_even_when_none_is_the_empty_form(self) -> None:
+        run, _ = self.run_case(AwsOfTheHost(empty_listing="None\n"), leftover=True)
+        self.assertEqual(failed(run), ["the Trino workload's own access"])
+
+    def test_the_absent_forms_are_the_two_of_an_empty_listing_and_nothing_else(self) -> None:
+        module = runner()
+        self.assertTrue(all(module.probe_absent(0, text) for text in ("0\n", "None\n", "0", "None")))
+        self.assertFalse(any(module.probe_absent(0, text) for text in ("1\n", "5\n", "", "\n", "none", "None None", "0\n0\n", "00", "Error")))
+        self.assertFalse(any(module.probe_absent(code, text) for code in (1, 2, 252, 254, 255) for text in ("0\n", "None\n")))
 
     def test_each_call_mounts_the_folder_of_its_own_workload(self) -> None:
         aws = AwsOfTheHost()
@@ -471,6 +521,73 @@ class TrinoWorkloadWrite(unittest.TestCase):
         self.assertNotIn("probe_", observed)
         self.assertNotIn(BUCKET, observed)
         self.assertRegex(observed, r"^list exit \d+, write exit \d+, refusal is AccessDenied: (True|False), probe key absent: (True|False)$")
+
+
+JOB_LINE = "Nessie refused the branch: the reference or its content changed (a conflict)"
+
+
+class SecondJobOnTheSameBranch(unittest.TestCase):
+    """The job's refusal of a branch that exists is one fixed line of its own: ``<job>: <fixed text>``, and the case asks for exactly that line."""
+
+    def case(self, module: ModuleType, code: int, err: str, *, moved: bool = False) -> Record:
+        nessie = HostNessie()
+        trunk = module.start_private_trunk(nessie, "proof_trunk_x")
+        branch = nessie.create_branch("proof_b", trunk.name)
+        at = branch.hash
+        if moved:
+            nessie.commit(branch.name, branch.hash, "write", [module.put_namespace("x")])
+        proof = proof_of(module, Stack(lambda arguments, environment: (code, "", err, 1.0)), HostTrino(), nessie, trunk="proof_trunk_x")
+        proof.second_job("proof_b", {"branch_hash": at})
+        record_: Record = proof.record
+        return record_
+
+    def test_the_fixed_line_of_the_job_passes_also_after_other_lines(self) -> None:
+        module = runner()
+        name = spark_name(module)
+        for err in (f"{name}: {JOB_LINE}\n", f"WARNING: noise\n{name}: {JOB_LINE}\nmore noise\n", f"{name}: {JOB_LINE}"):
+            with self.subTest(err=err):
+                self.assertEqual(failed(self.case(module, 1, err)), [])
+
+    def test_the_old_text_that_names_the_branch_does_not_pass(self) -> None:
+        module = runner()
+        name = spark_name(module)
+        run = self.case(module, 1, f"{name}: Nessie refused the branch proof_b: Nessie refused the reference\n")
+        self.assertEqual(failed(run), ["a second job on the same branch"])
+
+    def test_another_line_does_not_pass(self) -> None:
+        module = runner()
+        name = spark_name(module)
+        for err in (
+            "",
+            f"{name}: cannot work with Nessie: boom\n",
+            f"table_checks: {JOB_LINE}\n",
+            f"{JOB_LINE}\n",
+            f"{name}: {JOB_LINE} extra\n",
+            f"{name}: {JOB_LINE.replace('(a conflict)', '(conflict)')}\n",
+            f"{name}: {JOB_LINE.lower()}\n",
+            f"at x: {name}: {JOB_LINE}\n",
+            f" {name}: {JOB_LINE}\n",
+            f"{name}: Nessie refused the branch proof_b\n",
+        ):
+            with self.subTest(err=err):
+                self.assertEqual(failed(self.case(module, 1, err)), ["a second job on the same branch"])
+
+    def test_another_exit_code_or_a_moved_branch_does_not_pass(self) -> None:
+        module = runner()
+        line = f"{spark_name(module)}: {JOB_LINE}\n"
+        for code in (0, 2, 124):
+            with self.subTest(code=code):
+                self.assertEqual(failed(self.case(module, code, line)), ["a second job on the same branch"])
+        self.assertEqual(failed(self.case(module, 1, line, moved=True)), ["a second job on the same branch"])
+
+    def test_the_text_is_the_one_that_the_job_source_holds_when_the_checkout_holds_the_fixed_text(self) -> None:
+        module = runner()
+        nessie_source = (ROOT / "scripts" / "stack" / "nessie.py").read_text()
+        found = re.search(r'^CONFLICT_TEXT = "(.+)"$', nessie_source, re.MULTILINE)
+        if found is None:
+            self.skipTest("this checkout's job still names the branch: the fixed text is in the integration branch")
+        self.assertEqual(module.CONFLICT_LINE, found.group(1))
+        self.assertEqual(module.CONFLICT_LINE, JOB_LINE)
 
 
 class MainAndLaterWrite(unittest.TestCase):
