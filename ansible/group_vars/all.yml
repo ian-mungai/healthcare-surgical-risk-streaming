@@ -106,9 +106,21 @@ compose_stack_provision_deadline_seconds: 120
 # mode 0400. Both are set by the deploy that places the token; the role stops with a fixed message while either is missing, and it creates neither.
 compose_stack_registry_user: ""
 compose_stack_registry_token_file: "{{ compose_stack_secrets_directory }}/registry_token"
-# The role's own Docker client configuration folder (mode 0700, made for the pull and removed after it). The login, the pull and the logout run with DOCKER_CONFIG set to it,
-# so the host's other Docker logins are never touched.
+# The parent of the pull's own Docker client configuration folders (mode 0700, owned by compose_stack_owner). The pull makes one fresh folder under it, holds the login in
+# that folder only and removes the folder; the parent is made when it is missing and is never removed or changed, and nothing else in it is read or changed.
 compose_stack_registry_config_directory: "{{ compose_stack_directory }}/registry_docker"
+# The project's image settings come from the rendered host settings file and from nothing else, so every Compose command runs with these three names removed from the
+# environment that it inherits (env -u, because Ansible's environment setting cannot remove a name). The three names are those of scripts.stack.groups.PROJECT_IMAGE_SETTINGS.
+compose_stack_environment_unset:
+  - env
+  - -u
+  - IMAGE_DAGSTER
+  - -u
+  - IMAGE_REPLAY
+  - -u
+  - IMAGE_SPARK
+# The Docker command itself, for the calls that are not Compose commands (docker inspect).
+compose_stack_docker_command: docker
 compose_stack_command:
   - docker
   - compose
@@ -120,7 +132,7 @@ compose_stack_command:
   - "{{ compose_stack_compose_directory }}/limits.env"
   - --env-file
   - "{{ compose_stack_compose_directory }}/host.env"
-compose_stack_docker: "{{ compose_stack_command + (['--project-name', compose_stack_project] if compose_stack_project else []) }}"
+compose_stack_docker: "{{ compose_stack_environment_unset + compose_stack_command + (['--project-name', compose_stack_project] if compose_stack_project else []) }}"
 
 # Helm and Airbyte's chart. Each download is checked against its pinned SHA-256. Helm 3 is the line that Airbyte's installation guide uses.
 helm_version: v3.22.1

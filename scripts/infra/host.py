@@ -366,7 +366,7 @@ def platform_commit() -> str:
 
 
 def registry_user(configuration: dict[str, str]) -> str:
-    """The Docker Hub account of IMAGE_REPOSITORY (``<account>/<repository>``), which the host logs in as. A bad value is refused by the key's name."""
+    """The Docker Hub account of IMAGE_REPOSITORY (``<account>/<repository>``), which the host pulls as. A bad value is refused by the key's name."""
     repository = configuration.get("IMAGE_REPOSITORY", "")
     if not repository:
         raise HostError("IMAGE_REPOSITORY is missing in .env: copy the line from .env.example and fill it in")
@@ -377,7 +377,7 @@ def registry_user(configuration: dict[str, str]) -> str:
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
     """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, the bucket that Airbyte's
-    connection copies into, and the Docker Hub account that the host logs in as to pull the project's images. No variable holds the AWS profile or the key: the
+    connection copies into, and the Docker Hub account that the host pulls the project's images as. No variable holds the AWS profile or the key: the
     launcher reads the key itself and sends it to the host without Ansible."""
     return {
         "compose_stack_platform_commit": commit,

@@ -1,10 +1,15 @@
-# Reads compose_stack_docker (its first word is the docker command), compose_stack_registry_user, compose_stack_registry_token_file,
-# compose_stack_registry_config_directory, compose_stack_owner, compose_stack_group and compose_stack_pull_deadline_seconds. The project's images are in one
-# private Docker Hub repository, which the owner's computer pushed to (make images-push) and which compose/image_pins.yml names by digest. The host builds nothing:
-# it logs in with a read-only access token, pulls every image that the Compose files name (including the batch profile's), and logs out again. The login, the
-# pull and the logout run with DOCKER_CONFIG set to the role's own folder (mode 0700, removed at the end), so the host's other Docker logins are never read,
-# replaced or removed, and a failed logout fails the play. No logout runs when the login task was never reached. The token is one file on the host, which only
-# root reads. It reaches Docker through standard input only: it is on no command line, in no printed output and in no variable that a task keeps.
+# Reads compose_stack_docker (the Compose command, which runs with the project image settings removed from its environment), compose_stack_registry_user,
+# compose_stack_registry_token_file, compose_stack_registry_config_directory (the parent of the pull's login folder), compose_stack_owner and
+# compose_stack_pull_deadline_seconds. The project's images are in one private Docker Hub repository, which the owner's computer pushed to (make images-push) and
+# which compose/image_pins.yml names by digest. The host builds nothing: it pulls every image that the Compose files name (including the batch profile's).
+# The role owns every piece of Docker state that the pull uses and changes no state that anything else shares: it runs no docker login and no docker logout. One shell
+# task makes a fresh folder under the parent (mode 0700, never removed, never changed), writes the folder's config.json (mode 0600) with the one auth entry for Docker Hub,
+# runs the pull with DOCKER_CONFIG set to that folder and with DOCKER_AUTH_CONFIG and the project image settings removed from the environment, and removes that folder
+# on every exit. The task refuses before any write when a docker-credential-* program is on the PATH (Docker would pick it, and read no auth from the file). The token is one
+# file on the host, which only root reads. The shell task reads it on its standard input, so it is on no command line, in no environment, in no printed output and in
+# no variable that Ansible keeps. A caller that gets the token another way pipes it into the same task.
+# The task keeps its own deadline, ten seconds before compose_stack_pull_deadline_seconds (the pull is ended with a TERM signal past it), so its cleanup runs before
+# Ansible's own timeout, which is the backstop. The final step removes a folder path that the task printed and nothing else, for a task that Ansible ended anyway.
 - name: Stop when the registry user or the token file is not set
   ansible.builtin.assert:
     that:
@@ -29,59 +34,90 @@
     quiet: true
     fail_msg: "the registry token file is missing, is empty or is not a plain file that only {{ compose_stack_owner }} reads (mode 0400)"
 
-- name: Read the registry token
-  ansible.builtin.slurp:
-    src: "{{ compose_stack_registry_token_file }}"
-  register: compose_stack_registry_token
-  check_mode: false
-  no_log: true
-
-- name: Stop when the registry token file holds only white space
-  ansible.builtin.assert:
-    that: compose_stack_registry_token.content | b64decode | trim | length > 0
-    quiet: true
-    fail_msg: "the registry token file is empty"
-  no_log: true
-
-- name: Log in, pull the images and log out, in the role's own Docker configuration folder
+- name: Pull the images with a login that only the pull task holds
   block:
-    - name: Make the role's Docker configuration folder, which only the owner enters
-      ansible.builtin.file:
-        path: "{{ compose_stack_registry_config_directory }}"
-        state: directory
-        owner: "{{ compose_stack_owner }}"
-        group: "{{ compose_stack_group }}"
-        mode: "0700"
+    - name: Pull every image of the Compose files, each by its digest
+      ansible.builtin.shell:
+        cmd: |
+          {
+            set -u
+            umask 077
+            user={{ compose_stack_registry_user | quote }}
+            parent={{ compose_stack_registry_config_directory | quote }}
+            owner={{ compose_stack_owner | quote }}
+            deadline={{ [(compose_stack_pull_deadline_seconds | int) - 10, 1] | max }}
+            folder=
+            pull=
+            refuse() { printf 'REFUSED=%s\n' "$1"; exit 64; }
+            cleanup() {
+              if [ -n "$pull" ]; then kill -TERM "$pull" 2>/dev/null; fi
+              case $folder in "$parent"/login.*) rm -rf -- "$folder" ;; esac
+            }
+            trap cleanup EXIT
+            trap 'exit 1' HUP INT TERM
+            IFS=:
+            for dir in $PATH; do
+              for found in "${dir:-.}"/docker-credential-*; do
+                if [ -e "$found" ]; then refuse "a docker-credential helper is on the PATH: Docker would use it and read no login from the file"; fi
+              done
+            done
+            unset IFS
+            IFS= read -r token || true
+            token=$(printf '%s' "$token" | tr -d '[:space:]')
+            if [ -z "$token" ]; then refuse "the registry token file is empty"; fi
+            if [ -e "$parent" ] || [ -L "$parent" ]; then
+              if [ -z "$(find "$parent" -maxdepth 0 -type d -perm 0700 -user "$owner" 2>/dev/null)" ]; then
+                refuse "the folder for the pull's login is not a directory with mode 0700 that $owner owns"
+              fi
+            else
+              mkdir -m 0700 "$parent" || refuse "the folder for the pull's login could not be made"
+            fi
+            folder=$(mktemp -d "$parent/login.XXXXXX") || refuse "the pull's login folder could not be made"
+            printf 'FOLDER=%s\n' "$folder"
+            auth=$(printf '%s:%s' "$user" "$token" | base64 | tr -d '\n')
+            printf '{"auths": {"https://index.docker.io/v1/": {"auth": "%s"}}}\n' "$auth" > "$folder/config.json"
+            chmod 0600 "$folder/config.json"
+            env -u DOCKER_AUTH_CONFIG "DOCKER_CONFIG=$folder" {{ compose_stack_docker | map('quote') | join(' ') }} --profile batch pull --quiet < /dev/null > /dev/null 2>&1 &
+            pull=$!
+            (
+              waited=0
+              while kill -0 "$pull" 2>/dev/null; do
+                if [ "$waited" -ge "$deadline" ]; then kill -TERM "$pull" 2>/dev/null; exit 1; fi
+                sleep 1
+                waited=$((waited + 1))
+              done
+            ) &
+            wait "$pull"
+            code=$?
+            if ! wait $!; then code=124; fi
+            pull=
+            exit "$code"
+          } < {{ compose_stack_registry_token_file | quote }}
+      register: compose_stack_pull
+      failed_when: false
+      changed_when: false
+      no_log: true
+      timeout: "{{ compose_stack_pull_deadline_seconds | int }}"
 
-    - name: Log in, pull and log out
-      block:
-        - name: Log in to Docker Hub with the token on standard input
-          ansible.builtin.command:
-            argv: "{{ [compose_stack_docker[0], 'login', '--username', compose_stack_registry_user, '--password-stdin'] }}"
-            stdin: "{{ compose_stack_registry_token.content | b64decode | trim }}"
-          environment:
-            DOCKER_CONFIG: "{{ compose_stack_registry_config_directory }}"
-          changed_when: false
-          no_log: true
-          timeout: 60
-
-        - name: Pull every image of the Compose files, each by its digest
-          ansible.builtin.command:
-            argv: "{{ compose_stack_docker + ['--profile', 'batch', 'pull', '--quiet'] }}"
-          environment:
-            DOCKER_CONFIG: "{{ compose_stack_registry_config_directory }}"
-          changed_when: false
-          timeout: "{{ compose_stack_pull_deadline_seconds | int }}"
-      always:
-        - name: Log out of Docker Hub, in the role's own folder
-          ansible.builtin.command:
-            argv: "{{ [compose_stack_docker[0], 'logout'] }}"
-          environment:
-            DOCKER_CONFIG: "{{ compose_stack_registry_config_directory }}"
-          changed_when: false
-          timeout: 60
+    - name: Stop with a fixed message when the pull was refused or failed
+      ansible.builtin.fail:
+        msg: >-
+          {{ (compose_stack_pull.stdout_lines | select('match', '^REFUSED=') | map('regex_replace', '^REFUSED=', '') | list | first)
+          if (compose_stack_pull.stdout_lines | select('match', '^REFUSED=') | list | length > 0)
+          else ('the image pull ran past its deadline of ' ~ compose_stack_pull_deadline_seconds ~ ' seconds' if compose_stack_pull.rc == 124
+          else 'the image pull failed with status ' ~ compose_stack_pull.rc) }}
+      when: compose_stack_pull.rc != 0
   always:
-    - name: Remove the role's Docker configuration folder, so no login file stays on the host
+    - name: Find the login folder that the pull task printed
+      ansible.builtin.set_fact:
+        compose_stack_pull_leftovers: >-
+          {{ ((compose_stack_pull | default({})).stdout_lines | default([])) | select('match', '^FOLDER=') | map('regex_replace', '^FOLDER=', '')
+          | select('match', (compose_stack_registry_config_directory | regex_escape) ~ '/login\.[A-Za-z0-9]+$') | list }}
+      no_log: true
+
+    - name: Remove a login folder that the pull task left, and nothing else
       ansible.builtin.file:
-        path: "{{ compose_stack_registry_config_directory }}"
+        path: "{{ item }}"
         state: absent
+      loop: "{{ compose_stack_pull_leftovers }}"
+      no_log: true

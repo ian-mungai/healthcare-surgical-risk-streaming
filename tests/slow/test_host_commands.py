@@ -7,6 +7,7 @@ Terraform state with data sources and nested modules.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import functools
 import io
@@ -1080,7 +1081,8 @@ class DeployVariablesTest(unittest.TestCase):
             values["compose_stack_registry_user"] = host.deploy_variables(CONFIGURATION, "b" * 40)["compose_stack_registry_user"]
             code, output = run_tasks("pull_images.yml", values)
             self.assertEqual(0, code, output)
-            self.assertIn("login --username exampleaccount --password-stdin", (stand_in.parent / "calls.log").read_text())
+            used = json.loads((stand_in.parent / "pull_config.json").read_text())["auths"]["https://index.docker.io/v1/"]["auth"]
+            self.assertEqual(f"exampleaccount:{PullTest.TOKEN}", base64.b64decode(used).decode())
 
     def test_a_bucket_name_that_s3_refuses_stops_the_deploy_before_ansible_runs(self) -> None:
         with self.assertRaises(WarehouseError):

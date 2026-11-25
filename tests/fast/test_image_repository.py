@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.project_config import ConfigurationError, load_configuration
+from scripts.project_config import OPTIONAL_PATTERNS, ROOT, ConfigurationError, load_configuration
 
 BASE = "AWS_REGION=us-west-2\nAWS_PROFILE=p\nAWS_ACCOUNT_ID=" + "1" * 12 + "\nPROJECT_NAME=p\nENVIRONMENT=dev\nS3_BUCKET=bucket-one\n"
 GOOD = ("acct/images", "a/b", "acct1/my.images_2", "0acct/images__x--y", "acct/images-2")
@@ -56,6 +57,12 @@ class RepositoryFormTest(unittest.TestCase):
                     load_configuration(self.configuration(value))
                 self.assertIn("IMAGE_REPOSITORY", str(raised.exception))
                 self.assertNotIn(value, str(raised.exception))
+
+    def test_the_placeholder_of_the_example_file_is_a_value_that_the_validator_accepts(self) -> None:
+        text = (ROOT / ".env.example").read_text()
+        found = re.findall(r"(?m)^# IMAGE_REPOSITORY=(\S+)$", text)
+        self.assertEqual(1, len(found), "one commented placeholder line")
+        self.assertIsNotNone(OPTIONAL_PATTERNS["IMAGE_REPOSITORY"].fullmatch(found[0]), "a copy that only removes the comment mark must be accepted")
 
 
 if __name__ == "__main__":

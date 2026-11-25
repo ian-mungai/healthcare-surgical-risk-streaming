@@ -103,18 +103,20 @@ def main() -> None:
     module = AnsibleModule(
         argument_spec={
             "compose_command": {"type": "list", "elements": "str", "required": True},
+            "docker_command": {"type": "str", "required": True},
             "services": {"type": "list", "elements": "str", "default": []},
         },
         supports_check_mode=True,
     )
     command: list[str] = module.params["compose_command"]
+    docker: str = module.params["docker_command"]
     targets: list[str] = module.params["services"]
     try:
         files = service_files(json.loads(run(module, [*command, "config", "--format", "json"])))
         containers = parse_containers(run(module, [*command, "ps", "--all", "--format", "json"]))
         started: dict[str, float] = {}
         if containers:
-            lines = run(module, [command[0], "inspect", "--format", "{{ .Id }} {{ .State.StartedAt }}", *containers.values()]).splitlines()
+            lines = run(module, [docker, "inspect", "--format", "{{ .Id }} {{ .State.StartedAt }}", *containers.values()]).splitlines()
             by_id = dict(line.split(" ", 1) for line in lines if " " in line)
             for service, identifier in containers.items():
                 moment = next((text for full, text in by_id.items() if full.startswith(identifier) or identifier.startswith(full)), None)

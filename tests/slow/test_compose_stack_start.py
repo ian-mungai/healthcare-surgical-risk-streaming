@@ -6,11 +6,14 @@ commands and that the registry token reaches Docker through standard input only.
 
 from __future__ import annotations
 
+import base64
+import functools
 import grp
 import json
 import os
 import pwd
 import re
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +32,8 @@ here="$(dirname "$0")"
 printf '%s\n' "$*" >> "$here/calls.log"
 store="${DOCKER_CONFIG:-$here/default_config}"
 printf '%s|%s\n' "${DOCKER_CONFIG-unset}" "$(ls -ld "${DOCKER_CONFIG:-/nonexistent}" 2>/dev/null | cut -c1-10)" >> "$here/config.log"
+printf '%s: %s\n' "$1" "$(env | cut -d= -f1 | grep -E '^(IMAGE_|DOCKER_AUTH_CONFIG$)' | sort | tr '\n' ' ')" >> "$here/names.log"
+env >> "$here/env.log"
 for word in "$@"; do
   case "$word" in
     inspect) verb=inspect ;;
@@ -46,16 +51,14 @@ case "$verb" in
   config_services) cat "$here/services.txt" ;;
   config) if [ -f "$here/config.json" ]; then cat "$here/config.json"; else echo '{"services": {}}'; fi ;;
   ps_json) if [ -f "$here/ps.json" ]; then cat "$here/ps.json"; fi ;;
-  login)
-    cat > "$here/login_stdin.txt"
-    if [ -f "$here/fail_login" ]; then cat "$here/login_stdin.txt" >&2; exit 1; fi
-    mkdir -p "$store" && echo logged-in > "$store/config.json" ;;
-  logout)
-    if [ -f "$here/fail_logout" ]; then echo "logout failed" >&2; exit 1; fi
-    rm -f "$store/config.json" ;;
+  login|logout) echo "the role must not run docker $verb" >&2; exit 1 ;;
   pull)
+    ps -ww -eo args= >> "$here/ps.log"
     if [ -f "$here/fail_pull" ]; then echo "pull failed" >&2; exit 1; fi
-    if [ ! -f "$store/config.json" ]; then echo "pull denied: not logged in" >&2; exit 1; fi ;;
+    if [ ! -f "$store/config.json" ]; then echo "pull denied: not logged in" >&2; exit 1; fi
+    cp "$store/config.json" "$here/pull_config.json"
+    ls -l "$store/config.json" | cut -c1-10 >> "$here/pull_file_mode.log"
+    if [ -f "$here/hang_pull" ]; then exec sleep 30; fi ;;
   up)
     touch "$here/started"
     case " $* " in *" --force-recreate "*) sed -i.bak 's/ .*$/ 2099-01-01T00:00:00Z/' "$here/inspect.txt"; rm -f "$here/inspect.txt.bak" ;; esac ;;
@@ -80,14 +83,26 @@ def calls(stand_in: Path) -> list[str]:
     return log.read_text().splitlines() if log.exists() else []
 
 
-def run_tasks(task_file: str, values: dict[str, object]) -> tuple[int, str]:
+def run_tasks(task_file: str, values: dict[str, object], environment: dict[str, str] | None = None) -> tuple[int, str]:
+    """Run one task file of the role. ``environment`` is the environment that every task of the play inherits, like a host's own."""
     with tempfile.TemporaryDirectory() as scratch:
         work = Path(scratch)
         playbook = work / "check.yml"
         include = f"    - ansible.builtin.include_role:\n        name: {ROLE}\n        tasks_from: {task_file}\n"
-        playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{include}")
+        inherited = "".join(
+            f"  environment:\n    {name}: {json.dumps(value)}\n" if index == 0 else f"    {name}: {json.dumps(value)}\n"
+            for index, (name, value) in enumerate((environment or {}).items())
+        )
+        playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n{inherited}  tasks:\n{include}")
         result = run_playbook(work, playbook, ["-v", "-i", "localhost,", "--extra-vars", json.dumps(values)])
     return result.returncode, result.stdout + result.stderr
+
+
+@functools.cache
+def unset_prefix() -> tuple[str, ...]:
+    """The words that the role's Compose command starts with, as the group variables define them: ``env`` and one ``-u`` for each project image setting."""
+    found: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_environment_unset")
+    return tuple(found)
 
 
 def variables(folder: Path, stand_in: Path, **more: object) -> dict[str, object]:
@@ -96,7 +111,8 @@ def variables(folder: Path, stand_in: Path, **more: object) -> dict[str, object]
         "compose_stack_registry_config_directory": str(folder / "platform" / "registry_docker"),
         "compose_stack_owner": pwd.getpwuid(os.getuid()).pw_name,
         "compose_stack_group": grp.getgrgid(os.getgid()).gr_name,
-        "compose_stack_docker": [str(stand_in), "compose", "--project-name", "sample"],
+        "compose_stack_docker_command": str(stand_in),
+        "compose_stack_docker": [*unset_prefix(), str(stand_in), "compose", "--project-name", "sample"],
         "compose_stack_pull_deadline_seconds": 60,
         "compose_stack_start_deadline_seconds": 60,
         "compose_stack_health_deadline_seconds": 30,
@@ -252,6 +268,47 @@ class RecreateTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps grafana"], forced)
 
+    def test_every_compose_command_of_the_start_runs_with_no_project_image_setting_even_when_the_host_environment_holds_stale_ones(self) -> None:
+        planted = {name: f"stale/{name.lower()}@sha256:{'a' * 64}" for name in ("IMAGE_DAGSTER", "IMAGE_REPLAY", "IMAGE_SPARK")}
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
+            code, output = run_tasks("start.yml", variables(folder, stand_in, compose_stack_start_services=[]), environment=planted)
+            names = (stand_in.parent / "names.log").read_text().splitlines()
+            forced = self.recreations(stand_in)
+        self.assertEqual(0, code, output)
+        self.assertEqual(1, len(forced))
+        compose = [line for line in names if line.startswith("compose:")]
+        self.assertGreaterEqual(len(compose), 5, "config, ps, the start, the recreation and the second ps")
+        self.assertEqual({"compose: "}, set(compose))
+        self.assertIn("inspect: IMAGE_DAGSTER IMAGE_REPLAY IMAGE_SPARK ", names, "the stale settings did reach a command that is not a Compose command")
+
+
+class CommandVariableTest(unittest.TestCase):
+    GROUP_VARIABLES = ROOT / "ansible" / "group_vars" / "all.yml"
+
+    def test_the_compose_command_removes_exactly_the_project_image_settings_with_env_and_the_docker_command_is_its_own_variable(self) -> None:
+        from scripts.stack.groups import PROJECT_IMAGE_SETTINGS
+
+        prefix = list(unset_prefix())
+        self.assertEqual("env", prefix[0])
+        self.assertEqual(["-u"] * len(PROJECT_IMAGE_SETTINGS), prefix[1::2])
+        self.assertEqual(sorted(PROJECT_IMAGE_SETTINGS), sorted(prefix[2::2]))
+        command: Any = load_variable(self.GROUP_VARIABLES, "compose_stack_docker")
+        self.assertEqual([*prefix, "docker", "compose"], command[: len(prefix) + 2])
+        self.assertEqual("docker", load_variable(self.GROUP_VARIABLES, "compose_stack_docker_command"))
+
+    def test_no_task_builds_a_docker_command_of_its_own_and_no_module_takes_a_word_of_the_compose_command_as_the_docker_command(self) -> None:
+        for path in sorted(ROLE.glob("tasks/*.yml")):
+            code = "\n".join(line for line in path.read_text().splitlines() if not line.lstrip().startswith("#"))
+            with self.subTest(path=path.name):
+                self.assertNotRegex(code, r"docker compose|'compose'|\"compose\"")
+                self.assertNotIn("compose_stack_docker[0]", code)
+        for path in sorted(ROLE.glob("library/*.py")):
+            with self.subTest(path=path.name):
+                self.assertNotIn("command[0]", path.read_text())
+
 
 class SecretRecreateTest(unittest.TestCase):
     """A service whose secret file was replaced after its container started is recreated alone by the Compose command; only a named service is read."""
@@ -320,25 +377,35 @@ class SecretRecreateTest(unittest.TestCase):
 
 
 class PullTest(unittest.TestCase):
-    TOKEN = "dckr_pat_example_token_value"  # noqa: S105 - a stand-in value that proves the token never reaches a command line or the output
+    TOKEN = "dckr_pat_example_token_value"  # noqa: S105 - a stand-in value that proves the token never reaches a command line, an environment or the output
+    USER = "example_account"
+    SHAPE = "login.[A-Za-z0-9]+"
 
     def prepare_pull(self, folder: Path, *, mode: int | None = 0o400, content: str = TOKEN + "\n") -> tuple[Path, dict[str, object]]:
         stand_in = prepare(folder)
+        (folder / "platform").mkdir()
         token_file = folder / "registry_token"
         if mode is not None:
             token_file.write_text(content)
             token_file.chmod(mode)
-        values = variables(
-            folder,
-            stand_in,
-            compose_stack_registry_user="example_account",
-            compose_stack_registry_token_file=str(token_file),
-        )
+        values = variables(folder, stand_in, compose_stack_registry_user=self.USER, compose_stack_registry_token_file=str(token_file))
         return stand_in, values
 
-    def config_folder(self, folder: Path) -> Path:
-        """The folder that the role owns for its Docker client configuration."""
+    def parent(self, folder: Path) -> Path:
+        """The parent that the role's own login folders are made in (the variable's value)."""
         return folder / "platform" / "registry_docker"
+
+    def plant_old_folder(self, folder: Path) -> dict[str, str]:
+        """A folder at the old path of the configuration folder with a login in it and a file beside it: the role must change nothing in it."""
+        parent = self.parent(folder)
+        (parent / "keep").mkdir(parents=True)
+        (parent / "config.json").write_text("old-login\n")
+        (parent / "keep" / "note.txt").write_text("note\n")
+        parent.chmod(0o700)
+        return self.snapshot(parent)
+
+    def snapshot(self, parent: Path) -> dict[str, str]:
+        return {str(path.relative_to(parent)): path.read_text() if path.is_file() else "<dir>" for path in sorted(parent.rglob("*"))}
 
     def plant_existing_login(self, stand_in: Path) -> Path:
         """A login of the host's own Docker client, which the role must never read, replace or remove."""
@@ -349,73 +416,160 @@ class PullTest(unittest.TestCase):
 
     def configurations(self, stand_in: Path) -> list[tuple[str, str]]:
         """The ``DOCKER_CONFIG`` value and the folder mode that each docker call saw, in the order of the calls."""
-        return [tuple(line.split("|")) for line in (stand_in.parent / "config.log").read_text().splitlines()]  # type: ignore[misc]
+        log = stand_in.parent / "config.log"
+        return [tuple(line.split("|")) for line in log.read_text().splitlines()] if log.exists() else []  # type: ignore[misc]
 
-    def test_the_login_reads_the_token_from_standard_input_the_pull_follows_and_the_logout_ends_it_with_the_token_on_no_command_line_and_in_no_output(
-        self,
-    ) -> None:
+    def helper_path(self, folder: Path) -> str:
+        helpers = folder / "helpers"
+        helpers.mkdir()
+        (helpers / "docker-credential-fake").write_text("#!/bin/sh\n")
+        (helpers / "docker-credential-fake").chmod(0o755)
+        return f"/usr/bin:/bin:{helpers}"
+
+    def test_the_pull_runs_once_in_a_fresh_folder_under_the_parent_with_no_login_and_no_logout_and_nothing_is_left(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
             code, output = run_tasks("pull_images.yml", values)
             logged = calls(stand_in)
-            stdin = (stand_in.parent / "login_stdin.txt").read_text()
+            seen = self.configurations(stand_in)
+            parent = self.parent(folder)
+            listing = os.listdir(parent)
+            parent_mode = stat.S_IMODE(parent.stat().st_mode)
+            used = json.loads((stand_in.parent / "pull_config.json").read_text())
+            file_mode = (stand_in.parent / "pull_file_mode.log").read_text().strip()
         self.assertEqual(0, code, output)
-        self.assertEqual(
-            [
-                "login --username example_account --password-stdin",
-                "compose --project-name sample --profile batch pull --quiet",
-                "logout",
-            ],
-            logged,
-        )
-        self.assertEqual(self.TOKEN, stdin.strip())
-        self.assertNotIn(self.TOKEN, "\n".join(logged) + output)
+        self.assertEqual(["compose --project-name sample --profile batch pull --quiet"], logged)
+        self.assertEqual(1, len(seen))
+        used_folder, mode = seen[0]
+        self.assertRegex(used_folder, re.escape(str(parent)) + "/" + self.SHAPE + "$")
+        self.assertEqual("drwx------", mode)
+        self.assertEqual("-rw-------", file_mode)
+        auth = base64.b64encode(f"{self.USER}:{self.TOKEN}".encode()).decode()
+        self.assertEqual({"auths": {"https://index.docker.io/v1/": {"auth": auth}}}, used, "one auth entry for Docker Hub and nothing else")
+        self.assertEqual([], listing, "the folder is removed and the parent stays")
+        self.assertEqual(0o700, parent_mode)
 
-    def test_login_pull_and_logout_all_use_the_role_s_own_root_only_configuration_folder_and_it_is_gone_afterwards(self) -> None:
+    def test_the_token_is_on_no_command_line_in_no_environment_and_in_no_output(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
             code, output = run_tasks("pull_images.yml", values)
-            seen = self.configurations(stand_in)
-            left = self.config_folder(folder).exists()
+            seen = {name: (stand_in.parent / name).read_text() for name in ("calls.log", "env.log", "ps.log", "names.log")}
         self.assertEqual(0, code, output)
-        self.assertEqual([(str(self.config_folder(folder)), "drwx------")] * 3, seen, "login, pull and logout, each with the folder that only the owner enters")
-        self.assertFalse(left, "no login stays in the folder after the play")
+        auth = base64.b64encode(f"{self.USER}:{self.TOKEN}".encode()).decode()
+        for name, text in {**seen, "output": output}.items():
+            self.assertNotIn(self.TOKEN, text, name)
+            self.assertNotIn(auth, text, name)
+        self.assertIn("compose --project-name sample --profile batch pull --quiet", seen["ps.log"], "the process list was read while the pull ran")
 
-    def test_the_hosts_own_docker_login_is_never_read_replaced_or_removed_by_any_outcome_of_the_role(self) -> None:
-        outcomes = {
+    def test_the_pull_sees_neither_a_docker_auth_setting_nor_a_project_image_setting_of_the_hosts_environment(self) -> None:
+        planted = {"DOCKER_AUTH_CONFIG": '{"auths": {}}', "IMAGE_SPARK": "stale/x@sha256:" + "a" * 64, "IMAGE_DAGSTER": "stale/y", "IMAGE_REPLAY": "stale/z"}
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            code, output = run_tasks("pull_images.yml", values, environment=planted)
+            names = (stand_in.parent / "names.log").read_text().splitlines()
+        self.assertEqual(0, code, output)
+        self.assertEqual(["compose: "], names)
+
+    def test_a_docker_credential_helper_on_the_path_refuses_the_pull_before_any_write_or_docker_call(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            code, output = run_tasks("pull_images.yml", values, environment={"PATH": self.helper_path(folder)})
+            made = self.parent(folder).exists()
+            logged = calls(stand_in)
+        self.assertNotEqual(0, code)
+        self.assertIn("a docker-credential helper is on the PATH", output)
+        self.assertFalse(made, "nothing was written, not even the parent")
+        self.assertEqual([], logged)
+        self.assertNotIn(self.TOKEN, output)
+
+    def test_an_existing_folder_at_the_old_path_and_an_existing_docker_login_are_untouched_by_every_outcome(self) -> None:
+        outcomes: dict[str, dict[str, object]] = {
             "success": {},
             "blank_token": {"content": "  \n"},
-            "refused_login": {"marker": "fail_login"},
+            "loose_token_file": {"mode": 0o600},
             "failed_pull": {"marker": "fail_pull"},
-            "failed_logout": {"marker": "fail_logout"},
+            "helper": {"helper": True},
         }
         for label, more in outcomes.items():
             with self.subTest(outcome=label), tempfile.TemporaryDirectory() as scratch:
-                stand_in, values = self.prepare_pull(Path(scratch), **({"content": more["content"]} if "content" in more else {}))  # type: ignore[arg-type]
+                folder = Path(scratch)
+                prepared = {key: more[key] for key in ("content", "mode") if key in more}
+                stand_in, values = self.prepare_pull(folder, **prepared)  # type: ignore[arg-type]
+                before = self.plant_old_folder(folder)
                 existing = self.plant_existing_login(stand_in)
                 if "marker" in more:
-                    (stand_in.parent / more["marker"]).write_text("")
-                run_tasks("pull_images.yml", values)
+                    (stand_in.parent / str(more["marker"])).write_text("")
+                environment = {"PATH": self.helper_path(folder)} if more.get("helper") else None
+                run_tasks("pull_images.yml", values, environment=environment)
+                self.assertEqual(before, self.snapshot(self.parent(folder)), "the old folder holds what it held, and no login folder is left in it")
+                self.assertEqual(0o700, stat.S_IMODE(self.parent(folder).stat().st_mode))
                 self.assertEqual("existing-login\n", existing.read_text())
-                self.assertEqual(["config.json"], os.listdir(existing.parent), "nothing was written beside it")
-                self.assertNotIn(
-                    "unset", [configuration for configuration, _ in self.configurations(stand_in)] if (stand_in.parent / "config.log").exists() else []
-                )
+                self.assertEqual(["config.json"], os.listdir(existing.parent))
+                self.assertNotIn("unset", [configuration for configuration, _ in self.configurations(stand_in)])
 
-    def test_a_logout_that_fails_fails_the_play_and_still_removes_the_configuration_folder(self) -> None:
+    def test_a_parent_that_is_not_a_root_only_folder_is_refused_and_left_as_it_is(self) -> None:
+        for label in ("open_mode", "symbolic_link", "plain_file"):
+            with self.subTest(parent=label), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, values = self.prepare_pull(folder)
+                parent = self.parent(folder)
+                if label == "open_mode":
+                    parent.mkdir()
+                    parent.chmod(0o755)
+                elif label == "symbolic_link":
+                    (folder / "elsewhere").mkdir(mode=0o700)
+                    parent.symlink_to(folder / "elsewhere")
+                else:
+                    parent.write_text("x")
+                code, output = run_tasks("pull_images.yml", values)
+                self.assertNotEqual(0, code)
+                self.assertIn("is not a directory with mode 0700", output)
+                self.assertEqual([], calls(stand_in))
+                if label == "open_mode":
+                    self.assertEqual(0o755, stat.S_IMODE(parent.stat().st_mode), "the folder's mode is not changed")
+                if label == "symbolic_link":
+                    self.assertEqual([], os.listdir(folder / "elsewhere"))
+
+    def test_a_pull_that_fails_stops_the_deploy_with_a_fixed_message_and_removes_its_folder(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
-            (stand_in.parent / "fail_logout").write_text("")
+            (stand_in.parent / "fail_pull").write_text("")
             code, output = run_tasks("pull_images.yml", values)
-            logged = calls(stand_in)
-            left = self.config_folder(folder).exists()
+            left = os.listdir(self.parent(folder))
         self.assertNotEqual(0, code, output)
-        self.assertEqual("logout", logged[-1])
-        self.assertFalse(left)
+        self.assertIn("the image pull failed with status 1", output)
+        self.assertEqual([], left)
         self.assertNotIn(self.TOKEN, output)
+
+    def test_a_pull_that_runs_past_its_deadline_is_ended_by_the_task_with_a_fixed_message_and_its_folder_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            (stand_in.parent / "hang_pull").write_text("")
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": 3})
+            left = os.listdir(self.parent(folder))
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the image pull ran past its deadline of 3 seconds", output)
+        self.assertEqual([], left)
+        self.assertNotIn(self.TOKEN, output)
+
+    def test_a_second_run_changes_nothing_on_the_host_and_runs_the_same_pull(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            first, _ = run_tasks("pull_images.yml", values)
+            code, output = run_tasks("pull_images.yml", values)
+            left = os.listdir(self.parent(folder))
+            count = len(calls(stand_in))
+        self.assertEqual((0, 0), (first, code), output)
+        self.assertRegex(output, CHANGED_NONE)
+        self.assertEqual(2, count)
+        self.assertEqual([], left)
 
     def test_a_missing_empty_or_loose_token_file_stops_the_deploy_with_the_fixed_message_before_any_docker_call(self) -> None:
         cases = {"missing": {"mode": None}, "empty": {"content": ""}, "loose": {"mode": 0o600}}
@@ -428,15 +582,16 @@ class PullTest(unittest.TestCase):
                 self.assertEqual([], calls(stand_in))
                 self.assertNotIn(self.TOKEN, output)
 
-    def test_a_token_file_of_white_space_only_is_refused_before_the_login_and_no_docker_call_runs_not_even_a_logout(self) -> None:
+    def test_a_token_file_of_white_space_only_is_refused_before_any_write_and_no_docker_call_runs(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder, content="  \n")
             code, output = run_tasks("pull_images.yml", values)
-            self.assertNotEqual(0, code)
-            self.assertIn("the registry token file is empty", output)
-            self.assertEqual([], calls(stand_in))
-            self.assertFalse(self.config_folder(folder).exists())
+            made = self.parent(folder).exists()
+        self.assertNotEqual(0, code)
+        self.assertIn("the registry token file is empty", output)
+        self.assertEqual([], calls(stand_in))
+        self.assertFalse(made)
 
     def test_an_unset_user_or_token_file_setting_is_refused_by_name(self) -> None:
         for name in ("compose_stack_registry_user", "compose_stack_registry_token_file"):
@@ -448,30 +603,12 @@ class PullTest(unittest.TestCase):
                 self.assertIn("set compose_stack_registry_user and compose_stack_registry_token_file", output)
                 self.assertEqual([], calls(stand_in))
 
-    def test_a_refused_login_prints_no_token_even_though_docker_echoes_it_and_no_pull_follows(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            stand_in, values = self.prepare_pull(folder)
-            (stand_in.parent / "fail_login").write_text("")
-            code, output = run_tasks("pull_images.yml", values)
-            logged = calls(stand_in)
-            left = self.config_folder(folder).exists()
-        self.assertNotEqual(0, code)
-        self.assertNotIn(self.TOKEN, output)
-        self.assertEqual(["login --username example_account --password-stdin", "logout"], logged)
-        self.assertFalse(left)
-
-    def test_a_failed_pull_stops_the_deploy_and_still_logs_out(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            stand_in, values = self.prepare_pull(folder)
-            (stand_in.parent / "fail_pull").write_text("")
-            code, output = run_tasks("pull_images.yml", values)
-            logged = calls(stand_in)
-            left = self.config_folder(folder).exists()
-        self.assertNotEqual(0, code, output)
-        self.assertEqual("logout", logged[-1])
-        self.assertFalse(left)
+    def test_the_task_file_runs_no_docker_login_or_logout_and_keeps_no_token_in_a_variable(self) -> None:
+        text = (ROLE / "tasks" / "pull_images.yml").read_text()
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        for word in ("login'", "logout'", "docker login", "docker logout", "slurp", "b64decode", "--password"):
+            self.assertNotIn(word, code)
+        self.assertNotIn("registry_token.content", code)
 
 
 class SourceCoverageTest(unittest.TestCase):
