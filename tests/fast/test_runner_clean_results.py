@@ -235,7 +235,7 @@ class CatalogFinish(unittest.TestCase):
         self.assertIn("deleted: 2", text)
 
     def test_trino_that_did_not_come_back_fails_the_run(self) -> None:
-        self.assertEqual(failed(self.finish(restored=False)[0]), ["Trino back on main"])
+        self.assertEqual(failed(self.finish(restored=False)[0]), ["Trino back on main", "references deleted", "pin file removed"])
 
     def test_a_stack_with_no_trino_container_in_the_final_listing_fails_the_run(self) -> None:
         self.assertEqual(failed(self.finish(trino=False)[0]), ["Trino container listed"])
@@ -265,16 +265,30 @@ class CatalogFinish(unittest.TestCase):
 
     def test_a_restoration_that_fails_fails_the_run_and_names_the_step(self) -> None:
         run, text = self.finish(restored=False, listing=False)
-        self.assertEqual(failed(run), ["Trino back on main", "Trino container listed"])
-        self.assertTrue(text.startswith("cleanup failed (Trino back on main, Trino container listed)"), text)
+        self.assertEqual(failed(run), ["Trino back on main", "Trino container listed", "references deleted", "pin file removed"])
+        self.assertTrue(text.startswith("cleanup failed (Trino back on main, Trino container listed, references deleted, pin file removed)"), text)
 
-    def test_a_restoration_that_times_out_fails_the_run_and_the_later_steps_still_run(self) -> None:
+    def test_a_restoration_that_times_out_fails_the_run_and_keeps_what_trino_may_still_read(self) -> None:
         run, text = self.finish(pin_error=subprocess.TimeoutExpired("docker", 600))
-        self.assertEqual(failed(run), ["Trino back on main"])
+        self.assertEqual(failed(run), ["Trino back on main", "references deleted", "pin file removed"])
         self.assertIn("TimeoutExpired", next(item.observed for item in run.observations if not item.passed))
-        self.assertEqual(sorted(self.deleted), ["a", "b"])
-        self.assertEqual([item.case for item in run.observations][-2:], ["references deleted", "pin file removed"])
-        self.assertTrue(text.startswith("cleanup failed (Trino back on main)"), text)
+        self.assertEqual(self.deleted, [])
+        self.assertTrue(text.startswith("cleanup failed (Trino back on main, references deleted, pin file removed)"), text)
+        self.assertIn("were kept", text)
+
+    def test_a_restoration_that_fails_before_it_starts_keeps_the_references_and_the_pin_file(self) -> None:
+        for error in (BlockingIOError("resource busy"), OSError("ssh failed")):
+            with self.subTest(error=type(error).__name__):
+                self.deleted.clear()
+                run, text = self.finish(pin_error=error)
+                self.assertEqual(self.deleted, [])
+                self.assertEqual(failed(run), ["Trino back on main", "references deleted", "pin file removed"])
+                self.assertIn("were kept", text)
+
+    def test_a_restoration_that_returns_no_health_keeps_the_references(self) -> None:
+        run, text = self.finish(restored=False)
+        self.assertEqual(self.deleted, [])
+        self.assertIn("were kept", text)
 
     def test_a_reference_that_fails_to_travel_fails_the_run_and_the_pin_file_is_still_removed(self) -> None:
         for error in (OSError("curl exit 7"), TimeoutError("timed out")):
