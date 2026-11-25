@@ -1,14 +1,17 @@
 # Reads runner_checkout_python_url, runner_checkout_python_archive, runner_checkout_python_archive_sha256, runner_checkout_python_directory, runner_checkout_python_home,
-# runner_checkout_python_marker, runner_checkout_python, runner_checkout_python_version and the deadlines. The interpreter is one exact version from a python-build-standalone
-# archive whose SHA-256 is pinned: get_url refuses an archive with another hash. The published name runner_checkout_python_home is a link that this role made, to a folder
-# of its own beside the others (the version and a random suffix). An installed interpreter is reused only when that link names such a folder and the marker in it names
-# the digest of the archive that is pinned now, so another archive of the same version, and an install that no marker names, are installed again. The new interpreter is
-# unpacked into a new folder beside the others, runs and says the pinned version there and gets its marker, and only then does the link change: one atomic replacement of
-# the link (ansible.builtin.file with state link makes a temporary link beside it and renames that over the old one: ansible-core's modules/file.py, ensure_symlink, "try to
-# replace atomically"; rename(2) replaces the name in one step, so a reader sees the old folder or the new one and never none). Nothing is removed before that: a failure at
-# any step, or an interruption, leaves the installed interpreter as it was, and the folder that was being made is removed (or, after an interruption, with the next good
-# install, which removes every folder of this version that the link does not name). A folder at the published name that is not a link is not the role's and is refused,
-# never removed. It is shared and public software: the folder is open to read, and no runner folder or secret lives in it.
+# runner_checkout_python_marker, runner_checkout_python_folder_prefix, runner_checkout_python_folder_form, runner_checkout_python_prune_script, runner_checkout_python,
+# runner_checkout_python_version and the deadlines (and processes.yml's variables). The interpreter is one exact version from a python-build-standalone archive whose
+# SHA-256 is pinned: get_url refuses an archive with another hash. The published name runner_checkout_python_home is a link that this role made, to a folder of its own
+# beside the others (a name of the form runner_checkout_python_folder_form). An installed interpreter is reused only when that link names such a folder and the marker in
+# it names the digest of the archive that is pinned now, so another archive of the same version, and an install that no marker names, are installed again. The new
+# interpreter is unpacked into a new folder beside the others (which holds its marker from before the unpack), runs and says the pinned version there, and only then does
+# the link change: one atomic replacement of the link (ansible.builtin.file with state link makes a temporary link beside it and renames that over the old one:
+# ansible-core's modules/file.py, ensure_symlink, "try to replace atomically"; rename(2) replaces the name in one step, so a reader sees the old folder or the new one and
+# never none). Nothing is removed before that: a failure at any step, or an interruption, leaves the installed interpreter as it was, and the folder that was being made
+# is removed (or, after an interruption, with a later good install). Each new folder gets its marker before anything is unpacked into it. After the link changed, and only
+# once no process of a build and none in the runner folder still works (processes.yml), the other folders of this version that the role can tell it made (a name of its
+# form and its marker) are removed, and no other entry. A folder at the published name that is not a link is not the role's and is refused, never removed. It is shared
+# and public software: the folder is open to read, and no runner folder or secret lives in it.
 - name: Look at the published name of the installed interpreter without following a link
   ansible.builtin.stat:
     path: "{{ runner_checkout_python_home }}"
@@ -27,7 +30,7 @@
     path: "{{ runner_checkout_python_directory }}/{{ runner_checkout_interpreter_home.stat.lnk_target }}"
     follow: false
   register: runner_checkout_interpreter_folder
-  when: runner_checkout_interpreter_home.stat.islnk | default(false) and runner_checkout_interpreter_home.stat.lnk_target is regex('^' ~ runner_checkout_python_version | regex_escape ~ '-[A-Za-z0-9_]+$')
+  when: runner_checkout_interpreter_home.stat.islnk | default(false) and runner_checkout_interpreter_home.stat.lnk_target is regex(runner_checkout_python_folder_form)
 
 - name: Look for the marker that names the archive of the installed interpreter
   ansible.builtin.stat:
@@ -83,8 +86,14 @@
       ansible.builtin.tempfile:
         state: directory
         path: "{{ runner_checkout_python_directory }}"
-        prefix: "{{ runner_checkout_python_version }}-"
+        prefix: "{{ runner_checkout_python_folder_prefix }}"
       register: runner_checkout_interpreter_temporary
+
+    - name: Mark the new folder as the role's own and name the pinned archive in it, before anything is unpacked into it
+      ansible.builtin.copy:
+        dest: "{{ runner_checkout_interpreter_temporary.path }}/{{ runner_checkout_python_marker | basename }}"
+        content: "{{ runner_checkout_python_archive_sha256 }}\n"
+        mode: "0644"
 
     - name: Unpack the interpreter into the new folder
       ansible.builtin.command:
@@ -121,12 +130,6 @@
         quiet: true
         fail_msg: "The new interpreter says {{ runner_checkout_interpreter_new.stdout | trim }} and the pin is Python {{ runner_checkout_python_version }}; the installed one is unchanged."
 
-    - name: Name the pinned archive in the new interpreter's folder
-      ansible.builtin.copy:
-        dest: "{{ runner_checkout_interpreter_temporary.path }}/{{ runner_checkout_python_marker | basename }}"
-        content: "{{ runner_checkout_python_archive_sha256 }}\n"
-        mode: "0644"
-
     - name: Open the new interpreter's folder to read
       ansible.builtin.file:
         path: "{{ runner_checkout_interpreter_temporary.path }}"
@@ -144,29 +147,23 @@
       ansible.builtin.set_fact:
         runner_checkout_interpreter_published: true
 
-    - name: Remove every other folder of this version that the link does not name
+    - name: Confirm that no process still works before an older interpreter folder is removed
+      ansible.builtin.include_tasks: processes.yml
+
+    - name: Remove every other folder of this version that the role can tell it made
       ansible.builtin.command:
         argv:
           - timeout
           - "--kill-after={{ runner_checkout_kill_after_seconds }}"
           - "{{ runner_checkout_remove_deadline_seconds }}"
-          - find
+          - python3
+          - -I
+          - -c
+          - "{{ runner_checkout_python_prune_script }}"
           - "{{ runner_checkout_python_directory }}"
-          - -mindepth
-          - "1"
-          - -maxdepth
-          - "1"
-          - -name
-          - "{{ runner_checkout_python_version }}-*"
-          - "!"
-          - -name
+          - "{{ runner_checkout_python_folder_form }}"
+          - "{{ runner_checkout_python_marker | basename }}"
           - "{{ runner_checkout_interpreter_temporary.path | basename }}"
-          - -exec
-          - rm
-          - -rf
-          - --
-          - "{}"
-          - +
       changed_when: true
       timeout: "{{ runner_checkout_remove_deadline_seconds + runner_checkout_stop_grace_seconds }}"
   always:

@@ -204,9 +204,31 @@ runner_checkout_python_download_directory: /usr/local/src
 runner_checkout_python_url: >-
   https://github.com/astral-sh/python-build-standalone/releases/download/{{ runner_checkout_python_build }}/cpython-{{ runner_checkout_python_version }}%2B{{ runner_checkout_python_build }}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
 runner_checkout_python_archive: "{{ runner_checkout_python_download_directory }}/cpython-{{ runner_checkout_python_version }}-{{ runner_checkout_python_build }}-x86_64-linux-gnu.tar.gz"
-# The published name of the interpreter: a link that the role makes to a folder of its own beside it (the version, a dash and a random suffix) and replaces in one atomic
-# rename, so that an interrupted or failed install leaves the interpreter that was there.
+# The published name of the interpreter: a link that the role makes to a folder of its own beside it and replaces in one atomic rename, so that an interrupted or failed
+# install leaves the interpreter that was there.
 runner_checkout_python_home: "{{ runner_checkout_python_directory }}/{{ runner_checkout_python_version }}"
+# A folder that the role made for an interpreter is known by two things together: a name that only the role gives (the version, "-runner_checkout-" and the eight characters
+# that tempfile adds) and a marker in it (runner_checkout_python_marker's name: a plain file of one line, the SHA-256 of an archive), written before anything is unpacked
+# into it. After a new interpreter is published, runner_checkout_python_prune_script removes the other folders of this version that have both, so that an install that never
+# finished goes too. It removes nothing else: a folder with another name, with no marker or with a marker of another form, and a link, stay.
+runner_checkout_python_folder_prefix: "{{ runner_checkout_python_version }}-runner_checkout-"
+runner_checkout_python_folder_form: "^{{ runner_checkout_python_folder_prefix | regex_escape }}[a-z0-9_]{8}$"
+runner_checkout_python_prune_script: |
+  import os, re, shutil, stat, sys
+  directory, form, marker, keep = sys.argv[1:]
+  for entry in os.scandir(directory):
+      if entry.name == keep or re.fullmatch(form, entry.name) is None or not entry.is_dir(follow_symlinks=False):
+          continue
+      try:
+          descriptor = os.open(os.path.join(entry.path, marker), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+      except OSError:
+          continue
+      try:
+          content = os.read(descriptor, 66) if stat.S_ISREG(os.fstat(descriptor).st_mode) else b""
+      finally:
+          os.close(descriptor)
+      if re.fullmatch(rb"[0-9a-f]{64}\n", content):
+          shutil.rmtree(entry.path)
 runner_checkout_python: "{{ runner_checkout_python_home }}/bin/python{{ runner_checkout_python_version.split('.')[:2] | join('.') }}"
 # The files, relative to the folder, that the environment's packages come from: every one is installed with --require-hashes, so every requirement in it must carry a hash.
 # The host process of the runners imports only PyYAML and ansible-core, both in the root lock (tests/fast/test_runner_requirements.py reads every import); the locks of spark/,
@@ -235,7 +257,7 @@ runner_checkout_manifest_mode: "0400"
 runner_checkout_placed_runners: "{{ runner_checkout_folder }}/placed_runners.json"
 # The marker in the interpreter's folder (read through the published link) that names the SHA-256 of the archive it was unpacked from: an installed interpreter is reused only
 # when it names the pinned archive, and it is published (one atomic replacement of the link) only after it ran in a folder of its own and said its version, so another archive of
-# the same version replaces it and a failed install changes nothing.
+# the same version replaces it and a failed install changes nothing. The marker is written into each new folder before the unpack; its name also tells the prune a folder of the role.
 runner_checkout_python_marker: "{{ runner_checkout_python_home }}/.archive_sha256"
 # Each deadline is in seconds. The install deadline covers every package of the lock file. Every command of the role runs under timeout with a kill-after of
 # runner_checkout_kill_after_seconds, so that it is stopped, with every process it started, where it runs, and the task's own deadline is the command's deadline plus
@@ -256,9 +278,11 @@ runner_checkout_kill_after_seconds: 5
 runner_checkout_stop_grace_seconds: 15
 # The processes of a build. Each command that can leave a process behind (the unpack, the environment and the install) starts through a program that makes its process group
 # and writes the group's number as one line in the record, runner_checkout_build_record (beside the runner folder, so that no prune takes it). Before a build removes anything,
-# and after a failed build before any cleanup, runner_checkout_process_script looks at every group of the record (kill -0 on the group: one live process of it is enough, wherever
-# it works and whatever its command line says) and at every process whose command line names the runner folder, and removes the record when none is left. A group number that
-# the system gave to another process after a restart looks live: the deploy then names the record, and its owner removes it once it is clear that nothing of the build works.
+# after a failed build before any cleanup, and before older interpreter folders are removed, runner_checkout_process_script looks at every group of the record (os.killpg with
+# signal 0: no such process means that the group is gone, and no permission means that it lives; the shell's kill is not used, because dash reads "--" there as a process
+# number), at every process whose working folder or executable is the runner folder or below it (the links cwd and exe of each process in runner_checkout_proc_directory) and
+# at every process whose command line names the runner folder. It removes the record when none is left, and it exits 2 when it cannot look. A group number that the system gave
+# to another process after a restart looks live: the deploy then names the record, and its owner removes it once it is clear that nothing of the build works.
 runner_checkout_build_record: "{{ runner_checkout_directory }}.build_processes"
 runner_checkout_track:
   - python3
@@ -275,18 +299,54 @@ runner_checkout_track:
     os.close(descriptor)
     os.execvp(sys.argv[2], sys.argv[2:])
   - "{{ runner_checkout_build_record }}"
+runner_checkout_proc_directory: /proc
 runner_checkout_process_script: |
-  live=0
-  if test -f "$1"; then
-    while read -r group; do
-      case "$group" in ''|*[!0-9]*) continue ;; esac
-      if kill -0 -- "-$group" 2>/dev/null; then live=1; fi
-    done < "$1"
-  fi
-  pgrep -f -- "$2" >/dev/null 2>&1
-  case $? in 0) live=1 ;; 1) ;; *) exit 2 ;; esac
-  if test "$live" = 0; then rm -f -- "$1"; fi
-  exit "$live"
+  import os, subprocess, sys
+  record, directory, processes, pattern = sys.argv[1:]
+
+  def a_group_lives():
+      try:
+          with open(record, encoding="ascii", errors="replace") as handle:
+              lines = handle.read().split()
+      except FileNotFoundError:
+          return False
+      for line in lines:
+          if line.isdigit() and int(line) > 1:
+              try:
+                  os.killpg(int(line), 0)
+              except ProcessLookupError:
+                  continue
+              except PermissionError:
+                  pass
+              return True
+      return False
+
+  def a_process_is_in_the_folder():
+      folder = os.path.realpath(directory)
+      for number in os.listdir(processes):
+          for name in ("cwd", "exe") if number.isdigit() else ():
+              try:
+                  target = os.readlink(os.path.join(processes, number, name)).removesuffix(" (deleted)")
+              except (FileNotFoundError, ProcessLookupError):
+                  continue
+              if target == folder or target.startswith(folder + "/"):
+                  return True
+      return False
+
+  def a_command_line_names_the_folder():
+      code = subprocess.run(["pgrep", "-f", "--", pattern], stdout=subprocess.DEVNULL, check=False).returncode
+      if code not in (0, 1):
+          raise OSError(code)
+      return code == 0
+
+  try:
+      if a_group_lives() or a_process_is_in_the_folder() or a_command_line_names_the_folder():
+          sys.exit(1)
+      if os.path.exists(record):
+          os.unlink(record)
+  except (OSError, ValueError, OverflowError) as error:
+      sys.stderr.write("the look for processes failed: " + type(error).__name__ + "\n")
+      sys.exit(2)
 # After a failed build, and before a retry removes anything, nothing is cleaned up until no process of the build works: the script, with its own deadline, tried again this many
 # times, this many seconds apart.
 runner_checkout_stop_check_deadline_seconds: 10

@@ -317,6 +317,7 @@ class HostSetupBudgetTest(unittest.TestCase):
         decision = seconds("manifest") + seconds("environment_check")
         retries = 1 + int(names["runner_checkout_stop_check_retries"])
         stop_check = retries * (seconds("stop_check") + grace) + (retries - 1) * int(names["runner_checkout_stop_check_delay_seconds"])
+        python += stop_check
         build = (
             under_timeout("remove", "remove")
             + seconds("unpack")
@@ -328,13 +329,13 @@ class HostSetupBudgetTest(unittest.TestCase):
         self.assertEqual(
             python + controller + decision + build + closing,
             parts()["runner_checkout"],
-            "the interpreter's download, unpack, checks and removals (the old folders after the link changed, the new folder of a failed install); "
+            "the interpreter's download, unpack, checks, the stop check before the old folders go and the removals (those, a failed install's folder); "
             "the controller's archive, its read and its scratch removal; the manifest and environment checks; the removals, the copy, the unpack, "
-            "the environment, its check, the install, the archive's removals and the two stop checks (before anything is removed, and after a failed build); "
+            "the environment, its check, the install, the archive's removals and the build's two stop checks (before a removal, and after a failed build); "
             "the closing, the manifest and the listing",
         )
         timed = [item for item in found if item.role == "runner_checkout" and task_seconds(item)]
-        self.assertEqual(26, len(timed))
+        self.assertEqual(27, len(timed))
 
     def test_the_rollback_and_the_uninstall_count_once_and_the_install_counts_beside_the_recovery(self) -> None:
         found = playbook_occurrences("host.yml")

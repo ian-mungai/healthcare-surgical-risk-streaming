@@ -79,13 +79,26 @@ class Scratch:
         self.git("init", "--quiet", "--initial-branch", "main")
         (self.repo / ".gitignore").write_text("ignored_runner.py\n")
         self.commit_a = self.commit({"requirements.txt": self.requirements(), "app/a.py": "A = 1\n", "tests/e2e/tracked.py": "T = 1\n"})
-        interpreter = self.python_root / f"{VERSION}-fixture" / "bin" / f"python{VERSION.rsplit('.', 1)[0]}"
+        installed = f"{VERSION}-runner_checkout-fixture0"
+        interpreter = self.python_root / installed / "bin" / f"python{VERSION.rsplit('.', 1)[0]}"
         interpreter.parent.mkdir(parents=True)
         interpreter.symlink_to(Path(sys.executable))
-        (self.python_root / f"{VERSION}-fixture" / PYTHON_MARKER).write_text(PINNED_DIGEST + "\n")
-        (self.python_root / VERSION).symlink_to(f"{VERSION}-fixture")
+        (self.python_root / installed / PYTHON_MARKER).write_text(PINNED_DIGEST + "\n")
+        (self.python_root / VERSION).symlink_to(installed)
         self.scratch_root = self.base / "controller_scratch"
         self.scratch_root.mkdir()
+        # The stand-in for the host's /proc, which this computer may not have: a folder for each process with its ``cwd`` and ``exe`` links.
+        self.proc_root = self.base / "proc"
+        self.proc_root.mkdir()
+
+    def add_process(self, pid: int, cwd: Path | str | None, exe: Path | str | None) -> Path:
+        """One process of the stand-in table; a link that is None is not there, as for a process that ended or a thread of the kernel."""
+        entry = self.proc_root / str(pid)
+        entry.mkdir()
+        for name, target in (("cwd", cwd), ("exe", exe)):
+            if target is not None:
+                (entry / name).symlink_to(os.path.realpath(target))
+        return entry
 
     def requirements(self, digest: str | None = None) -> str:
         return f"runner-probe==1.0 \\\n    --hash=sha256:{digest or self.wheel_hash}\n"
@@ -115,6 +128,7 @@ class Scratch:
             "runner_checkout_python_version": VERSION,
             "runner_checkout_install_deadline_seconds": 120,
             "runner_checkout_stop_check_delay_seconds": 1,
+            "runner_checkout_proc_directory": str(self.proc_root),
         } | more
 
     def run(self, commit: str, tasks_from: str = "main", **more: object) -> tuple[int, str]:
@@ -779,6 +793,103 @@ class DeadlineTest(unittest.TestCase):
         self.assertEqual([], list(scratch.scratch_root.iterdir()))
 
 
+def stop_worker(worker: subprocess.Popen[bytes]) -> None:
+    """Kill a process that a test started and wait for it."""
+    worker.kill()
+    worker.wait(timeout=30)
+
+
+def another_users_process_group() -> int | None:
+    """A process group that this user may not signal, or None (as root every group may be signalled)."""
+    for line in run_command("ps", ["-axo", "pgid=,uid="], timeout=10, check=True).stdout.splitlines():
+        group, user = (int(part) for part in line.split())
+        if group > 1 and user != os.getuid():
+            try:
+                os.killpg(group, 0)
+            except PermissionError:
+                return group
+            except ProcessLookupError:
+                continue
+    return None
+
+
+class GuardTest(unittest.TestCase):
+    """The look for a process of a build, or one that works in the runner folder, before anything is removed (``processes.yml``)."""
+
+    def guard(self, scratch: Scratch, **more: object) -> tuple[int, str]:
+        return scratch.run(scratch.commit_a, "processes", runner_checkout_stop_check_retries=1, **more)
+
+    def record(self, scratch: Scratch) -> Path:
+        return Path(f"{scratch.runner_root}.build_processes")
+
+    def assert_stopped(self, result: tuple[int, str]) -> None:
+        code, output = result
+        self.assertNotEqual(0, code, output)
+        self.assertIn("so nothing was cleaned up", output)
+
+    def test_a_recorded_process_group_that_lives_stops_the_guard_and_the_same_record_passes_and_is_removed_once_it_ended(self) -> None:
+        scratch = Scratch(self)
+        worker = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)  # noqa: S603
+        self.addCleanup(stop_worker, worker)
+        self.record(scratch).write_text(f"not a number\n0\n{worker.pid}\n")
+        self.assert_stopped(self.guard(scratch))
+        self.assertTrue(self.record(scratch).exists())
+        worker.kill()
+        worker.wait(timeout=30)
+        code, output = self.guard(scratch)
+        self.assertEqual(0, code, output)
+        self.assertFalse(self.record(scratch).exists())
+
+    def test_a_recorded_group_that_this_user_may_not_signal_is_alive(self) -> None:
+        group = another_users_process_group()
+        if group is None:
+            self.skipTest("every process group may be signalled here")
+        scratch = Scratch(self)
+        self.record(scratch).write_text(f"{group}\n")
+        self.assert_stopped(self.guard(scratch))
+        self.assertTrue(self.record(scratch).exists())
+
+    def test_a_worker_that_was_started_in_the_checkout_by_a_relative_path_is_found_by_its_working_folder(self) -> None:
+        scratch = Scratch(self)
+        folder = scratch.folder(scratch.commit_a)
+        folder.mkdir(parents=True)
+        worker = subprocess.Popen(["./worker", "60"], executable="/bin/sleep", cwd=folder)  # noqa: S603
+        self.addCleanup(stop_worker, worker)
+        scratch.add_process(worker.pid, folder, "/bin/sleep")
+        self.assert_stopped(self.guard(scratch))
+
+    def test_a_process_whose_working_folder_or_executable_is_the_runner_folder_or_below_it_stops_the_guard_even_when_it_was_removed(self) -> None:
+        for case in ("the folder itself", "an executable below it", "a removed working folder"):
+            with self.subTest(case=case):
+                scratch = Scratch(self)
+                scratch.runner_root.mkdir()
+                if case == "the folder itself":
+                    scratch.add_process(4101, scratch.runner_root, "/bin/sleep")
+                elif case == "an executable below it":
+                    scratch.add_process(4102, "/", scratch.runner_root / "gone" / "tool")
+                else:
+                    scratch.add_process(4103, f"{scratch.runner_root} (deleted)", None)
+                self.assert_stopped(self.guard(scratch))
+
+    def test_processes_outside_the_runner_folder_and_processes_with_no_links_let_the_guard_pass(self) -> None:
+        scratch = Scratch(self)
+        scratch.runner_root.mkdir()
+        scratch.add_process(4201, f"{scratch.runner_root}_other", f"{scratch.runner_root}.backup/tool")
+        scratch.add_process(4202, scratch.base, "/bin/sleep")
+        scratch.add_process(4203, None, None)
+        (scratch.proc_root / "self").symlink_to(scratch.proc_root / "4202")
+        (scratch.proc_root / "sys").mkdir()
+        (scratch.proc_root / "sys" / "cwd").symlink_to(scratch.runner_root)
+        code, output = self.guard(scratch)
+        self.assertEqual(0, code, output)
+
+    def test_a_process_table_that_cannot_be_read_stops_the_deploy(self) -> None:
+        scratch = Scratch(self)
+        code, output = self.guard(scratch, runner_checkout_proc_directory=str(scratch.base / "no_proc"))
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the look for processes failed: FileNotFoundError", output)
+
+
 class InterpreterTest(unittest.TestCase):
     def archive(self, folder: Path, version_line: str, name: str = "python.tar.gz", comment: str = "") -> tuple[Path, str]:
         data = io.BytesIO()
@@ -791,15 +902,76 @@ class InterpreterTest(unittest.TestCase):
         path.write_bytes(data.getvalue())
         return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def run_python(self, scratch: Scratch, archive: Path, digest: str) -> tuple[int, str]:
-        return scratch.run(
-            scratch.commit_a,
-            "python",
-            runner_checkout_python_url=archive.as_uri(),
-            runner_checkout_python_archive_sha256=digest,
-            runner_checkout_python_directory=str(scratch.base / "fresh_python"),
-            runner_checkout_python_download_directory=str(scratch.base),
-        )
+    def run_python(self, scratch: Scratch, archive: Path, digest: str, **more: object) -> tuple[int, str]:
+        variables: dict[str, object] = {
+            "runner_checkout_python_url": archive.as_uri(),
+            "runner_checkout_python_archive_sha256": digest,
+            "runner_checkout_python_directory": str(scratch.base / "fresh_python"),
+            "runner_checkout_python_download_directory": str(scratch.base),
+        }
+        return scratch.run(scratch.commit_a, "python", **(variables | more))
+
+    def replace_interpreter(self, scratch: Scratch, **more: object) -> tuple[int, str]:
+        """Publish a second archive of the same version over the installed one, which then prunes."""
+        second, other = self.archive(scratch.base, f"Python {VERSION}", name="second.tar.gz", comment="# the second archive")
+        return self.run_python(scratch, second, other, **more)
+
+    def role_folder(self, scratch: Scratch, suffix: str, marker: str | None = "a" * 64 + "\n") -> Path:
+        """A folder with a name of the role's form, with its marker unless ``marker`` is None."""
+        folder = scratch.base / "fresh_python" / f"{VERSION}-runner_checkout-{suffix}"
+        folder.mkdir()
+        if marker is not None:
+            (folder / PYTHON_MARKER).write_text(marker)
+        return folder
+
+    def test_only_a_folder_that_the_role_can_tell_it_made_is_removed_after_a_new_interpreter_is_published(self) -> None:
+        scratch = Scratch(self)
+        archive, digest = self.archive(scratch.base, f"Python {VERSION}")
+        self.assertEqual(0, self.run_python(scratch, archive, digest)[0])
+        root = scratch.base / "fresh_python"
+        first = root / os.readlink(self.installed(scratch))
+        backup = root / f"{VERSION}-backup"
+        shutil.copytree(first, backup)
+        plain = root / f"{VERSION}-keep"
+        plain.mkdir()
+        longer = root / f"{VERSION}-runner_checkout-leftover_copy"
+        shutil.copytree(first, longer)
+        operators = [backup, plain, longer]
+        operators.append(self.role_folder(scratch, "nomarker", None))
+        operators.append(self.role_folder(scratch, "badtext1", "not a digest\n"))
+        operators.append(self.role_folder(scratch, "twolines", "a" * 64 + "\nmore\n"))
+        linked = self.role_folder(scratch, "linkmark", None)
+        (linked / PYTHON_MARKER).symlink_to(first / PYTHON_MARKER if (first / PYTHON_MARKER).exists() else backup / PYTHON_MARKER)
+        folder_marker = self.role_folder(scratch, "dirmark1", None)
+        (folder_marker / PYTHON_MARKER).mkdir()
+        operators += [linked, folder_marker]
+        as_link = root / f"{VERSION}-runner_checkout-aslinked"
+        as_link.symlink_to(backup.name)
+        leftover = self.role_folder(scratch, "leftover")
+        code, output = self.replace_interpreter(scratch)
+        self.assertEqual(0, code, output)
+        for kept in operators:
+            with self.subTest(kept=kept.name):
+                self.assertTrue(kept.is_dir(), "the role cannot tell that it made this folder, so it stays")
+        self.assertTrue(as_link.is_symlink(), "a link is not a folder that the role made")
+        self.assertTrue((backup / PYTHON_MARKER).is_file(), "nothing was removed through a link")
+        self.assertFalse(first.exists(), "the folder of the first archive is the role's own")
+        self.assertFalse(leftover.exists(), "a folder with the role's name and marker is the role's own")
+
+    def test_no_old_interpreter_folder_is_removed_while_a_process_still_works_in_the_runner_folder(self) -> None:
+        scratch = Scratch(self)
+        archive, digest = self.archive(scratch.base, f"Python {VERSION}")
+        self.assertEqual(0, self.run_python(scratch, archive, digest)[0])
+        first = scratch.base / "fresh_python" / os.readlink(self.installed(scratch))
+        folder = scratch.folder(scratch.commit_a)
+        folder.mkdir(parents=True)
+        worker = subprocess.Popen(["./worker", "60"], executable="/bin/sleep", cwd=folder)  # noqa: S603
+        self.addCleanup(stop_worker, worker)
+        scratch.add_process(worker.pid, folder, "/bin/sleep")
+        code, output = self.replace_interpreter(scratch, runner_checkout_stop_check_retries=1)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("so nothing was cleaned up", output)
+        self.assertTrue(first.is_dir(), "the interpreter folder that the worker may run from is still there")
 
     def test_the_interpreter_is_downloaded_checked_against_its_hash_unpacked_and_its_version_checked(self) -> None:
         scratch = Scratch(self)
@@ -875,7 +1047,7 @@ class InterpreterTest(unittest.TestCase):
         self.assertEqual(0, self.run_python(scratch, second, other)[0])
         later = os.readlink(self.installed(scratch))
         self.assertNotEqual(first, later)
-        self.assertRegex(later, rf"^{re.escape(VERSION)}-[A-Za-z0-9_]+$")
+        self.assertRegex(later, rf"^{re.escape(VERSION)}-runner_checkout-[a-z0-9_]{{8}}$")
         self.assertEqual([f"{VERSION} -> {later}", later], self.entries(scratch), "the folder of the first archive is gone")
 
     def test_the_interpreter_is_there_at_every_moment_while_another_archive_replaces_it(self) -> None:
@@ -923,10 +1095,9 @@ class InterpreterTest(unittest.TestCase):
     def test_a_folder_left_by_an_install_that_never_finished_is_removed_with_the_next_good_install_and_other_folders_stay(self) -> None:
         scratch = Scratch(self)
         archive, digest = self.archive(scratch.base, f"Python {VERSION}")
-        unfinished = scratch.base / "fresh_python" / f"{VERSION}-unfinished"
         unrelated = scratch.base / "fresh_python" / "other_tool"
         unrelated.mkdir(parents=True)
-        unfinished.mkdir()
+        unfinished = self.role_folder(scratch, "halfdone")
         (unfinished / "half.txt").write_text("a crash left this\n")
         code, output = self.run_python(scratch, archive, digest)
         self.assertEqual(0, code, output)

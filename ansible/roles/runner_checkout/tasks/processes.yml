@@ -1,17 +1,20 @@
-# Reads runner_checkout_build_record, runner_checkout_process_script, runner_checkout_directory and the stop check's deadline, retries and delay. Fails when a process that a
-# build of the runner folder started (a group of the record) or that works in the runner folder (its command line names the folder) still works after the retries, so that
-# nothing is removed or cleaned up under a live process; it removes the record when none is left. Nothing here changes a file but the record.
+# Reads runner_checkout_build_record, runner_checkout_process_script, runner_checkout_proc_directory, runner_checkout_directory and the stop check's deadline, retries and
+# delay. Fails when a process that a build of the runner folder started (a group of the record) or that works in the runner folder (its working folder or executable is under
+# it, or its command line names it) still works after the retries, so that nothing is removed or cleaned up under a live process, and fails when it cannot look; it removes
+# the record when none is left. Nothing here changes a file but the record.
 - name: Look for a process of a build, or one that works in the runner folder, that still works
   ansible.builtin.command:
     argv:
       - timeout
       - "--kill-after={{ runner_checkout_kill_after_seconds }}"
       - "{{ runner_checkout_stop_check_deadline_seconds }}"
-      - sh
+      - python3
+      - -I
       - -c
       - "{{ runner_checkout_process_script }}"
-      - sh
       - "{{ runner_checkout_build_record }}"
+      - "{{ runner_checkout_directory }}"
+      - "{{ runner_checkout_proc_directory }}"
       - "[{{ runner_checkout_directory[0] }}]{{ runner_checkout_directory[1:] }}/"
   register: runner_checkout_still_working
   changed_when: false

@@ -122,8 +122,21 @@ class DeadlineTest(unittest.TestCase):
         names = sorted(task["name"] for _, task in role_tasks() if module_name(task, ("command",)) and "runner_checkout_track" in str(task))
         self.assertEqual(["Install the hash-pinned requirements", "Make the environment", "Unpack the archive"], names)
         script = str(group_variables()["runner_checkout_process_script"])
-        for part in ("kill -0 --", "pgrep -f", 'rm -f -- "$1"'):
+        for part in ("os.killpg(", '"pgrep", "-f"', '("cwd", "exe")', "os.unlink(record)"):
             self.assertIn(part, script)
+
+    def test_an_interpreter_folder_is_marked_before_the_unpack_and_older_ones_are_removed_only_after_the_look_for_processes(self) -> None:
+        names = [str(task["name"]) for file, task in role_tasks() if file == "python.yml"]
+
+        def at(start: str) -> int:
+            return next(number for number, name in enumerate(names) if name.startswith(start))
+
+        self.assertLess(at("Make a new folder"), at("Mark the new folder"))
+        self.assertLess(at("Mark the new folder"), at("Unpack the interpreter"), "an install that is interrupted leaves a folder that a later one can remove")
+        self.assertLess(at("Publish the new interpreter"), at("Confirm that no process still works"))
+        self.assertEqual(at("Confirm that no process still works") + 1, at("Remove every other folder of this version"))
+        include = next(task for file, task in role_tasks() if file == "python.yml" and str(task["name"]).startswith("Confirm that no process still works"))
+        self.assertEqual("processes.yml", include["ansible.builtin.include_tasks"])
 
 
 class PinnedInstallTest(unittest.TestCase):
@@ -201,6 +214,16 @@ class ProtectionTest(unittest.TestCase):
                 self.assertRegex(str(variables[name]), r"^(?:0?[0-7][0-5]0|u=[rwxX]+,g=[rxX]*,o=)$", "no permission for others")
         self.assertEqual("/opt/platform/runner", variables["runner_checkout_directory"])
         self.assertEqual("ubuntu", variables["runner_checkout_owner"])
+
+    def test_the_placement_tool_accepts_exactly_the_forms_that_the_role_asserts_for_the_pin_and_the_requirements(self) -> None:
+        from scripts.infra import runner_place
+
+        first: Any = load_yaml((ROLE / "tasks" / "main.yml").read_text())
+        asserted = " ".join(str(line) for line in first[0]["ansible.builtin.assert"]["that"])
+        for form in (runner_place.PYTHON_FORM, runner_place.LOCK_FORM):
+            with self.subTest(form=form.pattern):
+                self.assertIn(f"'^{form.pattern}$'", asserted)
+        self.assertEqual(sorted(runner_place.MARKER_FIELDS), sorted(group_variables()["runner_checkout_expected"]))
 
     def test_the_placement_tool_uses_the_roles_folder_and_marker_name(self) -> None:
         from scripts.infra import runner_place
