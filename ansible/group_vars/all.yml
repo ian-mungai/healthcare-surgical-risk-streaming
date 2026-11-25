@@ -106,6 +106,9 @@ compose_stack_provision_deadline_seconds: 120
 # mode 0400. Both are set by the deploy that places the token; the role stops with a fixed message while either is missing, and it creates neither.
 compose_stack_registry_user: ""
 compose_stack_registry_token_file: "{{ compose_stack_secrets_directory }}/registry_token"
+# The role's own Docker client configuration folder (mode 0700, made for the pull and removed after it). The login, the pull and the logout run with DOCKER_CONFIG set to it,
+# so the host's other Docker logins are never touched.
+compose_stack_registry_config_directory: "{{ compose_stack_directory }}/registry_docker"
 compose_stack_command:
   - docker
   - compose

@@ -27,9 +27,11 @@ SOURCE_PATH = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 STAND_IN = r"""#!/bin/sh
 here="$(dirname "$0")"
 printf '%s\n' "$*" >> "$here/calls.log"
+store="${DOCKER_CONFIG:-$here/default_config}"
+printf '%s|%s\n' "${DOCKER_CONFIG-unset}" "$(ls -ld "${DOCKER_CONFIG:-/nonexistent}" 2>/dev/null | cut -c1-10)" >> "$here/config.log"
 for word in "$@"; do
   case "$word" in
-    inspect) if [ "$1" = "image" ]; then verb=image_inspect; else verb=inspect; fi ;;
+    inspect) verb=inspect ;;
     up) verb=up ;;
     ps) verb=ps ;;
     login) verb=login ;;
@@ -44,12 +46,16 @@ case "$verb" in
   config_services) cat "$here/services.txt" ;;
   config) if [ -f "$here/config.json" ]; then cat "$here/config.json"; else echo '{"services": {}}'; fi ;;
   ps_json) if [ -f "$here/ps.json" ]; then cat "$here/ps.json"; fi ;;
-  image_inspect) if [ -f "$here/label" ]; then cat "$here/label"; else echo "Error: No such image" >&2; exit 1; fi ;;
   login)
     cat > "$here/login_stdin.txt"
-    if [ -f "$here/fail_login" ]; then cat "$here/login_stdin.txt" >&2; exit 1; fi ;;
-  logout) : ;;
-  pull) if [ -f "$here/fail_pull" ]; then echo "pull failed" >&2; exit 1; fi ;;
+    if [ -f "$here/fail_login" ]; then cat "$here/login_stdin.txt" >&2; exit 1; fi
+    mkdir -p "$store" && echo logged-in > "$store/config.json" ;;
+  logout)
+    if [ -f "$here/fail_logout" ]; then echo "logout failed" >&2; exit 1; fi
+    rm -f "$store/config.json" ;;
+  pull)
+    if [ -f "$here/fail_pull" ]; then echo "pull failed" >&2; exit 1; fi
+    if [ ! -f "$store/config.json" ]; then echo "pull denied: not logged in" >&2; exit 1; fi ;;
   up)
     touch "$here/started"
     case " $* " in *" --force-recreate "*) sed -i.bak 's/ .*$/ 2099-01-01T00:00:00Z/' "$here/inspect.txt"; rm -f "$here/inspect.txt.bak" ;; esac ;;
@@ -59,19 +65,14 @@ esac
 """
 
 
-def prepare(folder: Path) -> tuple[Path, Path]:
-    """The stand-in ``docker`` and a build context with an executable script, both in ``folder``."""
+def prepare(folder: Path) -> Path:
+    """The stand-in ``docker`` in ``folder``."""
     bin_folder = folder / "bin"
     bin_folder.mkdir()
     stand_in = bin_folder / "docker"
     stand_in.write_text(STAND_IN)
     stand_in.chmod(0o755)
-    context = folder / "source" / "sample"
-    context.mkdir(parents=True)
-    (context / "Dockerfile").write_text("FROM scratch\n")
-    (context / "run.sh").write_text("#!/bin/sh\n")
-    (context / "run.sh").chmod(0o755)
-    return stand_in, context
+    return stand_in
 
 
 def calls(stand_in: Path) -> list[str]:
@@ -89,13 +90,13 @@ def run_tasks(task_file: str, values: dict[str, object]) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
-def variables(folder: Path, stand_in: Path, context: Path, **more: object) -> dict[str, object]:
+def variables(folder: Path, stand_in: Path, **more: object) -> dict[str, object]:
     return {
         "compose_stack_directory": str(folder / "platform"),
+        "compose_stack_registry_config_directory": str(folder / "platform" / "registry_docker"),
         "compose_stack_owner": pwd.getpwuid(os.getuid()).pw_name,
         "compose_stack_group": grp.getgrgid(os.getgid()).gr_name,
         "compose_stack_docker": [str(stand_in), "compose", "--project-name", "sample"],
-        "compose_stack_source_root": str(context.parent),
         "compose_stack_pull_deadline_seconds": 60,
         "compose_stack_start_deadline_seconds": 60,
         "compose_stack_health_deadline_seconds": 30,
@@ -107,8 +108,8 @@ class StartTest(unittest.TestCase):
     def start(self, services: list[str]) -> tuple[list[str], int, str]:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            stand_in, context = prepare(folder)
-            code, output = run_tasks("start.yml", variables(folder, stand_in, context, compose_stack_start_services=services))
+            stand_in = prepare(folder)
+            code, output = run_tasks("start.yml", variables(folder, stand_in, compose_stack_start_services=services))
             return calls(stand_in), code, output
 
     def test_the_start_names_the_services_it_is_given_and_waits_for_their_health_with_the_deadline(self) -> None:
@@ -127,9 +128,9 @@ class StartTest(unittest.TestCase):
     ) -> tuple[list[str], int, str]:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            stand_in, context = prepare(folder)
+            stand_in = prepare(folder)
             (stand_in.parent / "services.txt").write_text(names)
-            values = variables(folder, stand_in, context, compose_stack_start_services=[], compose_stack_start_except=left_out)
+            values = variables(folder, stand_in, compose_stack_start_services=[], compose_stack_start_except=left_out)
             code, output = run_tasks("start.yml", values)
             return calls(stand_in), code, output
 
@@ -150,8 +151,8 @@ class StartTest(unittest.TestCase):
     def test_a_start_that_names_services_ignores_the_ones_left_out(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            stand_in, context = prepare(folder)
-            values = variables(folder, stand_in, context, compose_stack_start_services=["postgres"], compose_stack_start_except=["postgres"])
+            stand_in = prepare(folder)
+            values = variables(folder, stand_in, compose_stack_start_services=["postgres"], compose_stack_start_except=["postgres"])
             code, output = run_tasks("start.yml", values)
             self.assertEqual(0, code, output)
             self.assertEqual(
@@ -166,8 +167,8 @@ class StartTest(unittest.TestCase):
     def test_the_second_start_of_the_same_containers_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            stand_in, context = prepare(folder)
-            values = variables(folder, stand_in, context, compose_stack_start_services=[])
+            stand_in = prepare(folder)
+            values = variables(folder, stand_in, compose_stack_start_services=[])
             first, _ = run_tasks("start.yml", values)
             code, output = run_tasks("start.yml", values)
         self.assertEqual((0, 0), (first, code), output)
@@ -178,7 +179,7 @@ class RecreateTest(unittest.TestCase):
     """A service whose placed configuration file is newer than its container is recreated, alone, and a second run changes nothing."""
 
     def setup(self, folder: Path, *, started: dict[str, str]) -> tuple[Path, Path, Path]:
-        stand_in, context = prepare(folder)
+        stand_in = prepare(folder)
         files = {"alloy": folder / "alloy.alloy", "grafana": folder / "grafana.yml"}
         for path in files.values():
             path.write_text("x")
@@ -196,15 +197,15 @@ class RecreateTest(unittest.TestCase):
     def recreations(self, stand_in: Path) -> list[str]:
         return [line for line in calls(stand_in) if "--force-recreate" in line]
 
-    def start(self, folder: Path, stand_in: Path, context: Path, services: list[str]) -> tuple[int, str]:
-        return run_tasks("start.yml", variables(folder, stand_in, context, compose_stack_start_services=services))
+    def start(self, folder: Path, stand_in: Path, services: list[str]) -> tuple[int, str]:
+        return run_tasks("start.yml", variables(folder, stand_in, compose_stack_start_services=services))
 
     def test_only_the_service_whose_file_is_newer_than_its_container_is_recreated_without_its_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
             os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
-            code, output = self.start(folder, stand_in, folder, [])
+            code, output = self.start(folder, stand_in, [])
             forced = self.recreations(stand_in)
         self.assertEqual(0, code, output)
         self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps alloy"], forced)
@@ -214,8 +215,8 @@ class RecreateTest(unittest.TestCase):
             folder = Path(scratch)
             stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
             os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
-            self.start(folder, stand_in, folder, [])
-            code, output = self.start(folder, stand_in, folder, [])
+            self.start(folder, stand_in, [])
+            code, output = self.start(folder, stand_in, [])
             forced = self.recreations(stand_in)
         self.assertEqual(0, code, output)
         self.assertEqual(1, len(forced), forced)
@@ -225,7 +226,7 @@ class RecreateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, _, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
-            code, output = self.start(folder, stand_in, folder, [])
+            code, output = self.start(folder, stand_in, [])
             forced = self.recreations(stand_in)
         self.assertEqual(0, code, output)
         self.assertEqual([], forced)
@@ -235,7 +236,7 @@ class RecreateTest(unittest.TestCase):
             folder = Path(scratch)
             stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
             os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
-            code, output = self.start(folder, stand_in, folder, ["postgres"])
+            code, output = self.start(folder, stand_in, ["postgres"])
             forced = self.recreations(stand_in)
         self.assertEqual(0, code, output)
         self.assertEqual([], forced)
@@ -246,7 +247,7 @@ class RecreateTest(unittest.TestCase):
             stand_in, alloy_file, grafana_file = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
             os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
             os.utime(grafana_file, (1_800_000_000, 1_800_000_000))
-            code, output = self.start(folder, stand_in, folder, ["grafana"])
+            code, output = self.start(folder, stand_in, ["grafana"])
             forced = self.recreations(stand_in)
         self.assertEqual(0, code, output)
         self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps grafana"], forced)
@@ -259,7 +260,7 @@ class SecretRecreateTest(unittest.TestCase):
 
     def setup(self, folder: Path, *, secret_age: int | None) -> tuple[Path, Path]:
         """The stand-in with two containers that started in 2025, and a secret file of the code location that is as old as ``secret_age`` or absent."""
-        stand_in, _ = prepare(folder)
+        stand_in = prepare(folder)
         secret = folder / "client_id"
         if secret_age is not None:
             secret.write_text("x")
@@ -276,7 +277,7 @@ class SecretRecreateTest(unittest.TestCase):
         return stand_in, secret
 
     def start(self, folder: Path, stand_in: Path, services: list[str]) -> tuple[int, str]:
-        return run_tasks("start.yml", variables(folder, stand_in, folder, compose_stack_start_services=services))
+        return run_tasks("start.yml", variables(folder, stand_in, compose_stack_start_services=services))
 
     def recreations(self, stand_in: Path) -> list[str]:
         return [line for line in calls(stand_in) if "--force-recreate" in line]
@@ -322,7 +323,7 @@ class PullTest(unittest.TestCase):
     TOKEN = "dckr_pat_example_token_value"  # noqa: S105 - a stand-in value that proves the token never reaches a command line or the output
 
     def prepare_pull(self, folder: Path, *, mode: int | None = 0o400, content: str = TOKEN + "\n") -> tuple[Path, dict[str, object]]:
-        stand_in, context = prepare(folder)
+        stand_in = prepare(folder)
         token_file = folder / "registry_token"
         if mode is not None:
             token_file.write_text(content)
@@ -330,11 +331,25 @@ class PullTest(unittest.TestCase):
         values = variables(
             folder,
             stand_in,
-            context,
             compose_stack_registry_user="example_account",
             compose_stack_registry_token_file=str(token_file),
         )
         return stand_in, values
+
+    def config_folder(self, folder: Path) -> Path:
+        """The folder that the role owns for its Docker client configuration."""
+        return folder / "platform" / "registry_docker"
+
+    def plant_existing_login(self, stand_in: Path) -> Path:
+        """A login of the host's own Docker client, which the role must never read, replace or remove."""
+        existing = stand_in.parent / "default_config" / "config.json"
+        existing.parent.mkdir()
+        existing.write_text("existing-login\n")
+        return existing
+
+    def configurations(self, stand_in: Path) -> list[tuple[str, str]]:
+        """The ``DOCKER_CONFIG`` value and the folder mode that each docker call saw, in the order of the calls."""
+        return [tuple(line.split("|")) for line in (stand_in.parent / "config.log").read_text().splitlines()]  # type: ignore[misc]
 
     def test_the_login_reads_the_token_from_standard_input_the_pull_follows_and_the_logout_ends_it_with_the_token_on_no_command_line_and_in_no_output(
         self,
@@ -357,6 +372,51 @@ class PullTest(unittest.TestCase):
         self.assertEqual(self.TOKEN, stdin.strip())
         self.assertNotIn(self.TOKEN, "\n".join(logged) + output)
 
+    def test_login_pull_and_logout_all_use_the_role_s_own_root_only_configuration_folder_and_it_is_gone_afterwards(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            code, output = run_tasks("pull_images.yml", values)
+            seen = self.configurations(stand_in)
+            left = self.config_folder(folder).exists()
+        self.assertEqual(0, code, output)
+        self.assertEqual([(str(self.config_folder(folder)), "drwx------")] * 3, seen, "login, pull and logout, each with the folder that only the owner enters")
+        self.assertFalse(left, "no login stays in the folder after the play")
+
+    def test_the_hosts_own_docker_login_is_never_read_replaced_or_removed_by_any_outcome_of_the_role(self) -> None:
+        outcomes = {
+            "success": {},
+            "blank_token": {"content": "  \n"},
+            "refused_login": {"marker": "fail_login"},
+            "failed_pull": {"marker": "fail_pull"},
+            "failed_logout": {"marker": "fail_logout"},
+        }
+        for label, more in outcomes.items():
+            with self.subTest(outcome=label), tempfile.TemporaryDirectory() as scratch:
+                stand_in, values = self.prepare_pull(Path(scratch), **({"content": more["content"]} if "content" in more else {}))  # type: ignore[arg-type]
+                existing = self.plant_existing_login(stand_in)
+                if "marker" in more:
+                    (stand_in.parent / more["marker"]).write_text("")
+                run_tasks("pull_images.yml", values)
+                self.assertEqual("existing-login\n", existing.read_text())
+                self.assertEqual(["config.json"], os.listdir(existing.parent), "nothing was written beside it")
+                self.assertNotIn(
+                    "unset", [configuration for configuration, _ in self.configurations(stand_in)] if (stand_in.parent / "config.log").exists() else []
+                )
+
+    def test_a_logout_that_fails_fails_the_play_and_still_removes_the_configuration_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            (stand_in.parent / "fail_logout").write_text("")
+            code, output = run_tasks("pull_images.yml", values)
+            logged = calls(stand_in)
+            left = self.config_folder(folder).exists()
+        self.assertNotEqual(0, code, output)
+        self.assertEqual("logout", logged[-1])
+        self.assertFalse(left)
+        self.assertNotIn(self.TOKEN, output)
+
     def test_a_missing_empty_or_loose_token_file_stops_the_deploy_with_the_fixed_message_before_any_docker_call(self) -> None:
         cases = {"missing": {"mode": None}, "empty": {"content": ""}, "loose": {"mode": 0o600}}
         for label, more in cases.items():
@@ -368,13 +428,15 @@ class PullTest(unittest.TestCase):
                 self.assertEqual([], calls(stand_in))
                 self.assertNotIn(self.TOKEN, output)
 
-    def test_a_token_file_of_white_space_only_is_refused_before_the_login_and_only_the_logout_runs(self) -> None:
+    def test_a_token_file_of_white_space_only_is_refused_before_the_login_and_no_docker_call_runs_not_even_a_logout(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            stand_in, values = self.prepare_pull(Path(scratch), content="  \n")
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder, content="  \n")
             code, output = run_tasks("pull_images.yml", values)
             self.assertNotEqual(0, code)
             self.assertIn("the registry token file is empty", output)
-            self.assertEqual(["logout"], calls(stand_in))
+            self.assertEqual([], calls(stand_in))
+            self.assertFalse(self.config_folder(folder).exists())
 
     def test_an_unset_user_or_token_file_setting_is_refused_by_name(self) -> None:
         for name in ("compose_stack_registry_user", "compose_stack_registry_token_file"):
@@ -388,22 +450,28 @@ class PullTest(unittest.TestCase):
 
     def test_a_refused_login_prints_no_token_even_though_docker_echoes_it_and_no_pull_follows(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            stand_in, values = self.prepare_pull(Path(scratch))
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
             (stand_in.parent / "fail_login").write_text("")
             code, output = run_tasks("pull_images.yml", values)
             logged = calls(stand_in)
+            left = self.config_folder(folder).exists()
         self.assertNotEqual(0, code)
         self.assertNotIn(self.TOKEN, output)
         self.assertEqual(["login --username example_account --password-stdin", "logout"], logged)
+        self.assertFalse(left)
 
     def test_a_failed_pull_stops_the_deploy_and_still_logs_out(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            stand_in, values = self.prepare_pull(Path(scratch))
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
             (stand_in.parent / "fail_pull").write_text("")
             code, output = run_tasks("pull_images.yml", values)
             logged = calls(stand_in)
+            left = self.config_folder(folder).exists()
         self.assertNotEqual(0, code, output)
         self.assertEqual("logout", logged[-1])
+        self.assertFalse(left)
 
 
 class SourceCoverageTest(unittest.TestCase):
