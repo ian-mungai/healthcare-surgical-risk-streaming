@@ -32,6 +32,7 @@ from scripts.project_config import ROOT as REAL_ROOT
 from scripts.project_config import ConfigurationError
 from tests.fast.ansible_paths import group_variables
 
+REAL_EXPECTED_USER = storage.expected_user
 FIRST_VALUE = "example-first-0123456789abcdef"
 SECOND_VALUE = "example-second-0123456789abcdef"
 ADDRESS = "storage-host.example.ts.net"
@@ -45,6 +46,8 @@ def secrets_directory() -> str:
     return str(variables["compose_stack_secrets_directory"]).replace("{{ compose_stack_directory }}", str(variables["compose_stack_directory"]))
 
 
+HASHES = '    "h1:Yg7vN8mCk1pQ0wXr3sT5uZ2aB4dE6fH8jL0nP2rS4tU=",\n    "zh:' + "0123456789abcdef" * 4 + '",\n    "zh:' + "fedcba9876543210" * 4 + '",\n'
+LOCK = 'provider "registry.terraform.io/aminueza/minio" {\n  version     = "3.46.2"\n  constraints = "= 3.46.2"\n  hashes = [\n' + HASHES + "  ]\n}\n"
 LOGIN_ID = "01234567-89ab-cdef-0123-456789abcdef"
 SESSION_VALUE = "hvs.example-token-0123456789"
 PROJECT_USER = "project_user"
@@ -102,8 +105,10 @@ class Stand(unittest.TestCase):
         (self.folder / ".tools" / "bin" / "terraform").chmod(0o700)
         self.source = self.folder / "infra" / "storage"
         self.source.mkdir(parents=True)
-        for name in ("main.tf", "variables.tf", "outputs.tf", "versions.tf", ".terraform.lock.hcl"):
+        for name in ("main.tf", "variables.tf", "outputs.tf", "versions.tf"):
             (self.source / name).write_text(f"# {name}\n")
+        (self.source / ".terraform.lock.hcl").write_text(LOCK)
+        self.account = FIRST_VALUE
         (self.source / "tests").mkdir()
         (self.source / "tests" / "storage.tftest.hcl").write_text("# test\n")
         self.calls: list[tuple[list[str], dict[str, str]]] = []
@@ -122,6 +127,7 @@ class Stand(unittest.TestCase):
             mock.patch.object(storage, "run_command", side_effect=self.run_command),
             mock.patch.object(storage, "host_peer", return_value=Peer()),
             mock.patch.object(storage, "ssh_output", side_effect=self.ssh_output),
+            mock.patch.object(storage, "expected_user", side_effect=lambda: self.account),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -187,6 +193,20 @@ class CredentialsTest(Stand):
         self.assertEqual({"X-Vault-Token": SESSION_VALUE}, read[3])
         self.assertEqual("", self.printed())
         self.assertNotIn(SECOND_VALUE, repr(credentials))
+
+    def test_the_account_that_openbao_names_must_be_the_one_the_deploy_makes_and_another_is_refused_with_no_name_in_the_message(self) -> None:
+        for other in ("another_account", "Project_User", "project_user2", FIRST_VALUE + "x"):
+            with self.subTest(other=other):
+                Gateway.stored = {"user": other, "password": SECOND_VALUE}
+                with self.assertRaises(storage.StorageError) as caught:
+                    storage.read_credentials(RUN.run_id, ADDRESS)
+                for value in (other, SECOND_VALUE, FIRST_VALUE):
+                    self.assertNotIn(value, str(caught.exception))
+                self.assertIn("not the project user", str(caught.exception))
+
+    def test_the_expected_account_is_the_name_that_the_deploy_makes_from_the_group_variables(self) -> None:
+        self.assertEqual(group_variables()["compose_stack_aistor_project_user"], REAL_EXPECTED_USER())
+        self.assertRegex(REAL_EXPECTED_USER(), storage.USER_FORM.pattern)
 
     def test_no_root_file_is_read_and_no_root_name_is_in_any_command(self) -> None:
         storage.read_credentials(RUN.run_id, ADDRESS)
@@ -254,6 +274,7 @@ class CredentialsTest(Stand):
     def test_the_form_check_takes_the_form_that_the_secret_file_module_writes(self) -> None:
         import secrets
 
+        self.account = PROJECT_USER
         for _ in range(50):
             Gateway.stored = {"user": PROJECT_USER, "password": secrets.token_urlsafe(32)}
             storage.read_credentials(RUN.run_id, ADDRESS)
@@ -554,6 +575,69 @@ class UpTest(Stand):
         self.versioning = "Suspended"
         with self.assertRaises(storage.StorageError):
             self.up(code)
+
+
+class AccountBeforeTerraformTest(UpTest):
+    def test_a_sign_in_of_another_account_stops_the_run_before_any_terraform_call_and_before_any_file_is_made(self) -> None:
+        Gateway.stored = {"user": "another_account", "password": SECOND_VALUE}
+        with self.assertRaises(storage.StorageError) as caught:
+            self.up()
+        self.assertEqual([], self.calls)
+        self.assertEqual([], self.aws_calls)
+        self.assertFalse((self.folder / ".tools" / "terraform").exists())
+        self.assertNotIn("another_account", str(caught.exception))
+
+
+class ProviderLockTest(Stand):
+    """The lock of the storage root must hold the registry's hashes, or Terraform trusts what it downloads: ``storage-up`` refuses before the host."""
+
+    def up(self) -> int:
+        binding = self.folder / "runs" / "run_binding.json"
+        binding.parent.mkdir(parents=True, exist_ok=True)
+        binding.write_text(json.dumps(RUN.__dict__))
+        return storage.storage_up(CONFIGURATION, binding, "")
+
+    def refused(self, text: str) -> str:
+        (self.source / ".terraform.lock.hcl").write_text(text)
+        with self.assertRaises(storage.StorageError) as caught:
+            self.up()
+        self.assertEqual([], self.ssh_commands, "no call to the host")
+        self.assertEqual([], Gateway.requests, "no call to OpenBao")
+        self.assertEqual([], self.calls, "no Terraform call")
+        return str(caught.exception)
+
+    def test_a_lock_with_the_registrys_hashes_goes_on(self) -> None:
+        self.assertEqual(0, self.up())
+
+    def test_a_lock_that_has_the_pin_and_no_hashes_is_refused_and_the_message_names_the_owner_step_and_the_running_platform(self) -> None:
+        message = self.refused('provider "registry.terraform.io/aminueza/minio" {\n  version     = "3.46.2"\n  constraints = "= 3.46.2"\n}\n')
+        self.assertIn("providers lock", message)
+        self.assertIn("-platform=" + storage.running_platform(), message)
+        self.assertIn("infra/storage/.terraform.lock.hcl", message)
+        self.assertIn("owner", message)
+
+    def test_an_empty_file_an_empty_list_a_list_with_only_a_local_hash_and_a_hash_in_a_comment_or_for_another_provider_are_refused(self) -> None:
+        zh = "zh:" + "0" * 64
+        cases = {
+            "an empty file": "",
+            "an empty list": LOCK.replace(HASHES, ""),
+            "only h1": LOCK.replace(HASHES, HASHES.splitlines(keepends=True)[0]),
+            "a short zh": LOCK.replace(HASHES, '    "zh:abc",\n'),
+            "a comment": LOCK.replace(HASHES, f"    # {zh}\n"),
+            "another provider": 'provider "registry.terraform.io/hashicorp/aws" {\n  hashes = [\n' + HASHES + "  ]\n}\n" + LOCK.replace(HASHES, ""),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertIn("providers lock", self.refused(text))
+
+    def test_the_lock_is_also_checked_where_the_run_copies_it_so_no_other_entry_reaches_terraform_with_an_empty_lock(self) -> None:
+        (self.source / ".terraform.lock.hcl").write_text("")
+        with self.assertRaises(storage.StorageError):
+            storage.initialise(RUN, storage.Credentials(FIRST_VALUE, SECOND_VALUE))
+        self.assertEqual([], self.calls)
+
+    def test_the_running_platform_is_the_form_that_the_lock_command_takes(self) -> None:
+        self.assertRegex(storage.running_platform(), r"^(darwin|linux)_(arm64|amd64)$")
 
 
 class MainTest(Stand):

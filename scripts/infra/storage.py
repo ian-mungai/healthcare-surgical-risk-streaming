@@ -8,13 +8,17 @@ plan of ``infra/storage`` and, when it changes anything, prints the changes and 
 After a plan with no change or an apply, the command refuses a state file that holds either credential and asks AIStor, through the AWS command line,
 whether the bucket's versioning is Enabled.
 
-The command signs in as the project user and never as root: AIStor's root pair stays in root-only files on the host, is used once by the deploy to make the
-project user and is not read here. The read goes through the gateway's OpenBao route with the ``aistor`` service's own AppRole: the command reads that role's
-secret ID over SSH (a root-only file on the host) and asks OpenBao for the secret at ``secret/services/aistor/aistor``, which only that role reads. The two
-credentials reach Terraform only as the environment of its own process (the provider reads ``MINIO_USER`` and ``MINIO_PASSWORD``, and takes them in no
-other form without writing them to the plan), and the AWS command line takes them only as ``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY`` in the
-environment of its one call (the profile files stay off), never as an argument, a variable, a plan, a state or a printed
-line. The state is the local file ``runs/<RUN_ID>/storage/terraform.tfstate``. Every wait has a deadline.
+Before it reads anything from the host it refuses a provider lock (``infra/storage/.terraform.lock.hcl``) that holds no registry hashes: the owner's provider
+lock step adds them, and Terraform would otherwise trust what it downloads. It also refuses a sign-in in OpenBao for any account but the project user that the
+deploy makes (``compose_stack_aistor_project_user``), before Terraform starts.
+
+The command signs in as the project user and never as root: AIStor's root pair stays in root-only files on the host, is used by the deploy only when the
+project user's own sign-in is refused and is not read here. The read goes through the gateway's OpenBao route with the ``aistor`` service's own AppRole: the
+command reads that role's secret ID over SSH (a root-only file on the host) and asks OpenBao for the secret at ``secret/services/aistor/aistor``, which only
+that role reads. The two credentials reach Terraform only as the environment of its own process (the provider reads ``MINIO_USER`` and ``MINIO_PASSWORD``, and
+takes them in no other form without writing them to the plan), and the AWS command line takes them only as ``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY``
+in the environment of its one call (the profile files stay off), never as an argument, a variable, a plan, a state or a printed line.
+The state is the local file ``runs/<RUN_ID>/storage/terraform.tfstate``. Every wait has a deadline.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import re
 import shutil
 import sys
@@ -53,6 +58,7 @@ from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.caddy import RoutesError, load_routes
+from scripts.stack.yaml_text import load_yaml
 
 SECRETS_DIRECTORY = "/opt/platform/secrets"
 STORAGE_ROUTE = "aistor"
@@ -64,6 +70,10 @@ LOGIN_FORM = re.compile(r"[A-Za-z0-9_-]{16,128}")
 TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 USER_FORM = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,63}")
 PASSWORD_FORM = re.compile(r"[A-Za-z0-9_-]{16,128}")
+GROUP_VARIABLES = Path(__file__).resolve().parents[2] / "ansible" / "group_vars" / "all.yml"
+PROVIDER_BLOCK = re.compile(r'provider "registry\.terraform\.io/aminueza/minio" \{(.*?)^\}', re.DOTALL | re.MULTILINE)
+HASH_LIST = re.compile(r"^\s*hashes\s*=\s*\[(.*?)^\s*\]", re.DOTALL | re.MULTILINE)
+REGISTRY_HASH = re.compile(r'^\s*"zh:[0-9a-f]{64}",?\s*$', re.MULTILINE)
 SSH_SECONDS = 30
 OPENBAO_SECONDS = 15
 CHECK_SECONDS = 60
@@ -81,6 +91,47 @@ class Credentials:
 
     user: str = field(repr=False)
     password: str = field(repr=False)
+
+
+def expected_user() -> str:
+    """The name of the project user that the deploy makes, from the group variables of the playbooks: the one account that this command signs in as."""
+    try:
+        document = load_yaml(GROUP_VARIABLES.read_text())
+    except OSError as error:
+        raise StorageError(f"the group variables cannot be read: {error.strerror}") from None
+    name = document.get("compose_stack_aistor_project_user") if isinstance(document, dict) else None
+    if not (isinstance(name, str) and USER_FORM.fullmatch(name)):
+        raise StorageError("the group variables name no project user of the expected form")
+    return name
+
+
+def running_platform() -> str:
+    """The platform of this computer in the form that ``terraform providers lock -platform`` takes."""
+    system = platform.system().lower()
+    machine = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine().lower())
+    return f"{system}_{machine}"
+
+
+def lock_problem(text: str) -> str | None:
+    """Why the provider lock cannot be trusted, or None. It must hold, for the minio provider, the registry's hashes of the provider's packages (``zh:``)."""
+    block = PROVIDER_BLOCK.search(text)
+    listed = HASH_LIST.search(block.group(1)) if block else None
+    if listed is not None and REGISTRY_HASH.search(listed.group(1)):
+        return None
+    return (
+        "the provider lock infra/storage/.terraform.lock.hcl holds no hashes that the registry signed for the minio provider, so Terraform would trust what it "
+        "downloads: the owner runs the provider lock step first "
+        f"(.tools/bin/terraform -chdir=infra/storage providers lock -platform={running_platform()} -platform=linux_amd64) and commits the file"
+    )
+
+
+def require_provider_hashes(lock: Path) -> None:
+    try:
+        text = lock.read_text()
+    except OSError:
+        text = ""
+    if (problem := lock_problem(text)) is not None:
+        raise StorageError(problem)
 
 
 def endpoint(address: str, route: str = STORAGE_ROUTE) -> str:
@@ -140,6 +191,8 @@ def read_credentials(run_id: str, address: str) -> Credentials:
         raise StorageError(f"OpenBao holds no project user sign-in for the {OPENBAO_ROLE} role (HTTP {status}): the deploy makes it, so run make host-up first")
     if not (isinstance(user, str) and USER_FORM.fullmatch(user) and isinstance(password, str) and PASSWORD_FORM.fullmatch(password)):
         raise StorageError("the project user's sign-in in OpenBao is not of the expected form")
+    if user != expected_user():
+        raise StorageError("the sign-in in OpenBao is for an account that is not the project user that the deploy makes: Terraform is not started with it")
     return Credentials(user, password)
 
 
@@ -170,12 +223,14 @@ def plans_folder(run: RunBinding) -> Path:
 
 def prepare_configuration(run: RunBinding) -> Path:
     """Give the run its own copy of the storage root: its Terraform files and its provider lock, and no test folder."""
+    require_provider_hashes(ROOT / SOURCE_FOLDER / ".terraform.lock.hcl")
     target = configuration_folder(run)
     target.mkdir(parents=True, exist_ok=True)
     for stale in list_folder(target):
         if stale.name != ".terraform":
             shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
     source = ROOT / SOURCE_FOLDER
+    require_provider_hashes(source / ".terraform.lock.hcl")
     for item in [*list_folder(source, "*.tf"), source / ".terraform.lock.hcl"]:
         shutil.copy2(item, target / item.name)
     return target
@@ -361,6 +416,7 @@ def check_versioning(address: str, bucket: str, credentials: Credentials) -> Non
 
 
 def storage_up(configuration: dict[str, str], binding: Path, confirm: str) -> int:
+    require_provider_hashes(ROOT / SOURCE_FOLDER / ".terraform.lock.hcl")
     run = load_run(binding)
     host_name = f"platform-{configuration['ENVIRONMENT']}"
     try:
