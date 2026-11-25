@@ -3,13 +3,16 @@
 # compose_stack_pull_deadline_seconds. The project's images are in one private Docker Hub repository, which the owner's computer pushed to (make images-push) and
 # which compose/image_pins.yml names by digest. The host builds nothing: it pulls every image that the Compose files name (including the batch profile's).
 # The role owns every piece of Docker state that the pull uses and changes no state that anything else shares: it runs no docker login and no docker logout. One shell
-# task makes a fresh folder under the parent (mode 0700, never removed, never changed), writes the folder's config.json (mode 0600) with the one auth entry for Docker Hub,
-# runs the pull with DOCKER_CONFIG set to that folder and with DOCKER_AUTH_CONFIG and the project image settings removed from the environment, and removes that folder
-# on every exit. The task refuses before any write when a docker-credential-* program is on the PATH (Docker would pick it, and read no auth from the file). The token is one
+# task (run by bash, which makes a process group for a background job with no terminal) makes a fresh folder under the parent (mode 0700, never removed, never changed), writes the folder's
+# config.json (mode 0600) with the one auth entry for Docker Hub, checks what it wrote, runs the pull in a process group of its own with DOCKER_CONFIG set to that folder and
+# with DOCKER_AUTH_CONFIG and the project image settings removed from the environment, and removes that folder on every exit. A docker-credential-* program on the PATH does not
+# stop the deploy: Docker looks for a default helper only when the config file holds no auth entry, and this file holds one and no credsStore or credHelpers key. The task
+# reads the file back before the pull and refuses unless it is exactly the one auth entry (the auth value is base64 text only), so no other key can reach Docker. The token is one
 # file on the host, which only root reads. The shell task reads it on its standard input, so it is on no command line, in no environment, in no printed output and in
 # no variable that Ansible keeps. A caller that gets the token another way pipes it into the same task.
-# The task keeps its own deadline, ten seconds before compose_stack_pull_deadline_seconds (the pull is ended with a TERM signal past it), so its cleanup runs before
-# Ansible's own timeout, which is the backstop. The final step removes a folder path that the task printed and nothing else, for a task that Ansible ended anyway.
+# The task keeps its own deadline, ten seconds before compose_stack_pull_deadline_seconds. At the deadline it sends TERM to the pull's process group, waits five seconds,
+# sends KILL to the group, reaps the pull and only then removes the folder, so its cleanup runs before Ansible's own timeout, which is the backstop. The task then fails and names the deadline.
+# The final step removes a folder path that the task printed and nothing else, for a task that Ansible ended anyway.
 - name: Stop when the registry user or the token file is not set
   ansible.builtin.assert:
     that:
@@ -38,30 +41,39 @@
   block:
     - name: Pull every image of the Compose files, each by its digest
       ansible.builtin.shell:
+        executable: /bin/bash
         cmd: |
           {
             set -u
             umask 077
+            set -m
             user={{ compose_stack_registry_user | quote }}
             parent={{ compose_stack_registry_config_directory | quote }}
             owner={{ compose_stack_owner | quote }}
             deadline={{ [(compose_stack_pull_deadline_seconds | int) - 10, 1] | max }}
+            grace=5
             folder=
             pull=
             refuse() { printf 'REFUSED=%s\n' "$1"; exit 64; }
+            end_pull() {
+              if [ -n "$pull" ]; then
+                kill -s TERM -- "-$pull" 2>/dev/null
+                waited=0
+                while kill -s 0 -- "-$pull" 2>/dev/null && [ "$waited" -lt "$grace" ]; do
+                  sleep 1
+                  waited=$((waited + 1))
+                done
+                kill -s KILL -- "-$pull" 2>/dev/null
+                wait "$pull" 2>/dev/null
+                pull=
+              fi
+            }
             cleanup() {
-              if [ -n "$pull" ]; then kill -TERM "$pull" 2>/dev/null; fi
+              end_pull
               case $folder in "$parent"/login.*) rm -rf -- "$folder" ;; esac
             }
             trap cleanup EXIT
             trap 'exit 1' HUP INT TERM
-            IFS=:
-            for dir in $PATH; do
-              for found in "${dir:-.}"/docker-credential-*; do
-                if [ -e "$found" ]; then refuse "a docker-credential helper is on the PATH: Docker would use it and read no login from the file"; fi
-              done
-            done
-            unset IFS
             IFS= read -r token || true
             token=$(printf '%s' "$token" | tr -d '[:space:]')
             if [ -z "$token" ]; then refuse "the registry token file is empty"; fi
@@ -77,19 +89,28 @@
             auth=$(printf '%s:%s' "$user" "$token" | base64 | tr -d '\n')
             printf '{"auths": {"https://index.docker.io/v1/": {"auth": "%s"}}}\n' "$auth" > "$folder/config.json"
             chmod 0600 "$folder/config.json"
+            prefix='{"auths": {"https://index.docker.io/v1/": {"auth": "'
+            suffix='"}}}'
+            written=$(cat "$folder/config.json")
+            value=${written#"$prefix"}
+            value=${value%"$suffix"}
+            case $value in
+              '' | *[!A-Za-z0-9+/=]*) refuse "the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key" ;;
+            esac
+            if [ "$written" != "$prefix$value$suffix" ]; then refuse "the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key"; fi
             env -u DOCKER_AUTH_CONFIG "DOCKER_CONFIG=$folder" {{ compose_stack_docker | map('quote') | join(' ') }} --profile batch pull --quiet < /dev/null > /dev/null 2>&1 &
             pull=$!
-            (
-              waited=0
-              while kill -0 "$pull" 2>/dev/null; do
-                if [ "$waited" -ge "$deadline" ]; then kill -TERM "$pull" 2>/dev/null; exit 1; fi
-                sleep 1
-                waited=$((waited + 1))
-              done
-            ) &
+            waited=0
+            while kill -s 0 "$pull" 2>/dev/null; do
+              if [ "$waited" -ge "$deadline" ]; then
+                end_pull
+                exit 124
+              fi
+              sleep 1
+              waited=$((waited + 1))
+            done
             wait "$pull"
             code=$?
-            if ! wait $!; then code=124; fi
             pull=
             exit "$code"
           } < {{ compose_stack_registry_token_file | quote }}

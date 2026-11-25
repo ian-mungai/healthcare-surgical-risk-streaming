@@ -7,14 +7,18 @@ commands and that the registry token reaches Docker through standard input only.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import grp
 import json
 import os
 import pwd
 import re
+import signal
 import stat
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -25,6 +29,7 @@ from tests.slow.ansible_support import ROLES, load_variable, run_playbook
 
 ROLE = ROLES / "compose_stack"
 CHANGED_NONE = re.compile(r"changed=0\s")
+GRACE_SECONDS = 5
 SOURCE_PATH = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 
 STAND_IN = r"""#!/bin/sh
@@ -53,11 +58,14 @@ case "$verb" in
   ps_json) if [ -f "$here/ps.json" ]; then cat "$here/ps.json"; fi ;;
   login|logout) echo "the role must not run docker $verb" >&2; exit 1 ;;
   pull)
-    ps -ww -eo args= >> "$here/ps.log"
+    mine=$(ps -o pgid= -p $$ | tr -d ' ')
+    parents=$(ps -o pgid= -p "$PPID" | tr -d ' ')
+    ps -ww -eo pgid=,args= | awk -v a="$mine" -v b="$parents" '$1 == a || $1 == b { sub(/^ *[0-9]+ +/, ""); print }' >> "$here/ps.log"
     if [ -f "$here/fail_pull" ]; then echo "pull failed" >&2; exit 1; fi
     if [ ! -f "$store/config.json" ]; then echo "pull denied: not logged in" >&2; exit 1; fi
     cp "$store/config.json" "$here/pull_config.json"
     ls -l "$store/config.json" | cut -c1-10 >> "$here/pull_file_mode.log"
+    if [ -f "$here/ignore_term_pull" ]; then trap '' TERM; echo $$ > "$here/pull.pid"; while :; do sleep 1; done; fi
     if [ -f "$here/hang_pull" ]; then exec sleep 30; fi ;;
   up)
     touch "$here/started"
@@ -473,18 +481,48 @@ class PullTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertEqual(["compose: "], names)
 
-    def test_a_docker_credential_helper_on_the_path_refuses_the_pull_before_any_write_or_docker_call(self) -> None:
+    def test_a_docker_credential_helper_on_the_path_does_not_stop_the_pull_because_the_one_entry_file_gives_it_no_helper_to_use(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
             code, output = run_tasks("pull_images.yml", values, environment={"PATH": self.helper_path(folder)})
-            made = self.parent(folder).exists()
             logged = calls(stand_in)
-        self.assertNotEqual(0, code)
-        self.assertIn("a docker-credential helper is on the PATH", output)
-        self.assertFalse(made, "nothing was written, not even the parent")
-        self.assertEqual([], logged)
-        self.assertNotIn(self.TOKEN, output)
+            used = json.loads((stand_in.parent / "pull_config.json").read_text())
+        self.assertEqual(0, code, output)
+        self.assertEqual(["compose --project-name sample --profile batch pull --quiet"], logged)
+        self.assertEqual(["auths"], list(used))
+        self.assertEqual(1, len(used["auths"]))
+
+    def test_a_login_file_that_is_not_exactly_one_auth_entry_with_no_credential_store_or_helper_key_is_refused_before_the_pull(self) -> None:
+        """The auth value comes from ``base64`` on the PATH. A program there that adds a key of the file's own shape must not reach Docker."""
+        shims = {
+            "credsStore": 'eA==","credsStore":"desktop',
+            "credHelpers": 'eA=="},"credHelpers":{"index.docker.io":"fake',
+            "second entry": 'eA=="},"https://other.example":{"auth":"eA==',
+            "empty": "",
+            "space": "eA== ",
+        }
+        for label, value in shims.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, values = self.prepare_pull(folder)
+                helpers = folder / "helpers"
+                helpers.mkdir()
+                shim = helpers / "base64"
+                shim.write_text(f"#!/bin/sh\ncat > /dev/null\nprintf '%s' '{value}'\n")
+                shim.chmod(0o755)
+                code, output = run_tasks("pull_images.yml", values, environment={"PATH": f"{helpers}:/usr/bin:/bin"})
+                left = os.listdir(self.parent(folder))
+            self.assertNotEqual(0, code, output)
+            self.assertIn("the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key", output)
+            self.assertEqual([], calls(stand_in), "no Docker command ran with that file")
+            self.assertEqual([], left)
+            self.assertNotIn(self.TOKEN, output)
+
+    def test_the_task_file_has_no_refusal_for_a_credential_helper_on_the_path(self) -> None:
+        text = (ROLE / "tasks" / "pull_images.yml").read_text()
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("docker-credential", code)
 
     def test_an_existing_folder_at_the_old_path_and_an_existing_docker_login_are_untouched_by_every_outcome(self) -> None:
         outcomes: dict[str, dict[str, object]] = {
@@ -557,6 +595,64 @@ class PullTest(unittest.TestCase):
         self.assertIn("the image pull ran past its deadline of 3 seconds", output)
         self.assertEqual([], left)
         self.assertNotIn(self.TOKEN, output)
+
+    def test_a_pull_that_ignores_the_term_signal_is_killed_with_its_whole_group_before_the_folder_is_removed_and_the_task_names_the_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            (stand_in.parent / "ignore_term_pull").write_text("")
+            started = time.monotonic()
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": 14})
+            elapsed = time.monotonic() - started
+            left = os.listdir(self.parent(folder))
+            pid = int((stand_in.parent / "pull.pid").read_text())
+            self.addCleanup(self.kill_quietly, pid)
+            gone = self.is_gone(pid)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the image pull ran past its deadline of 14 seconds", output)
+        self.assertTrue(gone, "the pull survived the task: one TERM is not enough")
+        self.assertEqual([], left)
+        self.assertLess(elapsed, 14 + 20, "the task ended well inside Ansible's own timeout plus its start-up")
+        self.assertNotIn(self.TOKEN, output)
+
+    def test_a_pull_that_ends_on_the_term_signal_is_not_held_for_the_whole_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            (stand_in.parent / "hang_pull").write_text("")
+            started = time.monotonic()
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": 3})
+            elapsed = time.monotonic() - started
+        self.assertNotEqual(0, code, output)
+        self.assertLess(elapsed, 3 + GRACE_SECONDS + 15)
+
+    @staticmethod
+    def is_gone(pid: int) -> bool:
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.1)
+        return False
+
+    @staticmethod
+    def kill_quietly(pid: int) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+
+    def test_the_process_list_that_the_pull_takes_holds_nothing_from_outside_the_runs_process_groups(self) -> None:
+        outsider = subprocess.Popen(["/bin/sleep", "4711"], start_new_session=True)  # noqa: S603 - a process in a session of its own, to prove the list is scoped
+        self.addCleanup(outsider.wait)
+        self.addCleanup(outsider.kill)
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            code, output = run_tasks("pull_images.yml", values)
+            listing = (stand_in.parent / "ps.log").read_text()
+        self.assertEqual(0, code, output)
+        self.assertNotIn("sleep 4711", listing, "a process outside the run's groups is in the list")
+        self.assertIn("compose --project-name sample --profile batch pull --quiet", listing)
 
     def test_a_second_run_changes_nothing_on_the_host_and_runs_the_same_pull(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
