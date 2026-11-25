@@ -21,6 +21,7 @@ DOCKERFILE = ROOT / "orchestration" / "Dockerfile"
 DEFINITIONS = ROOT / "orchestration" / "surgical_risk" / "definitions.py"
 CODE_LOCATION = ROOT / "compose" / "services" / "dagster_code_location.yml"
 ENTRY = "orchestration/surgical_risk/table_checks.py"
+HOST_SETTINGS_TASKS = ROOT / "ansible" / "roles" / "compose_stack" / "tasks" / "render_environment.yml"
 CONTEXT_FOLDERS = {"stack_scripts": "scripts", "stack_spark": "spark"}
 IMAGE_APP = "/opt/dagster/app/"
 
@@ -154,6 +155,48 @@ class StagingVolumeTest(unittest.TestCase):
         self.assertIn("checks.STAGING_VOLUME", source)
         self.assertIn("checks.STAGING_DIRECTORY", source)
         self.assertNotIn("TABLE_CHECKS_STAGING", source)
+
+
+def required_names(source: str) -> set[str]:
+    """The names of the environment variables that a module insists on: each ``required("NAME")`` call of its own helper."""
+    return {
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "required"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+def deployed_names(code_location: dict[str, Any], host_settings_tasks: str) -> set[str]:
+    """The names that the code location container has: its Compose ``environment`` and the lines of the host settings file that the deploy writes."""
+    service = code_location["services"]["dagster_code_location"]
+    return set(service["environment"]) | set(re.findall(r"^\s+([A-Z][A-Z0-9_]*)=", host_settings_tasks, re.MULTILINE))
+
+
+class EnvironmentWiringTest(unittest.TestCase):
+    """The job runs in the code location container, whose environment the deploy sets: a variable that the job insists on and the deploy does not set stops
+    every run (it was ``AWS_PROFILE`` and ``S3_BUCKET``, which only the owner's ``.env`` has)."""
+
+    def setUp(self) -> None:
+        self.provided = deployed_names(yaml.safe_load(CODE_LOCATION.read_text()), HOST_SETTINGS_TASKS.read_text())
+
+    def test_every_variable_the_job_insists_on_is_set_in_the_code_location(self) -> None:
+        self.assertEqual(set(), required_names((ROOT / ENTRY).read_text()) - self.provided)
+
+    def test_the_check_names_a_variable_that_the_deploy_does_not_set(self) -> None:
+        source = (ROOT / ENTRY).read_text().replace('required("NESSIE_URI")', 'required("S3_BUCKET")', 1)
+        self.assertEqual({"S3_BUCKET"}, required_names(source) - self.provided)
+
+    def test_the_job_takes_the_bucket_the_region_and_the_workload_profile_from_the_settings_the_deploy_sets(self) -> None:
+        source = (ROOT / ENTRY).read_text()
+        self.assertIn("project_store(os.environ)", source)
+        self.assertLessEqual({"WAREHOUSE_LOCATION", "AWS_REGION"}, self.provided)
+        self.assertNotIn('"AWS_PROFILE"', source)
+        self.assertNotIn('"S3_BUCKET"', source)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.aws_cli import Aws
 from scripts.ingestion import record_run
-from scripts.ingestion.record_run import SECRET_FILES, SettingsError, main, settings_from_environment
+from scripts.ingestion.record_run import SECRET_FILES, SettingsError, main, project_store, settings_from_environment
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
 from tests.fast.locale_support import non_utf_8_locale
 from tests.fast.record_support import RELEASE_FILES, FakeAirbyte, FakeCatalog, landed_records
@@ -171,6 +172,26 @@ class SettingsTest(EnvironmentCase):
                 with self.assertRaises(SettingsError) as raised:
                     settings_from_environment({**self.environment, "WAREHOUSE_LOCATION": text})
                 self.assertIn("WAREHOUSE_LOCATION", str(raised.exception))
+
+
+class ProjectStoreTest(EnvironmentCase):
+    """The bucket of the project as the code location reaches it, for a job that only reads the bucket (the table checks)."""
+
+    def test_the_bucket_comes_from_the_warehouse_location_the_region_from_aws_region_and_the_profile_is_the_workload_profile(self) -> None:
+        for name in ("AWS_PROFILE", "S3_BUCKET"):
+            self.assertNotIn(name, self.environment)
+        store = project_store(self.environment)
+        self.assertEqual("example-bucket", store.bucket)
+        self.assertEqual(Aws("default", "us-west-2"), store.aws)
+
+    def test_the_profile_is_the_one_record_aws_profile_names_when_it_is_set(self) -> None:
+        self.assertEqual(Aws("another", "us-west-2"), project_store({**self.environment, "RECORD_AWS_PROFILE": "another"}).aws)
+
+    def test_a_missing_region_or_warehouse_location_is_named(self) -> None:
+        for name in ("AWS_REGION", "WAREHOUSE_LOCATION"):
+            with self.subTest(name=name), self.assertRaises(SettingsError) as raised:
+                project_store({key: value for key, value in self.environment.items() if key != name})
+            self.assertIn(name, str(raised.exception))
 
 
 class ApiAddressTest(EnvironmentCase):
