@@ -21,7 +21,8 @@ Failure modes covered here:
   the post, is not kept on every outcome, is marked complete before the tag is verified, or a pass is printed while it is not complete.
 - A launch whose SSH call timed out or failed is not pending, so both inventories read empty while its container is still starting and the cleanup deletes the
   branches and the folder under it; the wait for it has no fixed deadline, ends before the last attempt's deadline, or ends with a launch unresolved and the
-  record still passes.
+  record still passes; an interrupt that cuts the stamp of the end of the launch's call leaves the old start time, so the wait ends at once; an SSH that cannot
+  start in the final inventory, or an unreadable pending tag record, fails with the exception type only, naming no launch or record.
 - A case file is read before the whole run's object versions are confirmed, or before the Spark workload's own access is proved.
 """
 
@@ -898,6 +899,99 @@ class PendingLaunch(Hosted):
             self.host.stack.replay(["/out/x.py"], replay_access=False)
         self.assertEqual([self.host.stack.launched[-1]], list(self.host.stack.pending), "an interrupt after the 255 left no pending launch")
 
+    def interrupted_at_the_end_stamp(self, *, start_after: int) -> str:
+        """A job that ran 2400 seconds and whose SSH call timed out (255); one interrupt then hits the clock read that stamps the end of the call."""
+        original = self.target.run
+        returned: list[bool] = []
+
+        def slow(args: list[str], **options: Any) -> tuple[int, str, str]:
+            if "--name" in args and "run" in args and not returned:
+                self.time.now += 2400
+                result = original(args, **options)
+                returned.append(True)
+                return result
+            return original(args, **options)
+
+        def interrupted() -> float:
+            if returned and not self.stamp_works:
+                raise KeyboardInterrupt
+            return self.time.clock()
+
+        self.stamp_works = False
+        self.target.timeouts, self.target.start_after = 1, start_after
+        self.target.run = slow  # type: ignore[method-assign]
+        self.host.stack.clock = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.host.stack.replay(["/out/x.py"], replay_access=False)
+        self.stamp_works = True
+        return str(self.host.stack.launched[-1])
+
+    def test_an_interrupt_at_the_end_stamp_of_a_launch_still_gets_a_full_settlement_window_from_the_start_of_the_cleanup(self) -> None:
+        name = self.interrupted_at_the_end_stamp(start_after=8)
+        self.assertEqual([name], list(self.host.stack.pending))
+        passed, text = self.module.remove_everything(self.host)
+        self.assertIn("container started late", self.events, "the cleanup did not wait: the unknown end of the call was taken as the start of the call")
+        started = self.events.index("container started late")
+        deleted = next(number for number, event in enumerate(self.events) if event == "nessie DELETE")
+        self.assertTrue(
+            any(event.startswith("target docker rm") and number > started and number < deleted for number, event in enumerate(self.events)),
+            "the late container was not removed before the branches were deleted",
+        )
+        self.target.finish_starting()
+        self.assertEqual({}, self.target.containers)
+        self.assertTrue(passed, text)
+
+    def test_a_launch_with_no_end_stamp_is_waited_for_until_the_start_of_the_cleanup_plus_the_settlement_time(self) -> None:
+        self.interrupted_at_the_end_stamp(start_after=10**6)
+        cleanup_started = self.time.now
+        with mock.patch.object(self.module, "PENDING_POLL_SECONDS", 7):
+            passed, text = self.module.remove_everything(self.host)
+        self.assertEqual(cleanup_started + self.module.PENDING_SETTLE_SECONDS, self.time.now)
+        self.assertTrue(passed, text)
+
+    def test_a_launch_with_an_end_stamp_keeps_its_deadline_from_that_stamp_while_another_has_none(self) -> None:
+        self.timed_out()
+        stamped = self.time.now
+        self.interrupted_at_the_end_stamp(start_after=10**6)
+        cleanup_started = self.time.now
+        self.assertGreater(cleanup_started, stamped + self.module.PENDING_SETTLE_SECONDS)
+        self.module.remove_everything(self.host)
+        self.assertEqual(cleanup_started + self.module.PENDING_SETTLE_SECONDS, self.time.now)
+
+    def past_the_deadline_inventory_fails(self, *, calls_that_work: int) -> tuple[bool, str, str]:
+        """A pending launch that never appears; each ``docker ps`` after the settlement deadline, beyond ``calls_that_work`` of them, cannot start ``ssh``."""
+        name = self.timed_out()
+        deadline = max(self.host.stack.ended.values()) + self.module.PENDING_SETTLE_SECONDS
+        original = self.target.run
+        late: list[int] = []
+
+        def broken(args: list[str], **options: Any) -> tuple[int, str, str]:
+            if args[:3] == ["docker", "ps", "-a"] and self.time.now >= deadline:
+                late.append(1)
+                if len(late) > calls_that_work:
+                    raise FileNotFoundError(2, "No such file or directory", "ssh")
+            return original(args, **options)
+
+        self.target.run = broken  # type: ignore[method-assign]
+        passed, text = self.module.remove_everything(self.host)
+        return passed, text, name
+
+    def test_an_ssh_that_cannot_start_in_the_final_inventory_keeps_everything_and_names_the_launch(self) -> None:
+        passed, text, name = self.past_the_deadline_inventory_fails(calls_that_work=0)
+        self.assertFalse(passed)
+        self.assert_kept(text)
+        self.assertIn(name, text)
+        self.assertNotIn("stopped by", text, "the error was left to the generic step handler, which names no launch")
+        self.assertIn(name, self.host.stack.pending)
+
+    def test_an_ssh_that_cannot_start_in_the_inventory_after_the_removal_keeps_everything_and_names_the_launch(self) -> None:
+        passed, text, name = self.past_the_deadline_inventory_fails(calls_that_work=1)
+        self.assertFalse(passed)
+        self.assert_kept(text)
+        self.assertIn(name, text)
+        self.assertNotIn("stopped by", text, "the error was left to the generic step handler, which names no launch")
+        self.assertIn(name, self.host.stack.pending)
+
     def test_the_time_of_a_pending_launch_is_the_end_of_its_call_not_its_start(self) -> None:
         original = self.target.run
 
@@ -909,12 +1003,12 @@ class PendingLaunch(Hosted):
         self.target.timeouts, self.target.start_after = 1, 10**6
         self.target.run = slow  # type: ignore[method-assign]
         self.host.stack.replay(["/out/x.py"], replay_access=False)
-        self.assertEqual({self.host.stack.launched[-1]: self.time.now}, self.host.stack.pending)
+        self.assertEqual({self.host.stack.launched[-1]: self.time.now}, self.host.stack.ended)
 
     def test_every_call_of_the_settlement_is_capped_by_the_time_that_remains(self) -> None:
         self.timed_out(start_after=3)
         original = self.target.run
-        deadline = max(self.host.stack.pending.values()) + self.module.PENDING_SETTLE_SECONDS
+        deadline = max(self.host.stack.ended.values()) + self.module.PENDING_SETTLE_SECONDS
         calls: list[tuple[str, float, float]] = []
 
         def timed(args: list[str], **options: Any) -> tuple[int, str, str]:
@@ -932,7 +1026,7 @@ class PendingLaunch(Hosted):
     def test_the_last_poll_of_the_settlement_does_not_run_past_the_deadline(self) -> None:
         self.timed_out()
         original = self.target.run
-        deadline = max(self.host.stack.pending.values()) + self.module.PENDING_SETTLE_SECONDS
+        deadline = max(self.host.stack.ended.values()) + self.module.PENDING_SETTLE_SECONDS
         ends: list[float] = []
 
         def timed(args: list[str], **options: Any) -> tuple[int, str, str]:
@@ -1070,6 +1164,26 @@ class TagProof(Hosted):
     def test_a_pending_record_that_cannot_be_read_is_a_failure_that_names_it_even_with_a_saved_record(self) -> None:
         (self.run_folder / "tag_pending.json").write_text("{not json")
         passed, text = self.module.prove_tag(self.host)
+        self.assertFalse(passed)
+        self.assertIn("tag_pending.json", text)
+
+    def test_a_pending_record_that_is_a_folder_is_a_failure_that_names_it(self) -> None:
+        (self.run_folder / "tag_pending.json").unlink()
+        (self.run_folder / "tag_pending.json").mkdir()
+        passed, text = self.module.prove_tag(self.host)
+        self.assertFalse(passed)
+        self.assertIn("tag_pending.json", text)
+
+    def test_a_pending_record_that_cannot_be_opened_is_a_failure_that_names_it(self) -> None:
+        original = Path.read_text
+
+        def guarded(path: Path, *args: Any, **options: Any) -> str:
+            if path.name == "tag_pending.json":
+                raise PermissionError(13, "Permission denied")
+            return original(path, *args, **options)
+
+        with mock.patch.object(Path, "read_text", guarded):
+            passed, text = self.module.prove_tag(self.host)
         self.assertFalse(passed)
         self.assertIn("tag_pending.json", text)
 
