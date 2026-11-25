@@ -35,7 +35,7 @@ import time
 import unittest
 from pathlib import Path
 
-from scripts.process import CompletedProcess, TimeoutExpired, run_command
+from scripts.process import CompletedProcess, run_command
 from tests.e2e.run_record import ROOT
 from tests.fast.test_runner_gold_sealed import runner
 
@@ -108,12 +108,18 @@ class StalledCatalog(unittest.TestCase):
             self.assertEqual("", done.stdout)
 
     def test_the_same_program_without_a_timer_that_fires_is_still_waiting_after_the_deadline_has_passed(self) -> None:
-        """The probe is only a proof of the timer when the Nessie timeout (100 seconds) is longer than the wait: a job without its timer waits for it."""
+        """The probe is only a proof of the timer when the Nessie timeout (100 seconds) is longer than the wait: a job without its timer waits for it.
+        The wrapper's own limit (4 seconds) stops that job inside the host limit (8 seconds), so the test leaves no job running: the wrapper exits 1 with
+        a false flag and the job writes no final result."""
         module = runner("silver_cases")
         self.assertEqual("2", module.STALL_ENV["JOB_DEADLINE_SECONDS"])
         self.assertGreaterEqual(float(module.STALL_ENV["NESSIE_TIMEOUT_SECONDS"]), 100)
-        with tempfile.TemporaryDirectory(prefix="deadline_probe_") as folder, self.assertRaises(TimeoutExpired):
-            on_host(module.STALL, Path(folder), {**module.STALL_ENV, "JOB_DEADLINE_SECONDS": "2000"}, 8)
+        with tempfile.TemporaryDirectory(prefix="deadline_probe_") as folder:
+            done = on_host(module.STALL, Path(folder), {**module.STALL_ENV, "JOB_DEADLINE_SECONDS": "2000", "PROBE_SECONDS": "4"}, 8)
+            self.assertEqual(1, done.returncode)
+            self.assertEqual({"stderr_is_stop_line": False, "exit": 1}, json.loads((Path(folder) / "probe" / "result.json").read_text()))
+            # The stopped job never writes its result; only the name it reserved at its start (``result.json.part``) may stay.
+            self.assertFalse((Path(folder) / "result.json").exists())
 
 
 class PlantedJobs(unittest.TestCase):
