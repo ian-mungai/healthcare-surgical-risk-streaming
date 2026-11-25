@@ -226,5 +226,64 @@ class ContainersTest(unittest.TestCase):
                 stale.parse_containers(text)
 
 
+class DockerFailureTest(unittest.TestCase):
+    """A failed docker call shows the step, its exit code and one fixed reason word. Docker's text can hold a socket path, a registry address or a token."""
+
+    LEAKED = "/srv/example.invalid/docker/leaked.sock token=eyJleaked-docker-token-3"
+    TEXTS = {
+        "refused": f"permission denied while trying to connect to the Docker daemon socket at {LEAKED}",
+        "unreachable": f"Cannot connect to the Docker daemon at {LEAKED}. Is the docker daemon running?",
+        "not found": f"Error response from daemon: No such container: {LEAKED}",
+        "failed": f"error: {LEAKED}: yaml: line 9: did not find expected key",
+    }
+
+    class FakeModule:
+        def __init__(self, code: int, error: str) -> None:
+            self.reply = (code, "the answer", error)
+
+        def run_command(self, arguments: list[str], check_rc: bool = False) -> tuple[int, str, str]:
+            return self.reply
+
+    def failure(self, arguments: list[str], error: str, code: int = 1) -> str:
+        with self.assertRaises(stale.StaleError) as caught:
+            stale.run(self.FakeModule(code, error), arguments)
+        return str(caught.exception)
+
+    def test_each_failed_call_shows_the_step_the_code_and_one_fixed_reason_and_none_of_dockers_text(self) -> None:
+        for reason, text in self.TEXTS.items():
+            for step in ("config", "ps", "inspect"):
+                with self.subTest(reason=reason, step=step):
+                    message = self.failure(["docker", "compose", step, "--format", "json"], text, code=125)
+                    self.assertEqual(f"docker {step} exited with 125 (reason: {reason})", message)
+                    self.assertNotIn(self.LEAKED.split()[0], message)
+                    self.assertNotIn("eyJleaked", message)
+
+    def test_a_text_that_matches_no_word_gets_the_word_failed_and_a_call_with_no_known_step_is_named_command(self) -> None:
+        self.assertEqual("docker command exited with 1 (reason: failed)", self.failure(["docker", "version"], self.TEXTS["failed"]))
+        self.assertEqual("docker ps exited with 2 (reason: failed)", self.failure(["docker", "ps"], "", code=2))
+
+    def test_a_call_that_succeeds_returns_its_output_whatever_it_printed_on_standard_error(self) -> None:
+        self.assertEqual("the answer", stale.run(self.FakeModule(0, self.TEXTS["unreachable"]), ["docker", "ps"]))
+
+    def test_a_text_with_the_signs_of_two_reasons_gets_the_first_of_refused_then_unreachable_then_not_found(self) -> None:
+        refused, unreachable, missing = "permission denied", "Cannot connect to the Docker daemon", "No such container"
+        self.assertIn("(reason: refused)", self.failure(["docker", "ps"], f"{missing} {unreachable} {refused}"))
+        self.assertIn("(reason: unreachable)", self.failure(["docker", "ps"], f"{missing} {unreachable}"))
+        self.assertIn("(reason: not found)", self.failure(["docker", "ps"], missing))
+
+    SIGNS = {
+        "refused": ("permission denied", "unauthorized", "access denied"),
+        "unreachable": ("Cannot connect to the Docker daemon", "error during connect", "connection refused", "no such host", "i/o timeout"),
+        "not found": ("No such container", "No such object", "no such service", "is not running", "executable file not found"),
+    }
+
+    def test_every_sign_of_each_reason_is_named_by_its_word_and_the_list_holds_no_other_sign(self) -> None:
+        for reason, signs in self.SIGNS.items():
+            for sign in signs:
+                with self.subTest(reason=reason, sign=sign):
+                    self.assertIn(f"(reason: {reason})", self.failure(["docker", "ps"], f"docker: {sign}"))
+        self.assertEqual(self.SIGNS, {word: tuple(signs) for word, signs in stale.REASONS})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -201,6 +201,22 @@ class SecretsEncryptionTest(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assertIn(ENCRYPTION_MESSAGE, output)
 
+    def test_the_refusal_shows_fixed_text_and_none_of_the_status_output(self) -> None:
+        """k3s prints paths, key names and error text in its status output. The message never carries it."""
+        leaks = ("/srv/example.invalid/k3s/leaked-path", "leaked-key-name-7", "error loading leaked-token-8")
+        statuses = {
+            "disabled": "Encryption Status: Disabled\n" + "\n".join(leaks) + "\n",
+            "rotating": "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\n" + "\n".join(leaks) + "\n",
+            "hashes differ": "Encryption Status: Enabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: " + " ".join(leaks) + "\n",
+        }
+        for label, status in statuses.items():
+            with self.subTest(label):
+                code, output = encryption_verdict(status)
+                self.assertNotEqual(0, code)
+                self.assertIn(ENCRYPTION_MESSAGE, output)
+                for leaked in leaks:
+                    self.assertNotIn(leaked, output)
+
 
 if __name__ == "__main__":
     unittest.main()

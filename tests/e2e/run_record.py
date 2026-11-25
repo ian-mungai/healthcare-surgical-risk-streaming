@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -16,6 +18,28 @@ RUN_PAYLOAD_CLASS = 3
 PASSED_END = "the result is verified and its work is pushed to hosted CI"
 FAILED_END = "the failure is fixed and the fix is pushed to hosted CI"
 BLOCKED_PREFIX = "blocked: "
+VERDICT_FILES = ("record.json", "retention.json", "record.json.part", "retention.json.part")
+
+
+def proven_absent(path: Path) -> bool:
+    """True only when ``path`` is shown not to be there: its look-up says that the name or a part of its path does not exist. A look-up that fails for any other
+    reason (a folder that cannot be searched, an input or output error) proves nothing, so the path is not called gone. A name that is there is not absent."""
+    try:
+        path.lstat()
+    except FileNotFoundError, NotADirectoryError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def remove_verified(folder: Path, names: tuple[str, ...] = VERDICT_FILES) -> list[str]:
+    """Remove the files ``names`` of ``folder`` and give back every name that is not proven absent afterwards (``proven_absent``): a removal is checked,
+    never assumed, and a check that fails counts as a file that may still be there."""
+    for name in names:
+        with contextlib.suppress(OSError):
+            (folder / name).unlink()
+    return [name for name in names if not proven_absent(folder / name)]
 
 
 @dataclass
@@ -90,22 +114,56 @@ class Record:
         self.write_record(folder)
         return folder
 
+    def invalidate(self, folder: Path) -> None:
+        """Remove the earlier record, label and part files of ``folder`` and check that they are gone, so that no earlier verdict stays beside a rewrite that
+        is stopped. An ``OSError`` is raised when one of them cannot be removed."""
+        left = remove_verified(folder)
+        if left:
+            raise OSError(f"cannot remove {', '.join(left)}")
+
     def write_record(self, folder: Path) -> None:
-        """Write the record and its retention label in ``folder`` as they are now."""
-        (folder / "record.json").write_text(json.dumps(asdict(self), indent=2) + "\n")
+        """Write the retention label and then the record in ``folder`` as they are now. The earlier verdict is removed first (``invalidate``), so that a stop
+        between the two files leaves no earlier pass beside the label. Each file goes through a part file that replaces the file whole, and a part file is
+        removed when its write fails or is interrupted. An ``OSError`` is raised at the first file that cannot be written."""
+        self.invalidate(folder)
         label = {
             "class": RUN_PAYLOAD_CLASS,
             "purpose": self.feature,
             "created": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_condition": PASSED_END if self.outcome == "pass" else FAILED_END,
         }
-        (folder / "retention.json").write_text(json.dumps(label, indent=2) + "\n")
+        for name, document in (("retention.json", label), ("record.json", asdict(self))):
+            staged = folder / f"{name}.part"
+            try:
+                staged.write_text(json.dumps(document, indent=2) + "\n")
+                os.replace(staged, folder / name)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    staged.unlink()
+                raise
 
-    def report(self, folder: Path) -> int:
+    def discard(self, folder: Path, earlier: str = "pass") -> bool:
+        """Remove the record and the label of ``folder``, check that they are gone and say so on the error output; give back whether they are gone. A record
+        that cannot be brought to its final verdict must not stay with an earlier pass: when it cannot be removed either, the message says that it stays."""
+        left = remove_verified(folder)
+        said = (
+            f"{self.slug}: the record cannot be written again after a failed print, so there is no record\n"
+            if not left
+            else f"{self.slug}: the record cannot be written again after a failed print and cannot be removed or checked ({', '.join(left)}): "
+            f"it may still say {earlier}\n"
+        )
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            sys.stderr.write(said)
+        return not left
+
+    def report(self, folder: Path, rewrite: Callable[[Path], None] | None = None) -> int:
         """Print each assertion and the outcome, flushed, and return the exit code.
 
-        A print or flush that fails (stdout closed, broken or None) is itself a failed assertion: the record and its label in ``folder`` are written again and
-        say fail (or keep their blocked reason), so a record never claims a pass that the run could not print.
+        A print or flush that fails (stdout closed, broken or None) is itself a failed assertion. One guarded path then saves the result: ``rewrite`` (this
+        record's ``write_record`` when not given) writes the label and the record again in ``folder`` and says fail (or keeps the blocked reason), so a record
+        never claims a pass that the run could not print. The earlier record and label are removed first and checked, so that no earlier pass stays beside a
+        rewrite that is stopped. When the rewrite fails, the record and the label are removed again, and the removal is checked: when a file
+        cannot be removed, the message on the error output says that it stays and may still say the earlier outcome.
         """
         try:
             if sys.stdout is None:
@@ -115,10 +173,15 @@ class Record:
             sys.stdout.write(f"{self.outcome}: record in {folder.relative_to(ROOT)}\n")
             sys.stdout.flush()
         except (OSError, ValueError) as error:
-            blocked = self.outcome.removeprefix(BLOCKED_PREFIX) if self.outcome.startswith(BLOCKED_PREFIX) else ""
+            earlier = self.outcome
+            blocked = earlier.removeprefix(BLOCKED_PREFIX) if earlier.startswith(BLOCKED_PREFIX) else ""
             self.expect("run", "output", "the result is printed", type(error).__name__, False)
             self.settle(blocked)
-            self.write_record(folder)
+            try:
+                self.invalidate(folder)
+                (rewrite or self.write_record)(folder)
+            except OSError, ValueError:
+                self.discard(folder, earlier)
             return 1
         return 0 if self.outcome == "pass" else 1
 

@@ -10,7 +10,8 @@ Every topic in the list carries events that the platform acknowledges, so every 
 acknowledges it. The single broker has no replica to restore a record that a power loss took from the operating system's cache. Kafka applies the setting
 to each partition.
 
-It reaches the broker through ``docker compose exec`` and the tools that ship in the image. It uses only the standard library and runs on the host's Python.
+It reaches the broker through ``docker compose exec`` and the tools that ship in the image. A failed call shows the tool, its exit code and one fixed
+word (refused, unreachable, not found or failed), never the text of the tool. It uses only the standard library and runs on the host's Python.
 """
 
 from __future__ import annotations
@@ -36,7 +37,12 @@ MANAGED = ("cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes",
 LIST_SETTINGS = ("cleanup.policy",)
 OVERRIDES_HEADER = re.compile(r"Dynamic configs for topic (\S+) are:")
 OVERRIDE_START = re.compile(r"  ([^\s=]+)=")
-ERROR_CHARACTERS = 400
+# One fixed word for the text that a Kafka tool prints on standard error. The text itself can hold a path, an address or a token, so none of it is shown.
+REASONS = (
+    ("refused", ("AuthorizationException", "AuthenticationException", "Authentication failed", "Not authorized")),
+    ("unreachable", ("Timed out waiting for a node assignment", "Connection refused", "Connection to node", "Cannot connect to the Docker daemon")),
+    ("not found", ("doesn't exist", "UnknownTopicOrPartition", "is not running", "no such service", "executable file not found")),
+)
 
 
 class TopicError(RuntimeError):
@@ -239,11 +245,16 @@ class Broker:
         self.run = run
         self.compose_command = compose_command
 
+    @staticmethod
+    def reason(error: str) -> str:
+        """The one word of ``REASONS`` whose text the tool's standard error holds, or ``failed``."""
+        return next((word for word, texts in REASONS if any(text in error for text in texts)), "failed")
+
     def tool(self, tool: str, arguments: list[str]) -> str:
         command = [*self.compose_command, "exec", "-T", SERVICE, f"{TOOLS_FOLDER}/{tool}.sh", "--bootstrap-server", BOOTSTRAP, *arguments]
         code, output, error = self.run(command)
         if code != 0:
-            raise TopicError(f"service {SERVICE}: {tool} exited with {code}: {error.strip()[:ERROR_CHARACTERS]}")
+            raise TopicError(f"service {SERVICE}: {tool} exited with {code} (reason: {self.reason(error)})")
         return output
 
 

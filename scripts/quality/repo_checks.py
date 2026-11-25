@@ -152,6 +152,7 @@ def message_secret_findings(messages: str) -> list[Finding]:
 
 
 def commit_range(revisions: str) -> list[Finding]:
+    """Check every commit that ``git rev-list`` names: ``base..head`` the new commits, and one revision every commit reachable from it."""
     if revisions.startswith("-"):
         raise SystemExit(f"commit-range takes a revision or a range, not an option: {revisions!r}")
     findings = []

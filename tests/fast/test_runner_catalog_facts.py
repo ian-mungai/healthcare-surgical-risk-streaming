@@ -219,13 +219,13 @@ class MergeAndTagFacts(unittest.TestCase):
         module = runner("silver_signals")
         for tag_hash, saved_tag in ((MERGED, True), (WRONG_HASH, False)):
             with self.subTest(tag_hash=tag_hash[:2]):
-                nessie = FakeNessie({"run-sig-x": tag_hash, "again_x_1": BASE}, {}, ["silver.numeric_observations", "silver.waveform_seconds"])
+                nessie = FakeNessie({"run-sig-x": tag_hash, "again_x_1": BASE, "b": HEAD}, {}, ["silver.numeric_observations", "silver.waveform_seconds"])
                 run = module.Run(SimpleNamespace(), nessie, Record(feature="test", slug="test", rerun="none"), {})
                 run.suffix = "x"
                 run.silver = lambda mode, branch, base=None: SimpleNamespace(
                     keep=lambda: SimpleNamespace(ok=False, result={}, reason="the exit code is not the expected one"), code=1, seconds=1.0
                 )
-                run.merge_tag_rebuild({"branch": "b"})
+                run.merge_tag_rebuild({"branch": "b", "branch_hash": HEAD})
                 self.assertEqual(saved_tag, "tag_hash" in run.facts, saved(run.facts))
                 self.assertEqual(saved_tag, "merged_hash" in run.facts)
 
@@ -235,13 +235,13 @@ class MergeAndTagFacts(unittest.TestCase):
         for rebuilt_hash, saved_hash in ((MERGED, True), (WRONG_HASH, False)):
             with self.subTest(rebuilt_hash=rebuilt_hash[:2]):
                 kept = {**document, "base_hash": rebuilt_hash, "write_hash": None, "branch_hash": rebuilt_hash, "checked_hash": MERGED}
-                nessie = FakeNessie({"split_x": MERGED, "p6_trunk_x": MERGED}, {}, [])
+                nessie = FakeNessie({"split_x": MERGED, "p6_trunk_x": MERGED, "b": HEAD}, {}, [])
                 run = module.Run.__new__(module.Run)
                 run.stack, run.nessie = SimpleNamespace(split=lambda mode, branch, base=None, answer=kept, **keywords: (0, answer, "", 5.0)), nessie
                 run.record, run.facts, run.trunk, run.made = Record(feature="test", slug="test", rerun="none"), {}, "p6_trunk_x", []
                 run.suffix = "x"
                 run.name = lambda base: "split_x"
-                run.merge_and_rebuild({"branch": "b", "snapshot_id": document["snapshot_id"]})
+                run.merge_and_rebuild({"branch": "b", "branch_hash": HEAD, "snapshot_id": document["snapshot_id"]})
                 self.assertEqual(saved_hash, "merged_hash" in run.facts, saved(run.facts))
 
 
