@@ -383,39 +383,131 @@ class RemainingTest(unittest.TestCase):
         self.assertIsNone(remaining_seconds(0.0, 10.0**6, LOCAL_LIMITS))
 
 
-SHA_X, SHA_Y, SHA_Z = "a1" * 20, "b2" * 20, "c3" * 20
+SHA_X, SHA_Y, SHA_Z, SHA_V, SHA_C = "a1" * 20, "b2" * 20, "c3" * 20, "f7" * 20, "9a" * 20
+ROOT = Path(__file__).resolve().parents[2]
+DOCKERFILE = (
+    "FROM python:3.12\n"
+    "COPY --from=jre /opt/java/openjdk /opt/java/openjdk\n"
+    "COPY spark/requirements.txt /tmp/requirements.txt\n"
+    "COPY spark /opt/jobs/spark\n"
+    "COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py\n"
+    "# a comment\n"
+    "COPY features/signal_validity.py \\\n    /opt/jobs/features/signal_validity.py\n"
+    "COPY --chown=1:1 casefile /opt/jobs/casefile\n"
+    "WORKDIR /opt/jobs\n"
+)
 TREE = (
     f"100644 blob {SHA_X}\tspark/jobs/x.py\n100644 blob {SHA_Y}\tspark/silver/y.py\n100644 blob {SHA_Z}\tscripts/stack/nessie.py\n"
-    f"100644 blob {'d4' * 20}\tspark/Dockerfile\n100644 blob {'e5' * 20}\tREADME.md\n"
+    f"100644 blob {SHA_V}\tfeatures/signal_validity.py\n100644 blob {SHA_C}\tcasefile/store.py\n100644 blob {'a7' * 20}\tcasefile/data.json\n"
+    f"100644 blob {'d4' * 20}\tspark/Dockerfile\n100644 blob {'e5' * 20}\tREADME.md\n100644 blob {'b8' * 20}\tspark/requirements.txt\n"
 )
-IMAGE_FILES = f"{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n{SHA_Z} scripts/stack/nessie.py\n"
+IMAGE_FILES = (
+    f"{SHA_C} casefile/store.py\n{SHA_V} features/signal_validity.py\n{SHA_Z} scripts/stack/nessie.py\n{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n"
+)
+
+
+def committed(*arguments: str) -> str:
+    """What git says of the commit under test (HEAD of this checkout)."""
+    return run_command("git", ["-C", str(ROOT), *arguments], timeout=60, check=True).stdout
 
 
 class SourceProblemTest(unittest.TestCase):
     def test_an_image_that_holds_exactly_the_committed_files_it_copies_is_the_tested_build(self) -> None:
-        self.assertIsNone(source_problem(IMAGE_FILES, TREE))
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, DOCKERFILE))
 
     def test_an_image_file_that_differs_from_the_committed_file_is_another_build(self) -> None:
         changed = IMAGE_FILES.replace(SHA_Y, "f6" * 20)
-        self.assertEqual("image_source_differs", source_problem(changed, TREE))
+        self.assertEqual("image_source_differs", source_problem(changed, TREE, DOCKERFILE))
 
     def test_an_image_file_that_the_commit_does_not_hold_is_another_build(self) -> None:
-        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n", TREE))
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n", TREE, DOCKERFILE))
+
+    def test_an_image_file_in_a_folder_that_the_dockerfile_copies_only_in_part_is_another_build(self) -> None:
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} features/extra.py\n", TREE, DOCKERFILE))
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} scripts/stack/extra.py\n", TREE, DOCKERFILE))
 
     def test_a_committed_job_file_that_the_image_lacks_is_another_build(self) -> None:
-        self.assertEqual("image_source_missing", source_problem(f"{SHA_X} spark/jobs/x.py\n{SHA_Z} scripts/stack/nessie.py\n", TREE))
+        lacking = IMAGE_FILES.replace(f"{SHA_X} spark/jobs/x.py\n", "")
+        self.assertEqual("image_source_missing", source_problem(lacking, TREE, DOCKERFILE))
 
-    def test_a_committed_file_outside_the_jobs_folder_that_the_image_does_not_copy_is_not_missing(self) -> None:
-        self.assertIsNone(source_problem(IMAGE_FILES, TREE + f"100644 blob {'a9' * 20}\tscripts/other.py\n"))
+    def test_a_committed_file_that_a_single_file_copy_names_and_the_image_lacks_is_another_build(self) -> None:
+        for lost in (f"{SHA_V} features/signal_validity.py\n", f"{SHA_Z} scripts/stack/nessie.py\n"):
+            with self.subTest(lost=lost):
+                self.assertEqual("image_source_missing", source_problem(IMAGE_FILES.replace(lost, ""), TREE, DOCKERFILE))
+
+    def test_a_committed_file_of_a_copied_folder_other_than_spark_that_the_image_lacks_is_another_build(self) -> None:
+        self.assertEqual("image_source_missing", source_problem(IMAGE_FILES.replace(f"{SHA_C} casefile/store.py\n", ""), TREE, DOCKERFILE))
+
+    def test_a_copied_file_whose_content_changed_in_a_folder_other_than_spark_is_another_build(self) -> None:
+        for path in ("casefile/store.py", "features/signal_validity.py", "scripts/stack/nessie.py"):
+            with self.subTest(path=path):
+                changed = "".join(f"{'0f' * 20 if line.endswith(path) else line.split()[0]} {line.split()[1]}\n" for line in IMAGE_FILES.splitlines())
+                self.assertEqual("image_source_differs", source_problem(changed, TREE, DOCKERFILE))
+
+    def test_a_committed_file_that_the_dockerfile_does_not_copy_is_not_missing(self) -> None:
+        extra = TREE + f"100644 blob {'a9' * 20}\tscripts/other.py\n100644 blob {'a8' * 20}\tfeatures/other.py\n"
+        self.assertIsNone(source_problem(IMAGE_FILES, extra, DOCKERFILE))
+
+    def test_a_file_that_is_not_python_is_not_listed_by_the_image_and_is_not_missing(self) -> None:
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, DOCKERFILE))
+        self.assertNotIn("data.json", IMAGE_FILES)
 
     def test_a_listing_with_no_file_is_unreadable_and_never_a_match(self) -> None:
         for listing in ("", "\n", "not a listing line\n", f"{SHA_X}  spark/jobs/x.py\n"):
             with self.subTest(listing=listing):
-                self.assertEqual("image_source_unreadable", source_problem(listing, TREE))
+                self.assertEqual("image_source_unreadable", source_problem(listing, TREE, DOCKERFILE))
 
-    def test_a_tree_without_any_job_file_is_unreadable_and_never_a_match(self) -> None:
-        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, ""))
-        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, f"100644 blob {SHA_Z}\tscripts/stack/nessie.py\n"))
+    def test_a_tree_without_any_file_of_the_dockerfile_is_unreadable_and_never_a_match(self) -> None:
+        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, "", DOCKERFILE))
+        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, f"100644 blob {SHA_Z}\tscripts/stack/nessie.py\n", DOCKERFILE))
+
+    def test_a_dockerfile_that_the_check_cannot_read_is_unreadable_and_never_a_match(self) -> None:
+        cases = {
+            "empty": "",
+            "no copy into the jobs folder": "FROM x\nCOPY spark/requirements.txt /tmp/requirements.txt\n",
+            "a wildcard source": "COPY spark/*.py /opt/jobs/spark/\n",
+            "a JSON form": 'COPY ["spark", "/opt/jobs/spark"]\n',
+            "a relative destination": "WORKDIR /opt/jobs\nCOPY spark spark\n",
+            "a source that the commit does not hold": "COPY features/gone.py /opt/jobs/features/gone.py\n",
+            "a source outside the checkout": "COPY ../secret.py /opt/jobs/secret.py\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, TREE, text))
+
+    def test_a_copy_from_another_stage_and_a_destination_outside_the_jobs_folder_name_no_file_of_the_jobs_folder(self) -> None:
+        both = DOCKERFILE + "COPY --from=build /out/tool.py /opt/jobs/tool.py\nCOPY scripts/stack/nessie.py /tmp/nessie.py\n"
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, both))
+
+    def test_a_destination_with_a_trailing_slash_takes_the_name_of_the_source_file(self) -> None:
+        text = (
+            "COPY spark /opt/jobs/spark\nCOPY features/signal_validity.py /opt/jobs/features/\n"
+            "COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/\nCOPY casefile /opt/jobs/casefile\n"
+        )
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, text))
+
+    def test_a_later_copy_to_the_same_path_decides_which_file_the_image_holds(self) -> None:
+        text = DOCKERFILE + "COPY scripts/stack/nessie.py /opt/jobs/features/signal_validity.py\n"
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES, TREE, text))
+        swapped = IMAGE_FILES.replace(f"{SHA_V} features", f"{SHA_Z} features")
+        self.assertIsNone(source_problem(swapped, TREE, text))
+
+    def test_the_files_of_the_real_dockerfile_are_checked_in_every_folder_it_copies_from(self) -> None:
+        tree = committed("ls-tree", "-r", "HEAD")
+        dockerfile = committed("show", "HEAD:spark/Dockerfile")
+        found = host_mode.image_source_files(dockerfile, tree)
+        self.assertIsNotNone(found)
+        files = found or {}
+        for folder in ("spark/", "features/", "casefile/", "scripts/", "replay/"):
+            self.assertTrue(any(path.startswith(folder) for path in files), folder)
+        self.assertIn("features/signal_validity.py", files)
+        listing = "".join(f"{blob} {path}\n" for path, blob in sorted(files.items()))
+        self.assertIsNone(source_problem(listing, tree, dockerfile))
+        for lost in ("features/signal_validity.py", "scripts/stack/nessie.py", "replay/events/wire.py", "casefile/__init__.py"):
+            with self.subTest(lost=lost):
+                lacking = "".join(f"{blob} {path}\n" for path, blob in sorted(files.items()) if path != lost)
+                self.assertEqual("image_source_missing", source_problem(lacking, tree, dockerfile))
+        self.assertEqual("image_source_differs", source_problem(listing + f"{SHA_X} features/extra.py\n", tree, dockerfile))
 
     def test_the_script_that_the_image_runs_prints_the_git_id_and_the_path_of_each_python_file_under_the_jobs_folder(self) -> None:
         with tempfile.TemporaryDirectory(prefix="host_mode_source_") as folder:
