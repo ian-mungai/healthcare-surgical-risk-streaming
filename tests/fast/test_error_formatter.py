@@ -301,6 +301,11 @@ class LauncherErrorTextTests(unittest.TestCase):
                     return terraform_wrapper.terraform(marked, ["plan"], 5)
 
             cases[label] = call
+        ADVICE = {
+            "terraform failure": "terraform plan failed with exit status 1; its full output is in the run's raw folder as terraform_plan_failure.txt\n",
+            "terraform timeout": "terraform plan timed out after 5 seconds; its partial output is in the run's raw folder as terraform_plan_failure.txt\n",
+            "missing plan": "no saved plan JSON of the run gives the planned heavy_memory_mib: run make host-up again to plan first\n",
+        }
         with tempfile.TemporaryDirectory() as root, mock.patch.object(host, "ROOT", Path(root)):
             cases["missing plan"] = lambda: host.saved_plan(marked.run_id, applied=True)
             for label, raiser in cases.items():
@@ -308,7 +313,7 @@ class LauncherErrorTextTests(unittest.TestCase):
                     code, text = host_stderr(raiser)
                     self.assertEqual(1, code)
                     self.assertNotIn(PLANTED, text)
-                    self.assertNotEqual("WrapperError\n", text, "the fixed advice is still shown")
+                    self.assertEqual(ADVICE[label], text)
 
     def test_a_class_that_is_not_marked_shows_its_type_name_and_nothing_of_a_planted_value(self) -> None:
         for name, raiser in (("WrapperError", refused_planted_limits), ("HostError", bad_state_figure), ("AwsError", failed_aws_call)):

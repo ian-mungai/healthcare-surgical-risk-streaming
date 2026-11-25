@@ -107,8 +107,8 @@ class HostError(RuntimeError):
 
 
 class FixedHostError(HostError, FixedTextError):
-    """A host refusal whose whole text is fixed advice: constants, the host's name, the run's ID and counts, and never a value of the state, a plan, a file or
-    a reply. A command shows it."""
+    """A host refusal whose whole text is fixed advice: constants, the host's name and counts, and never the run's ID or a value of the state, a plan, a
+    file or a reply. A command shows it."""
 
 
 class NoPeerError(FixedHostError):
