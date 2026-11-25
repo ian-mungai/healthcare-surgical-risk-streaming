@@ -7,11 +7,16 @@ a duration): no glob, no ID of Airbyte, no credential and no text of an exceptio
 
 ``start`` refuses, before any job call, a connection whose source selects any other set of files than the fixed sample's (so a dev host that still holds the
 full release's selection copies nothing), a connection whose destination is not the project's bucket under the landing prefix (``destination_differs``) and a
-connection that has an active job (so no second copy runs beside the first). It keeps the job and the connection from its own start answer in a ledger, in the
-state folder, before it returns the job. ``wait`` and ``cancel`` act only on a job of that ledger whose connection Airbyte confirms (``job_not_owned``
-otherwise), so a job that a person or another tool started is never waited for, and never cancelled. ``wait`` ends at its deadline: a job that is still running
-then is cancelled and the cancellation is confirmed, a job whose success is read after the deadline is a ``deadline`` and not a success, and a job that cannot
-be confirmed stopped is named ``job_still_active``. ``cancel-owned`` cancels every job of the ledger that is still active.
+connection that has an active job (so no second copy runs beside the first). It keeps the attempt (the connection and the time) in a ledger, in the state
+folder, before it sends the start, and the job from the start answer beside it before it returns the job. A start whose reply is lost is reconciled by a
+confirmed identity: the connection's latest job that Airbyte created after the attempt time and that the ledger does not hold yet. A start that cannot be
+reconciled is ``start_unconfirmed``, and its attempt stays in the ledger as unresolved: ``cancel-owned`` reconciles it again, counts it in ``unresolved`` while
+it is open and drops it only when no job is found and ``ATTEMPT_SETTLE_SECONDS`` have passed since the attempt (a request that was never answered cannot land
+after that). ``wait`` and ``cancel`` act only on a job of that ledger whose connection Airbyte confirms (``job_not_owned``
+otherwise), so a job that a person or another tool started is never waited for, and never cancelled. ``wait`` ends at its deadline, which starts before its
+ownership reads: a job that is still running then is cancelled and the cancellation is confirmed, a job whose success is read after the deadline is a
+``deadline`` and not a success, and a job that cannot be confirmed stopped is named ``job_still_active``. ``cancel-owned`` cancels every job of the ledger that
+is still active, goes on after a job or an attempt that cannot be looked up (it counts it) and prints ``jobs``, ``still_active`` and ``unresolved``.
 
 ``docker compose exec -T dagster_code_location python -m scripts.ingestion.raw_copy status --bucket B``
 
@@ -25,15 +30,17 @@ import argparse
 import contextlib
 import json
 import os
+import secrets
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
-from scripts.ingestion.airbyte_api import JOB_STATUSES, TERMINAL_STATUSES, AirbyteError, HttpAirbyteApi, fields, job_entry, named, text
+from scripts.ingestion.airbyte_api import JOB_STATUSES, SYNC, TERMINAL_STATUSES, AirbyteError, HttpAirbyteApi, fields, job_entry, named, text
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.connection import CONNECTION_NAME, fixed_sample_selection
 from scripts.ingestion.landing import LANDING_PREFIX
@@ -47,11 +54,12 @@ DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_CONFIRM_SECONDS = 120.0
 STATUS_READ_SECONDS = 30.0
 RECORD_COUNTS = ("rowsSynced", "bytesSynced")
-LEDGER_FORMAT = "raw_copy_jobs_1"
+LEDGER_FORMAT = "raw_copy_jobs_2"
 LEDGER_FILE = "owned_jobs.json"
 LEDGER_FOLDER_DEFAULT = "/opt/dagster/data/raw_copy"
 LEDGER_FOLDER_VARIABLE = "RAW_COPY_STATE_DIR"
 LEDGER_KEEPS = 20
+ATTEMPT_SETTLE_SECONDS = 300.0
 
 
 class RawCopyError(RuntimeError):
@@ -72,10 +80,20 @@ class RawConnection:
     landing_path: str
 
 
-class JobLedger:
-    """The jobs that this tool started, each with the connection of its start answer, kept in a file of the state folder (the latest ``LEDGER_KEEPS``).
+@dataclass(frozen=True, slots=True)
+class Attempt:
+    """A start that was sent and whose job is not yet known: its token, the connection and the time of the attempt (epoch seconds)."""
 
-    A job that is not in the ledger was not started by this tool, so ``wait`` and ``cancel`` refuse it. The file is replaced whole, never edited in place.
+    token: str
+    connection_id: str
+    started: float
+
+
+class JobLedger:
+    """The attempts and the jobs that this tool started, kept in a file of the state folder (the latest ``LEDGER_KEEPS`` jobs and every open attempt).
+
+    An attempt is written before its start is sent and carries no job until the start answer, or a reconciliation, names it. A job that is not in the ledger
+    was not started by this tool, so ``wait`` and ``cancel`` refuse it. The file is replaced whole, never edited in place.
     """
 
     def __init__(self, directory: Path) -> None:
@@ -85,7 +103,7 @@ class JobLedger:
     def path(self) -> Path:
         return self.directory / LEDGER_FILE
 
-    def entries(self) -> list[tuple[int, str]]:
+    def rows(self) -> list[dict[str, Any]]:
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -93,22 +111,52 @@ class JobLedger:
         except OSError, ValueError:
             raise RawCopyError("state_unreadable") from None
         rows = document.get("jobs") if isinstance(document, dict) and document.get("format") == LEDGER_FORMAT else None
-        if type(rows) is not list or any(type(row) is not dict or type(row.get("job")) is not int or type(row.get("connection_id")) is not str for row in rows):
+        if type(rows) is not list or any(not well_formed(row) for row in rows):
             raise RawCopyError("state_unreadable")
-        return [(row["job"], row["connection_id"]) for row in rows]
+        return rows
+
+    def entries(self) -> list[tuple[int, str]]:
+        return [(row["job"], row["connection_id"]) for row in self.rows() if row["job"] is not None]
 
     def jobs(self) -> list[int]:
         return [job for job, _ in self.entries()]
+
+    def attempts(self) -> list[Attempt]:
+        return [Attempt(row["token"], row["connection_id"], row["started"]) for row in self.rows() if row["job"] is None]
 
     def connection_of(self, job: int) -> str | None:
         found = [connection for kept, connection in self.entries() if kept == job]
         return found[-1] if found else None
 
-    def record(self, job: int, connection_id: str) -> None:
+    def save(self, rows: list[dict[str, Any]]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        kept = [entry for entry in self.entries() if entry[0] != job][-(LEDGER_KEEPS - 1) :] + [(job, connection_id)]
-        document = {"format": LEDGER_FORMAT, "jobs": [{"job": number, "connection_id": connection} for number, connection in kept]}
-        replace_owned_file(self.path, json.dumps(document, sort_keys=True) + "\n", state_root=self.directory, mode=0o600)
+        resolved = [row for row in rows if row["job"] is not None][-LEDGER_KEEPS:]
+        kept = [row for row in rows if row["job"] is None or row in resolved]
+        replace_owned_file(self.path, json.dumps({"format": LEDGER_FORMAT, "jobs": kept}, sort_keys=True) + "\n", state_root=self.directory, mode=0o600)
+
+    def begin(self, connection_id: str, started: float) -> str:
+        """Keep an attempt that is about to be sent, and return its token."""
+        token = secrets.token_hex(8)
+        self.save([*self.rows(), {"token": token, "job": None, "connection_id": connection_id, "started": started}])
+        return token
+
+    def resolve(self, token: str, job: int) -> None:
+        """Name the job of an attempt."""
+        self.save([{**row, "job": job} if row["token"] == token else row for row in self.rows()])
+
+    def settle(self, token: str) -> None:
+        """Drop an attempt that is known to have made no job."""
+        self.save([row for row in self.rows() if row["token"] != token])
+
+
+def well_formed(row: object) -> bool:
+    return (
+        type(row) is dict
+        and type(row.get("token")) is str
+        and type(row.get("connection_id")) is str
+        and (row.get("job") is None or type(row.get("job")) is int)
+        and type(row.get("started")) in (int, float)
+    )
 
 
 class RawCopyApi(Protocol):
@@ -117,6 +165,8 @@ class RawCopyApi(Protocol):
     def job_connection(self, job: int, *, timeout: float | None = None) -> str: ...
 
     def running_jobs(self, connection_id: str) -> list[int]: ...
+
+    def jobs_since(self, connection_id: str, since: float, *, timeout: float | None = None) -> list[int]: ...
 
     def start_sync(self, connection_id: str) -> int: ...
 
@@ -164,6 +214,24 @@ class HttpRawCopyApi(HttpAirbyteApi):
     def job_document(self, job: int, *, timeout: float | None = None) -> dict[str, Any]:
         return self.call("GET", f"/jobs/{job}", timeout=timeout)
 
+    def jobs_since(self, connection_id: str, since: float, *, timeout: float | None = None) -> list[int]:
+        """The IDs of the sync jobs of the connection that Airbyte started at or after ``since`` (epoch seconds), by each job's own ``startTime``. Every entry
+        must be a sync job of the connection in the documented shape with a start time as text that names a zone, or the lookup is refused."""
+        what = "GET jobs"
+        found: list[int] = []
+        for entry in self.listing(f"/jobs?connectionId={quote(connection_id, safe='')}&jobType={SYNC}"):
+            job, _ = job_entry(entry, what, connection_id)
+            started = entry.get("startTime")
+            try:
+                moment = datetime.fromisoformat(started) if type(started) is str else None
+            except ValueError:
+                moment = None
+            if moment is None or moment.tzinfo is None:
+                raise AirbyteError(f"{what} gave a job without a start time as text with a zone")
+            if moment.timestamp() >= since:
+                found.append(job)
+        return found
+
 
 def check_selection(connection: RawConnection, wanted: Sequence[str]) -> None:
     """Refuse unless the source selects exactly the wanted files, each once. The order of the globs is not a difference."""
@@ -177,17 +245,43 @@ def check_destination(connection: RawConnection, bucket: str) -> None:
         raise RawCopyError("destination_differs")
 
 
-def start(api: RawCopyApi, wanted: Sequence[str], ledger: JobLedger, bucket: str) -> int:
+def find_attempt_job(api: RawCopyApi, ledger: JobLedger, attempt: Attempt) -> int | None:
+    """The job that the attempt made, by a confirmed identity: the connection's latest job that Airbyte created after the attempt time and that the ledger does
+    not hold yet. None when there is none. A lookup that fails raises ``AirbyteError``: an unreadable list is not an empty one."""
+    known = set(ledger.jobs())
+    found = [job for job in api.jobs_since(attempt.connection_id, attempt.started, timeout=DEFAULT_CONFIRM_SECONDS) if job not in known]
+    return max(found) if found else None
+
+
+def start(api: RawCopyApi, wanted: Sequence[str], ledger: JobLedger, bucket: str, *, now: Callable[[], float] = time.time) -> int:
     """Start one sync of the raw connection and return its job. The selection and the destination are checked first, and no job call is made when either
-    differs. The job and the connection are kept in the ledger before the job is returned; a job that cannot be kept is cancelled at once."""
+    differs. The attempt is kept in the ledger before the start is sent (nothing is sent when it cannot be kept), and the job is kept beside it before the job
+    is returned; a job that cannot be kept is cancelled at once. A start whose reply is lost is reconciled by ``find_attempt_job``; one that cannot be is
+    ``start_unconfirmed`` and its attempt stays in the ledger."""
     connection = api.raw_connection()
     check_selection(connection, wanted)
     check_destination(connection, bucket)
     if api.running_jobs(connection.connection_id):
         raise RawCopyError("job_active")
-    job = api.start_sync(connection.connection_id)
+    started = now()
     try:
-        ledger.record(job, connection.connection_id)
+        attempt = Attempt(ledger.begin(connection.connection_id, started), connection.connection_id, started)
+    except RawCopyError:
+        raise
+    except Exception:
+        raise RawCopyError("state_unwritable") from None
+    try:
+        job = api.start_sync(connection.connection_id)
+    except AirbyteError:
+        try:
+            found = find_attempt_job(api, ledger, attempt)
+        except AirbyteError, RawCopyError:
+            found = None
+        if found is None:
+            raise RawCopyError("start_unconfirmed") from None
+        job = found
+    try:
+        ledger.resolve(attempt.token, job)
     except Exception:
         with contextlib.suppress(AirbyteError):
             api.cancel_job(job, timeout=DEFAULT_CONFIRM_SECONDS)
@@ -261,8 +355,8 @@ def wait(
 ) -> str:
     """The terminal status of the job. At the deadline the job is cancelled and confirmed stopped, and the call raises ``deadline``; a stop that cannot be
     confirmed raises ``job_still_active`` instead. A status that cannot be read is treated as the deadline of that read: the job is cancelled too."""
-    require_owned(api, ledger, job, deadline_seconds)
     ends = clock() + deadline_seconds
+    require_owned(api, ledger, job, deadline_seconds)
     while True:
         status = read_status(api, job, ends - clock())
         late = clock() > ends
@@ -282,19 +376,31 @@ def cancel_owned(
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.time,
 ) -> dict[str, int]:
-    """Cancel each job of the ledger that is still active and count the jobs and those that are still active after the confirmation. A job that has ended is
-    not cancelled."""
+    """Reconcile each open attempt, cancel each job of the ledger that is still active and count the jobs, those that are not confirmed stopped and the
+    attempts that stay unresolved. A job that has ended is not cancelled. A lookup that fails for one attempt or one job is counted and the cleanup goes on
+    with the others, so one failure never leaves another job running."""
+    unresolved = 0
+    for attempt in ledger.attempts():
+        try:
+            job = find_attempt_job(api, ledger, attempt)
+            if job is not None:
+                ledger.resolve(attempt.token, job)
+            elif now() - attempt.started >= ATTEMPT_SETTLE_SECONDS:
+                ledger.settle(attempt.token)
+            else:
+                unresolved += 1
+        except AirbyteError, RawCopyError, OSError:
+            unresolved += 1
     still = 0
     jobs = ledger.jobs()
     for job in jobs:
         try:
             cancel(api, job, ledger, confirm_seconds=confirm_seconds, poll_seconds=poll_seconds, clock=clock, sleep=sleep)
-        except RawCopyError as error:
-            if error.error_code != "job_still_active":
-                raise
+        except RawCopyError:
             still += 1
-    return {"jobs": len(jobs), "still_active": still}
+    return {"jobs": len(jobs), "still_active": still, "unresolved": unresolved}
 
 
 def job_record(api: RawCopyApi, job: int) -> dict[str, Any]:
@@ -363,7 +469,7 @@ def command(arguments: argparse.Namespace, api: RawCopyApi, ledger: JobLedger) -
     if arguments.command == "cancel-owned":
         counts = cancel_owned(api, ledger, confirm_seconds=arguments.confirm_seconds, poll_seconds=arguments.poll_seconds)
         show(counts)
-        return 0 if counts["still_active"] == 0 else 1
+        return 0 if counts["still_active"] == 0 and counts["unresolved"] == 0 else 1
     show(job_record(api, arguments.job))
     return 0
 

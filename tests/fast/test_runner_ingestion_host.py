@@ -14,6 +14,13 @@ Failure modes covered here, each against a stand-in of the host, of Airbyte, of 
   controller refuses before Spark runs), or it is merged.
 - A planted-file case that passes without the exact failed-check refusal and finding, or with a changed manifest inventory.
 - A Dagster run or an Airbyte job that the run started is still running after a failure, or a success that arrives after the deadline passes.
+- A Dagster launch whose reply is lost, or whose run ID is another run's, leaves a run that nothing ends: each attempt is kept before it is sent and tagged with
+  a token of its own, and the cleanup reconciles it by that tag, ends the run it finds and reports an attempt that stays unresolved as a failure. A failed
+  lookup in one step of the cleanup stops no other step.
+- A host script that refuses a run folder, a receipt or a lookup shows content, or a lookup error (a permission error) reads as an absence.
+- The planted Spark case's results folder is not made by this run (exclusively) and is removed anyway, or stays; its check list holds fewer checks than the
+  required ones for a table that is not the laboratory table; its publish refusal holds more than the fixed text.
+- A sampler that is started and fails to be ready is left running.
 - The held-out rule: a table check's counts or values reach the host's answer or the evidence files (only check names and flags may). A receipt with a
   duplicated or a missing check passes, or a run folder with a secret-shaped text, another run's ID or another commit is copied into ``runs/``.
 
@@ -28,6 +35,8 @@ import hashlib
 import importlib
 import io
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +52,7 @@ from scripts.ingestion.connection import fixed_sample_selection
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.manifest import MANIFEST_PREFIX, ManifestRef
 from scripts.ingestion.record_load import RefState
-from scripts.stack.nessie import Reference
+from scripts.stack.nessie import NessieError, Reference
 from tests.e2e.run_record import Record
 from tests.fast.memory_store import MemoryStore
 from tests.fast.record_support import FakeClock
@@ -105,6 +114,16 @@ class World:
         self.puts: list[tuple[str, str]] = []
         self.planted_branches: dict[str, str] = {}
         self.disk_reads = 0
+        self.launch_seen: list[bool] = []
+        self.run_tokens: dict[str, str] = {}
+        self.finished_ids: list[str] = []
+        self.lookup_failures = 0
+        self.unfindable: set[str] = set()
+        self.folders: set[str] = set()
+        self.sampler_stops = 0
+        self.sampler_starts = 0
+        self.sampler_readies = 0
+        self.branch_deleted = False
         self.instance = INSTANCE
         self.commit = COMMIT
 
@@ -175,6 +194,7 @@ class FakeClient:
     def delete_reference(self, name: str, hash_value: str, kind: str | None = None) -> None:
         if "spark_branch_stays" not in self.world.faults and self.world.planted_branches.get(name) == hash_value:
             del self.world.planted_branches[name]
+            self.world.branch_deleted = True
 
 
 class FakeNessie:
@@ -186,6 +206,10 @@ class FakeNessie:
         return self.world.main if name == "main" else BRANCH_HEAD
 
     def reference(self, name: str) -> RefState | None:
+        if "reference_lookup_error" in self.world.faults and name.endswith("_fault"):
+            raise NessieError("the Nessie lookup of the reference did not finish")
+        if "branch_readback_error" in self.world.faults and name.endswith("_fault") and self.world.branch_deleted:
+            raise NessieError("the Nessie lookup of the reference did not finish")
         if name in self.world.planted_branches:
             return RefState("BRANCH", self.world.planted_branches[name])
         hidden = "second_load_hidden_branch" in self.world.faults and name.startswith("load_run_") and name != f"load_{RUN_ID}"
@@ -208,6 +232,8 @@ class FakeNessie:
 
 def build(module: ModuleType, world: World) -> type:
     class FakeHost(module.Host):  # type: ignore[name-defined,misc]
+        context: Any
+
         def __init__(self) -> None:
             self.world = world
             self.port = 3000
@@ -246,12 +272,18 @@ def build(module: ModuleType, world: World) -> type:
         def exists(self, path: str, budget: float = 0) -> bool | None:
             if "exists_unreadable" in world.faults:
                 return None
-            return path in world.files or any(name.startswith(path + "/") for name in world.files)
+            return path in world.files or path in world.folders or any(name.startswith(path + "/") for name in world.files)
 
         def entries(self, path: str, budget: float = 0) -> int | None:
             if "entries_unreadable" in world.faults:
                 return None
             return sum(1 for name in world.files if name.startswith(path + "/"))
+
+        def make_folder(self, path: str, budget: float = 0) -> bool:
+            if self.exists(path) is not False:
+                return False
+            world.folders.add(path)
+            return True
 
         def write_new(self, path: str, text: str, budget: float = 0) -> bool:
             if path in world.files or ("write_refused" in world.faults and path.endswith("_planted.load_record.json")):
@@ -263,7 +295,10 @@ def build(module: ModuleType, world: World) -> type:
             world.calls.append(f"remove {path}")
             if "planted_record_stays" in world.faults and path.endswith("_planted.load_record.json"):
                 return True
+            if "results_dir_stays" in world.faults and tree:
+                return True
             world.removed.append(path)
+            world.folders.discard(path)
             for name in [name for name in world.files if name == path or (tree and name.startswith(path + "/"))]:
                 del world.files[name]
             return True
@@ -302,10 +337,13 @@ def build(module: ModuleType, world: World) -> type:
                 return 0, {"job": job}, ""
             if arguments[0] == "cancel-owned":
                 stuck = "cancel_owned_still_active" in world.faults
-                found = {"jobs": len(world.open_jobs), "still_active": len(world.open_jobs) if stuck else 0}
+                open_attempt = "cancel_owned_unresolved" in world.faults
+                found = {"jobs": len(world.open_jobs), "still_active": len(world.open_jobs) if stuck else 0, "unresolved": 1 if open_attempt else 0}
                 if not stuck:
                     world.open_jobs.clear()
-                return (1 if stuck else 0), found, ""
+                exit_zero = "cancel_owned_unresolved_exit_zero" in world.faults
+                found["unresolved"] = 1 if open_attempt or exit_zero else 0
+                return (1 if stuck or open_attempt else 0), found, ""
             job = int(arguments[arguments.index("--job") + 1]) if "--job" in arguments else 0
             if arguments[0] == "cancel":
                 world.open_jobs.discard(job)
@@ -317,12 +355,25 @@ def build(module: ModuleType, world: World) -> type:
                 return 0, {"job": job, "status": "succeeded"}, ""
             return 0, {"jobId": job, "status": "succeeded", "rowsSynced": 11, "bytesSynced": world.sent.get(job, 5000)}, ""
 
-        def launch(self, job: str, config: dict[str, Any]) -> str:
+        def launch(self, job: str, config: dict[str, Any], token: str) -> str:
+            world.launch_seen.append(token in self.context.launch_attempts)
             run = f"dagster_run_{len(world.runs) + 1}"
             world.runs[run] = (job, config)
+            world.run_tokens[run] = token
+            if "launch_reply_lost" in world.faults and job == "record_load_job":
+                return ""
+            if "launch_reply_lost_unfindable" in world.faults and job == "record_load_job":
+                world.unfindable.add(token)
+                return ""
+            if "launch_reply_lost_once_unfindable" in world.faults and job == "record_load_job":
+                world.lookup_failures = 1
+                return ""
+            if "launch_returns_foreign_run" in world.faults and job == "record_load_job":
+                return "foreign_run_1"
             return run
 
         def finished(self, run_id: str, deadline_seconds: float) -> dict[str, Any] | None:
+            world.finished_ids.append(run_id)
             job, config = world.runs[run_id]
             if job == "record_load_job" and "load_never_ends" in world.faults and not world.branch:
                 return None
@@ -330,7 +381,7 @@ def build(module: ModuleType, world: World) -> type:
             if job == "table_checks_job":
                 path = config["ops"]["table_checks_step"]["config"]["load_record"]
                 if "_planted_spark" in path:
-                    return self.spark_run(path)
+                    return self.spark_run(path, config["ops"]["table_checks_step"]["config"]["results_root"])
                 planted = "_planted" in path
                 if planted and not world.planted_merges:
                     if "planted_moves_main" in world.faults:
@@ -387,8 +438,8 @@ def build(module: ModuleType, world: World) -> type:
                 tags["surgical_risk/records/load_branch"] = f"load_{given}"
             return {"status": "SUCCESS", "tags": [{"key": key, "value": value} for key, value in tags.items()]}
 
-        def spark_run(self, path: str) -> dict[str, Any]:
-            root = f"{module.PLANTED_RESULTS_ROOT}/{world.sha}"
+        def spark_run(self, path: str, results_root: str) -> dict[str, Any]:
+            root = f"{results_root}/{world.sha}"
             if "spark_passes" in world.faults:
                 world.main = HASH_AFTER
                 world.receipts[f"{root}/table_checks.json"] = {
@@ -404,13 +455,12 @@ def build(module: ModuleType, world: World) -> type:
                 failed = [("lab_data", name) for name in REQUIRED["lab_data"][2:]]
                 if "spark_clinical_fails" in world.faults:
                     failed.append(("clinical_data", "columns"))
-                world.receipts[f"{root}/table_checks.json"] = {
-                    "passed": False,
-                    "merged": False,
-                    "merged_hash": "",
-                    "main_hash_before": "",
-                    "tables": good_tables(failed=tuple(failed)),
-                }
+                tables = good_tables(failed=tuple(failed))
+                if "spark_clinical_checks_missing" in world.faults:
+                    tables[0]["checks"] = tables[0]["checks"][:2]
+                if "spark_lab_checks_missing" in world.faults:
+                    tables[1]["checks"] = tables[1]["checks"][:3]
+                world.receipts[f"{root}/table_checks.json"] = {"passed": False, "merged": False, "merged_hash": "", "main_hash_before": "", "tables": tables}
                 world.files[f"{root}/table_checks.json"] = "{}"
                 world.files[f"{root}/job_output.txt"] = "refusal: checks_failed\nexit code: 1\nresult lines: 1\n"
             return {"status": "FAILURE", "tags": []}
@@ -422,7 +472,18 @@ def build(module: ModuleType, world: World) -> type:
             return True
 
         def run_info(self, run_id: str, budget: float = 0) -> dict[str, Any]:
-            return {"status": "SUCCESS" if run_id in world.final else "STARTED", "tags": []}
+            if run_id not in world.runs:
+                return {"status": "STARTED", "jobName": "somebody_elses_job", "tags": []}
+            status = "SUCCESS" if run_id in world.final else "STARTED"
+            return {"status": status, "jobName": world.runs[run_id][0], "tags": [{"key": module.LAUNCH_TAG, "value": world.run_tokens[run_id]}]}
+
+        def runs_with_token(self, token: str, budget: float = 0) -> list[dict[str, Any]] | None:
+            if world.lookup_failures:
+                world.lookup_failures -= 1
+                return None
+            if token in world.unfindable:
+                return None
+            return [{"runId": run, **self.run_info(run)} for run, found in world.run_tokens.items() if found == token]
 
         def checked_folder(self, run_id: str, job: str, commit: str, budget: float = 0) -> dict[str, Any]:
             problems = []
@@ -441,7 +502,8 @@ def build(module: ModuleType, world: World) -> type:
             if planted and "_planted_spark" in world.runs[run_id][1]["ops"]["table_checks_step"]["config"]["load_record"]:
                 document["outputs"] = {"error": "a table check failed and nothing was merged: lab_data: columns"}
             document.update(run_id=run_id, job_name=job, commit=commit)
-            return {"ok": not problems, "problems": problems, "record": None if "secret_shaped_text" in problems else document}
+            leaked = "folder_leaks_record" in world.faults
+            return {"ok": not problems, "problems": problems, "record": document if leaked or not problems else None}
 
     class FakeContext(module.Context):  # type: ignore[name-defined,misc]
         def __init__(self, record: Record, log: list[str], scratch: Path, evidence: Path) -> None:
@@ -456,6 +518,7 @@ def build(module: ModuleType, world: World) -> type:
             self.aws = FakeAws(world)
             self.store = world.store
             self.host = FakeHost()
+            self.host.context = self
             self.nessie = FakeNessie(world)
             self.init_state(record, log, scratch, evidence)
             self.token = TOKEN
@@ -508,6 +571,8 @@ def build(module: ModuleType, world: World) -> type:
                 if not world.checks.get(options["--result"]):
                     if "planted_publish_writes" in world.faults:
                         world.store.put_object(f"{MANIFEST_PREFIX}p4_host_changed/{world.sha}.json", b"a manifest of a planted set")
+                    if "publish_extra_text" in world.faults:
+                        return 1, "the check did not pass\nand a detail that should not be here"
                     return 1, "something else was wrong" if "publish_other_refusal" in world.faults else "the check did not pass"
                 name = json.loads(Path(options["--selection"]).read_text())["name"]
                 key = f"{MANIFEST_PREFIX}{name}/{world.sha}.json"
@@ -540,7 +605,7 @@ class WalkTest(unittest.TestCase):
         self.patches: list[Any] = [
             mock.patch.object(self.module.time, "sleep"),
             mock.patch.object(self.module.Sampler, "start", lambda sampler: self.sampler_start(sampler)),
-            mock.patch.object(self.module.Sampler, "ready", lambda sampler, seconds=0: "sampler_not_ready" not in self.world.faults),
+            mock.patch.object(self.module.Sampler, "ready", lambda sampler, seconds=0: self.sampler_ready()),
             mock.patch.object(self.module.Sampler, "stop", lambda sampler: self.sampler_stop(sampler)),
             mock.patch.object(self.module, "verify_landed", lambda store, reference, selection, pins: tuple(range(11))),
             mock.patch.object(self.module, "tracked_pins", lambda: None),
@@ -550,10 +615,20 @@ class WalkTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def sampler_ready(self) -> bool:
+        self.world.sampler_readies += 1
+        if "sampler_ready_raises" in self.world.faults or ("second_sampler_ready_raises" in self.world.faults and self.world.sampler_readies == 2):
+            raise OSError("the sampler's file could not be read")
+        return "sampler_not_ready" not in self.world.faults
+
     def sampler_start(self, sampler: Any) -> None:
+        self.world.sampler_starts += 1
+        if "sampler_start_raises" in self.world.faults or ("second_sampler_start_raises" in self.world.faults and self.world.sampler_starts == 2):
+            raise OSError("the sampler could not be started")
         covering_samples(sampler.samples, covers="sampler_not_covering" not in self.world.faults)
 
     def sampler_stop(self, sampler: Any) -> int:
+        self.world.sampler_stops += 1
         return 1 if "sampler_dirty_exit" in self.world.faults else 0
 
     def read_sample(self, scratch: Path) -> tuple[dict[str, bytes], dict[str, bytes]]:
@@ -573,12 +648,25 @@ class WalkTest(unittest.TestCase):
         evidence = scratch / "evidence"
         evidence.mkdir()
         context = build(self.module, self.world)(record, log, scratch, evidence)
+        self.last_record = record
         with contextlib.suppress(self.module.Batch):
             self.module.steps(context)
         return record, log, evidence
 
     def failed(self, record: Record) -> list[str]:
         return [f"{item.case} ({item.step})" for item in record.observations if not item.passed]
+
+    def walk_to_the_end(self, *faults: str) -> tuple[Record, Exception | None]:
+        """A walk that keeps the exception that ends it, as ``main`` keeps it, so that the cleanup that ran after it can be read."""
+        self.world = World()
+        self.world.faults = set(faults)
+        raised: Exception | None = None
+        try:
+            record, _, _ = self.walk()
+        except OSError as error:
+            raised = error
+            record = self.last_record
+        return record, raised
 
     def with_faults(self, *faults: str) -> list[str]:
         self.world = World()
@@ -749,6 +837,11 @@ class WalkTest(unittest.TestCase):
             "spark_clinical_fails": "planted failing spark check (fault)",
             "spark_branch_stays": "planted failing spark check (cleanup)",
             "retry_wait_fails": "copy resumed (sync)",
+            "spark_clinical_checks_missing": "planted failing spark check (fault)",
+            "spark_lab_checks_missing": "planted failing spark check (fault)",
+            "publish_extra_text": "planted changed file (fault)",
+            "cancel_owned_unresolved": "cleanup (airbyte jobs)",
+            "cancel_owned_unresolved_exit_zero": "cleanup (airbyte jobs)",
         }
         for fault, assertion in cases.items():
             with self.subTest(fault=fault):
@@ -783,10 +876,34 @@ class WalkTest(unittest.TestCase):
     def test_a_planted_results_folder_that_already_exists_is_refused_and_never_removed(self) -> None:
         self.world.files[f"{self.module.PLANTED_RESULTS_ROOT}/old/table_checks.json"] = "someone's"
         record, _, _ = self.walk()
-        failed = self.failed(record)
-        self.assertIn("planted failed table check (reserve)", failed)
-        self.assertIn("planted failing spark check (reserve)", failed)
+        self.assertIn("planted failed table check (reserve)", self.failed(record))
         self.assertIn(f"{self.module.PLANTED_RESULTS_ROOT}/old/table_checks.json", self.world.files)
+
+    def test_the_spark_case_makes_its_own_results_folder_exclusively_and_removes_it_and_reads_it_gone(self) -> None:
+        root = self.module.planted_results_root(TOKEN)
+        record, _, _ = self.walk()
+        self.assertEqual([], self.failed(record))
+        self.assertIn(f"remove {root}", self.world.calls)
+        self.assertNotIn(root, self.world.folders)
+        self.assertEqual([], [name for name in self.world.files if name.startswith(root)])
+
+    def test_a_results_folder_of_the_spark_case_that_exists_already_is_refused_and_never_removed_even_when_it_is_empty(self) -> None:
+        root = self.module.planted_results_root(TOKEN)
+        for existing in ("folder_with_a_file", "empty_folder"):
+            with self.subTest(existing=existing):
+                self.world = World()
+                if existing == "folder_with_a_file":
+                    self.world.files[f"{root}/old/table_checks.json"] = "someone's"
+                else:
+                    self.world.folders.add(root)
+                record, _, _ = self.walk()
+                failed = self.failed(record)
+                self.assertTrue({"planted failing spark check (reserve)", "planted failing spark check (setup)"} & set(failed), failed)
+                self.assertNotIn(f"remove {root}", self.world.calls)
+                self.assertTrue(root in self.world.folders or f"{root}/old/table_checks.json" in self.world.files)
+
+    def test_a_results_folder_that_stays_after_its_removal_is_a_failed_cleanup_read_back_from_the_host(self) -> None:
+        self.assertIn("planted failing spark check (cleanup)", self.with_faults("results_dir_stays"))
 
     def test_an_absence_is_never_taken_from_a_failed_readback(self) -> None:
         for fault in ("exists_unreadable", "entries_unreadable"):
@@ -826,6 +943,76 @@ class WalkTest(unittest.TestCase):
         names = {item.key.split("/")[1] for item in self.world.store.list_versions(MANIFEST_PREFIX)}
         self.assertEqual({"fixed_sample"}, names)
 
+    def test_each_launch_attempt_is_kept_before_it_is_sent_and_carries_a_token_of_its_own(self) -> None:
+        self.walk()
+        self.assertGreaterEqual(len(self.world.launch_seen), 6)
+        self.assertTrue(all(self.world.launch_seen))
+        tokens = list(self.world.run_tokens.values())
+        self.assertEqual(len(tokens), len(set(tokens)))
+        self.assertTrue(all(token.startswith(f"{TOKEN}-") for token in tokens))
+
+    def test_a_launch_whose_reply_was_lost_is_reconciled_by_its_token_and_the_run_goes_on(self) -> None:
+        record, _ = self.walk_to_the_end("launch_reply_lost")
+        self.assertEqual([], self.failed(record))
+        self.assertIn("dagster_run_1", self.world.finished_ids)
+
+    def test_a_launch_that_was_lost_and_cannot_be_found_is_a_failed_cleanup_and_never_a_silent_pass(self) -> None:
+        with mock.patch.object(self.module, "LAUNCH_SETTLE_SECONDS", 0.05), mock.patch.object(self.module, "CLEANUP_RUN_SECONDS", 0.3):
+            record, _ = self.walk_to_the_end("launch_reply_lost_unfindable")
+        self.assertIn("record load (run)", self.failed(record))
+        self.assertIn("cleanup (dagster launches)", self.failed(record))
+
+    def test_a_launch_that_cannot_be_looked_up_at_first_is_found_and_ended_by_the_cleanup(self) -> None:
+        record, _ = self.walk_to_the_end("launch_reply_lost_once_unfindable")
+        failed = self.failed(record)
+        self.assertIn("record load (run)", failed)
+        self.assertNotIn("cleanup (dagster launches)", failed)
+        self.assertIn("dagster_run_1", self.world.terminated)
+
+    def test_a_run_id_that_is_not_the_launched_run_is_never_waited_for_or_terminated_and_the_real_run_is_found_by_its_token(self) -> None:
+        record, _ = self.walk_to_the_end("launch_returns_foreign_run")
+        self.assertEqual([], self.failed(record))
+        self.assertNotIn("foreign_run_1", self.world.finished_ids)
+        self.assertNotIn("foreign_run_1", self.world.terminated)
+        self.assertIn("dagster_run_1", self.world.finished_ids)
+
+    def test_the_airbyte_cleanup_runs_even_when_the_dagster_cleanup_stops(self) -> None:
+        with mock.patch.object(self.module, "reconcile_launches", side_effect=OSError("ssh broke")):
+            _, raised = self.walk_to_the_end("retry_wait_fails")
+        self.assertIsInstance(raised, OSError)
+        self.assertIn("raw_copy cancel-owned", self.world.calls)
+
+    def test_an_airbyte_attempt_that_stays_unresolved_is_a_failed_cleanup(self) -> None:
+        self.assertIn("cleanup (airbyte jobs)", self.with_faults("cancel_owned_unresolved"))
+
+    def test_a_run_folder_is_saved_only_on_a_passing_host_verdict_even_if_the_host_sent_a_record(self) -> None:
+        self.world.faults = {"folder_other_commit", "folder_leaks_record"}
+        record, _, evidence = self.walk()
+        self.assertIn("run folders (saved)", self.failed(record))
+        self.assertEqual([], sorted(evidence.glob("dagster_run_folder_*")))
+
+    def test_the_error_of_a_run_is_read_only_from_a_run_folder_that_the_host_passed(self) -> None:
+        self.world.faults = {"folder_other_run", "folder_leaks_record"}
+        record, _, _ = self.walk()
+        self.assertIn("planted failed table check (fault)", self.failed(record))
+
+    def test_a_reference_lookup_that_fails_is_unreadable_and_nothing_is_planted(self) -> None:
+        failed = self.with_faults("reference_lookup_error")
+        self.assertIn("planted failing spark check (reserve)", failed)
+        self.assertEqual({}, self.world.planted_branches)
+
+    def test_a_branch_readback_that_fails_is_a_failed_cleanup_and_does_not_stop_the_run(self) -> None:
+        failed = self.with_faults("branch_readback_error")
+        self.assertIn("planted failing spark check (cleanup)", failed)
+        self.assertNotIn("table checks (run)", failed)
+
+    def test_a_sampler_that_fails_to_start_or_to_be_ready_is_stopped(self) -> None:
+        for fault, stops in (("sampler_start_raises", 1), ("sampler_ready_raises", 1), ("second_sampler_start_raises", 2), ("second_sampler_ready_raises", 2)):
+            with self.subTest(fault=fault):
+                _, raised = self.walk_to_the_end(fault)
+                self.assertIsInstance(raised, OSError)
+                self.assertEqual(stops, self.world.sampler_stops)
+
     def test_the_planted_branch_holds_the_clinical_table_as_the_laboratory_table_and_the_record_names_that_snapshot(self) -> None:
         self.walk()
         (operation,) = self.world.planted_ops  # type: ignore[attr-defined]
@@ -857,21 +1044,38 @@ class HostCallsTest(unittest.TestCase):
     def test_a_job_is_launched_with_its_own_name_its_configuration_and_the_run_id_of_the_answer_is_returned(self) -> None:
         body = json.dumps({"data": {"launchRun": {"__typename": "LaunchRunSuccess", "run": {"runId": "abc"}}}})
         with self.answer(0, f"200\n{body}"):
-            run_id = self.host.launch("table_checks_job", {"ops": {"x": 1}})
+            run_id = self.host.launch("table_checks_job", {"ops": {"x": 1}}, "abcd1234-7")
         self.assertEqual("abc", run_id)
         variables = json.loads(self.sent[0][1] or "{}")["variables"]["params"]
+        self.assertEqual({"tags": [{"key": "p4_host_token", "value": "abcd1234-7"}]}, variables["executionMetadata"])
         self.assertEqual({"repositoryLocationName": "surgical_risk", "repositoryName": "__repository__", "jobName": "table_checks_job"}, variables["selector"])
         self.assertEqual({"ops": {"x": 1}}, variables["runConfigData"])
         self.assertIn("3000", self.sent[0][0])
 
     def test_a_refused_launch_gives_no_run_id(self) -> None:
         with self.answer(0, '200\n{"data": {"launchRun": {"__typename": "RunConfigValidationInvalid"}}}'):
-            self.assertEqual("", self.host.launch("table_checks_job", {}))
+            self.assertEqual("", self.host.launch("table_checks_job", {}, "t-1"))
 
     def test_an_answer_that_is_not_json_or_not_200_is_an_error_and_never_a_run(self) -> None:
         for code, out in ((0, "200\nnot json"), (0, "500\n{}"), (255, "")):
             with self.subTest(out=out), self.answer(code, out):
-                self.assertEqual("", self.host.launch("table_checks_job", {}))
+                self.assertEqual("", self.host.launch("table_checks_job", {}, "t-1"))
+
+    def test_the_runs_of_a_token_are_looked_up_by_the_tag_and_a_failed_lookup_is_none_and_never_an_empty_list(self) -> None:
+        found = {
+            "__typename": "Runs",
+            "results": [{"runId": "abc", "status": "STARTED", "jobName": "record_load_job", "tags": [{"key": "p4_host_token", "value": "t-1"}]}],
+        }
+        with self.answer(0, "200\n" + json.dumps({"data": {"runsOrError": found}})):
+            runs = self.host.runs_with_token("t-1")
+        self.assertEqual(["abc"], [run["runId"] for run in runs or []])
+        sent = json.loads(self.sent[0][1] or "{}")
+        self.assertEqual({"filter": {"tags": [{"key": "p4_host_token", "value": "t-1"}]}}, sent["variables"])
+        with self.answer(0, "200\n" + json.dumps({"data": {"runsOrError": {"__typename": "Runs", "results": []}}})):
+            self.assertEqual([], self.host.runs_with_token("t-1"))
+        for code, out in ((0, "200\n" + json.dumps({"data": {"runsOrError": {"__typename": "PythonError", "message": "x"}}})), (0, "500\n{}"), (255, "")):
+            with self.subTest(out=out[:30]), self.answer(code, out):
+                self.assertIsNone(self.host.runs_with_token("t-1"))
 
     def test_a_command_of_the_container_that_prints_no_json_gives_an_empty_answer_and_its_error_text(self) -> None:
         def in_code(args: list[str], **options: Any) -> tuple[int, str, str]:
@@ -1077,6 +1281,93 @@ class HostScriptsTest(unittest.TestCase):
         (other / "record.json").write_text("{}")
         self.assertIn("no_folder", self.folder_verdict()["problems"])
 
+    def test_a_refused_run_folder_shows_only_fixed_problem_words_and_none_of_its_content(self) -> None:
+        marker = "marker_outputs_text_9f2c"
+        for changes, job in (
+            ({"run_id": "99999999-2222-3333-4444-555555555555"}, "record_load_job"),
+            ({"commit": "2" * 40}, "record_load_job"),
+            ({}, "table_checks_job"),
+        ):
+            with self.subTest(changes=changes, job=job):
+                for entry in self.folder.iterdir():
+                    shutil.rmtree(entry)
+                self.make_folder(self.RUN, outputs={"error": marker}, **changes)
+                with mock.patch.object(self.module, "RUNS_ON_HOST", str(self.folder)):
+                    code, out, _ = self.host.in_code(
+                        ["python", "-c", self.module.FOLDER_SCRIPT, str(self.folder), self.RUN, job, COMMIT, ",".join(sorted(self.module.REQUIRED_FIELDS))]
+                    )
+                self.assertEqual(0, code)
+                answer = json.loads(out)
+                self.assertFalse(answer["ok"])
+                self.assertIsNone(answer["record"])
+                self.assertNotIn(marker, out)
+                self.assertTrue(all(re.fullmatch(r"[a-z_]+", word) for word in answer["problems"]))
+        for entry in self.folder.iterdir():
+            shutil.rmtree(entry)
+        document = {name: "x" for name in self.module.REQUIRED_FIELDS} | {
+            "run_id": self.RUN,
+            "job_name": "record_load_job",
+            "commit": COMMIT,
+            "outputs": {"error": marker},
+        }
+        document.pop("limits")
+        self.make_folder(self.RUN, outputs={"error": marker})
+        next(self.folder.glob("*/record.json")).write_text(json.dumps(document))
+        verdict = self.folder_verdict()
+        self.assertIn("fields_missing", verdict["problems"])
+        self.assertIsNone(verdict["record"])
+
+    def test_a_receipt_with_a_table_or_a_check_name_that_the_required_checks_do_not_hold_is_refused_on_the_host(self) -> None:
+        def receipt(table: str, check: str) -> str:
+            return json.dumps({"passed": True, "merged": True, "checked": {"tables": [{"table": table, "checks": [{"name": check, "passed": True}]}]}})
+
+        for table, check in (
+            ("clinical_data", "six thousand ninety"),
+            ("clinical_data", "rows digest"),
+            ("another_table", "columns"),
+            ("track list", "columns"),
+        ):
+            with self.subTest(table=table, check=check):
+                path = self.folder / "unknown.json"
+                path.write_text(receipt(table, check))
+                self.assertIsNone(self.host.receipt_flags(str(path)))
+        path = self.folder / "known.json"
+        path.write_text(receipt("track_list", "rows digest"))
+        self.assertEqual("rows digest", self.host.receipt_flags(str(path))["tables"][0]["checks"][0]["name"])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads every folder")
+    def test_a_permission_error_or_a_path_under_a_file_is_unreadable_and_never_absent(self) -> None:
+        (self.folder / "locked").mkdir()
+        (self.folder / "locked" / "child").write_text("x")
+        (self.folder / "locked" / "folder").mkdir()
+        (self.folder / "file").write_text("x")
+        (self.folder / "locked").chmod(0)
+        self.addCleanup((self.folder / "locked").chmod, 0o700)
+        for path in (self.folder / "locked" / "child", self.folder / "locked" / "folder", self.folder / "file" / "child"):
+            with self.subTest(path=path.name):
+                self.assertIsNone(self.host.exists(str(path)))
+                self.assertIsNone(self.host.entries(str(path)))
+                self.assertFalse(self.host.remove(str(path), tree=True))
+        self.assertIs(False, self.host.exists(str(self.folder / "missing")))
+        self.assertEqual(0, self.host.entries(str(self.folder / "missing")))
+
+    def test_a_folder_is_made_exclusively_and_one_that_exists_in_any_form_is_refused(self) -> None:
+        path = self.folder / "made"
+        self.assertTrue(self.host.make_folder(str(path)))
+        self.assertTrue(path.is_dir())
+        (path / "mine").write_text("x")
+        self.assertFalse(self.host.make_folder(str(path)))
+        self.assertEqual("x", (path / "mine").read_text())
+        (self.folder / "file").write_text("x")
+        self.assertFalse(self.host.make_folder(str(self.folder / "file")))
+        self.assertFalse(self.host.make_folder(str(self.folder / "no" / "parent")))
+
+    def test_a_tree_removal_refuses_what_is_not_a_folder_and_reads_a_missing_one_as_done(self) -> None:
+        (self.folder / "file").write_text("x")
+        self.assertFalse(self.host.remove(str(self.folder / "file"), tree=True))
+        self.assertTrue((self.folder / "file").exists())
+        self.assertTrue(self.host.remove(str(self.folder / "missing"), tree=True))
+
     def test_a_readback_of_a_path_gives_present_absent_or_unknown_and_never_absent_for_a_failure(self) -> None:
         present = self.folder / "a"
         present.write_text("x")
@@ -1156,6 +1447,36 @@ class PureTest(unittest.TestCase):
         ):
             with self.subTest(text=text[:40]):
                 self.assertFalse(self.module.exact_refusal(text, [(key, "checksum_differs")], 2))
+
+    def test_the_lab_fault_is_exact_only_for_the_full_check_list_of_every_table_with_only_laboratory_checks_failing(self) -> None:
+        fault = good_tables(failed=tuple(("lab_data", name) for name in REQUIRED["lab_data"][2:]))
+        self.assertEqual((True, []), self.module.exact_lab_fault(fault))
+        empty_clinical = good_tables(failed=tuple(("lab_data", name) for name in REQUIRED["lab_data"][2:]))
+        empty_clinical[0]["checks"] = []
+        short_track = good_tables(failed=(("lab_data", "columns"),))
+        short_track[2]["checks"] = short_track[2]["checks"][:1]
+        short_lab = good_tables(failed=(("lab_data", "columns"),))
+        short_lab[1]["checks"] = short_lab[1]["checks"][:3]
+        for name, tables in (
+            ("nothing failed", good_tables()),
+            ("a clinical check failed", good_tables(failed=(("lab_data", "columns"), ("clinical_data", "row count")))),
+            ("a track list check failed", good_tables(failed=(("lab_data", "columns"), ("track_list", "snapshot")))),
+            ("the columns check passed", good_tables(failed=(("lab_data", "row count"),))),
+            ("clinical checks absent", empty_clinical),
+            ("track checks cut short", short_track),
+            ("laboratory checks cut short", short_lab),
+            ("a table missing", good_tables(failed=(("lab_data", "columns"),))[1:]),
+            ("no tables", []),
+        ):
+            with self.subTest(name):
+                self.assertFalse(self.module.exact_lab_fault(tables)[0])
+
+    def test_the_publish_refusal_is_exact_only_for_the_fixed_text_alone(self) -> None:
+        self.assertTrue(self.module.exact_publish_refusal("the check did not pass\n"))
+        self.assertTrue(self.module.exact_publish_refusal("the check did not pass"))
+        for text in ("", "the check did not pass\nand a detail", "before: the check did not pass", "the check did not pass again", "something else"):
+            with self.subTest(text=text):
+                self.assertFalse(self.module.exact_publish_refusal(text))
 
     def test_the_check_set_is_exact_only_for_every_table_in_order_with_its_required_checks_once_each_and_all_passed(self) -> None:
         ok, problems = self.module.exact_check_set(good_tables())

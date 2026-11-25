@@ -212,7 +212,7 @@ OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "The staging folder of the load, made by stage_verified_files; the name is the fixed PLAN_FILE",
     ),
-    ("scripts/ingestion/raw_copy.py", "JobLedger.record", "self.directory"): (
+    ("scripts/ingestion/raw_copy.py", "JobLedger.save", "self.directory"): (
         1,
         "The ledger's state folder (RAW_COPY_STATE_DIR or the fixed LEDGER_FOLDER_DEFAULT), made in this call; the name is the fixed LEDGER_FILE",
     ),

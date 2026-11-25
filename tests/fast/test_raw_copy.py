@@ -11,6 +11,10 @@ Failure modes covered here, each against a stand-in of Airbyte's API (the real A
 - A job that passes its deadline is left running, or a job whose cancellation is not confirmed is reported as stopped.
 - The job record shows more than the closed set of facts, or a field of another type passes for a count.
 - A command writes a glob, an ID of Airbyte, a credential or the text of an exception.
+- A start whose reply is lost leaves a job that nothing owns: the attempt is kept in the ledger before it is sent, a lost reply is reconciled by the
+  connection's own job created after the attempt, and an attempt that cannot be resolved is reported by the cleanup as a failure.
+- A failed lookup of one attempt or one job stops the cleanup of the others.
+- A wait whose ownership reads are slow gets more than its deadline.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import json
 import tempfile
 import unittest
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -44,6 +49,11 @@ def ledger_in(test: unittest.TestCase) -> JobLedger:
     return JobLedger(Path(folder.name))
 
 
+def keep(ledger: JobLedger, job: int, connection: str = CONNECTION) -> None:
+    """A job that the ledger holds, as a start leaves it: its attempt was kept and then named the job."""
+    ledger.resolve(ledger.begin(connection, 0.0), job)
+
+
 class StandIn:
     """Airbyte's job calls for one connection, with a switch for each fault."""
 
@@ -60,10 +70,21 @@ class StandIn:
         self.started = 0
         self.cancel_stops = True
         self.status_error = False
+        self.created: list[tuple[int, float]] = []
+        self.lost_reply = False
+        self.never_arrives = False
+        self.lookup_error = False
+        self.created_at = 0.0
+        self.ledger: JobLedger | None = None
+        self.attempts_at_send: list[Any] | None = None
+        self.unreadable_jobs: set[int] = set()
+        self.ownership_takes = 0.0
         self.document: dict[str, Any] = {"jobId": 7, "status": "succeeded", "rowsSynced": 11, "bytesSynced": 123456, "connectionId": CONNECTION}
 
     def raw_connection(self) -> RawConnection:
         self.log.append("raw_connection")
+        if self.clock is not None:
+            self.clock.now += self.ownership_takes
         return RawConnection(CONNECTION, self.globs, self.bucket, self.path)
 
     def running_jobs(self, connection_id: str) -> list[int]:
@@ -73,10 +94,26 @@ class StandIn:
     def start_sync(self, connection_id: str) -> int:
         self.log.append(f"start_sync {connection_id}")
         self.started += 1
+        if self.ledger is not None:
+            self.attempts_at_send = self.ledger.attempts()
+        if not self.never_arrives:
+            self.created.append((7, self.created_at))
+        if self.lost_reply:
+            raise AirbyteError("POST jobs did not finish within its deadline")
         return 7
+
+    def jobs_since(self, connection_id: str, since: float, *, timeout: float | None = None) -> list[int]:
+        self.log.append(f"jobs_since {connection_id}")
+        if self.lookup_error:
+            raise AirbyteError("GET jobs did not finish within its deadline")
+        return [job for job, at in self.created if at >= since]
 
     def job_connection(self, job: int, *, timeout: float | None = None) -> str:
         self.log.append(f"job_connection {job}")
+        if self.clock is not None:
+            self.clock.now += self.ownership_takes
+        if job in self.unreadable_jobs:
+            raise AirbyteError(f"GET jobs/{job} did not finish within its deadline")
         return self.job_connection_id
 
     def job_status(self, job: int, *, timeout: float | None = None) -> str:
@@ -99,8 +136,12 @@ class StandIn:
 
 
 class StartTest(unittest.TestCase):
-    def start(self, api: StandIn, ledger: JobLedger | None = None) -> int:
-        return start(api, WANTED, ledger or ledger_in(self), BUCKET)
+    def start(self, api: StandIn, ledger: JobLedger | None = None, *, at: float = 100.0) -> int:
+        clock = FakeClock()
+        clock.now = at
+        self.ledger = ledger or ledger_in(self)
+        api.ledger = self.ledger
+        return start(api, WANTED, self.ledger, BUCKET, now=clock.time)
 
     def test_a_connection_that_selects_exactly_the_fixed_sample_starts_one_sync_and_returns_its_job(self) -> None:
         api = StandIn()
@@ -114,10 +155,65 @@ class StartTest(unittest.TestCase):
         self.assertEqual([7], ledger.jobs())
         self.assertIsNone(ledger.connection_of(8))
 
+    def test_the_attempt_is_kept_in_the_ledger_before_the_start_is_sent_and_is_resolved_to_the_job_after_it(self) -> None:
+        api = StandIn()
+        self.assertEqual(7, self.start(api))
+        (seen,) = api.attempts_at_send or []
+        self.assertEqual((CONNECTION, 100.0), (seen.connection_id, seen.started))
+        self.assertEqual([], self.ledger.attempts())
+        self.assertEqual([7], self.ledger.jobs())
+
+    def test_an_attempt_that_cannot_be_kept_sends_nothing(self) -> None:
+        api = StandIn()
+        ledger = ledger_in(self)
+        with mock.patch.object(ledger, "begin", side_effect=OSError("disk full")), self.assertRaises(RawCopyError) as caught:
+            self.start(api, ledger)
+        self.assertEqual("state_unwritable", caught.exception.error_code)
+        self.assertEqual(0, api.started)
+        self.assertNotIn(f"start_sync {CONNECTION}", api.log)
+
+    def test_a_lost_reply_is_reconciled_by_the_connection_s_job_created_after_the_attempt(self) -> None:
+        api = StandIn()
+        api.lost_reply, api.created_at = True, 101.0
+        self.assertEqual(7, self.start(api))
+        self.assertEqual(CONNECTION, self.ledger.connection_of(7))
+        self.assertEqual([], self.ledger.attempts())
+
+    def test_the_latest_job_after_the_attempt_is_the_one_a_lost_reply_names(self) -> None:
+        api = StandIn()
+        api.lost_reply, api.created_at = True, 101.0
+        api.created.append((9, 102.0))
+        self.assertEqual(9, self.start(api))
+        self.assertEqual([9], self.ledger.jobs())
+
+    def test_a_job_made_before_the_attempt_or_already_in_the_ledger_is_never_taken_for_a_lost_reply(self) -> None:
+        for earlier, known in (((5, 50.0), False), ((8, 150.0), True)):
+            with self.subTest(earlier=earlier):
+                api = StandIn()
+                api.lost_reply, api.never_arrives = True, True
+                api.created.append(earlier)
+                ledger = ledger_in(self)
+                if known:
+                    keep(ledger, earlier[0], CONNECTION)
+                with self.assertRaises(RawCopyError) as caught:
+                    self.start(api, ledger)
+                self.assertEqual("start_unconfirmed", caught.exception.error_code)
+                self.assertEqual(1, len(ledger.attempts()))
+                self.assertEqual([earlier[0]] if known else [], ledger.jobs())
+
+    def test_a_lost_reply_whose_lookup_also_fails_leaves_the_attempt_in_the_ledger_and_is_refused(self) -> None:
+        api = StandIn()
+        api.lost_reply, api.lookup_error = True, True
+        with self.assertRaises(RawCopyError) as caught:
+            self.start(api)
+        self.assertEqual("start_unconfirmed", caught.exception.error_code)
+        self.assertEqual([CONNECTION], [attempt.connection_id for attempt in self.ledger.attempts()])
+        self.assertEqual([], self.ledger.jobs())
+
     def test_a_job_that_cannot_be_kept_is_cancelled_at_once_and_the_start_is_refused(self) -> None:
         api = StandIn()
         ledger = ledger_in(self)
-        with mock.patch.object(ledger, "record", side_effect=OSError("disk full")), self.assertRaises(RawCopyError) as caught:
+        with mock.patch.object(ledger, "resolve", side_effect=OSError("disk full")), self.assertRaises(RawCopyError) as caught:
             self.start(api, ledger)
         self.assertEqual("state_unwritable", caught.exception.error_code)
         self.assertIn("cancel_job 7", api.log)
@@ -171,7 +267,7 @@ class WaitTest(unittest.TestCase):
         clock = clock or FakeClock()
         ledger = ledger_in(self)
         if owned:
-            ledger.record(7, CONNECTION)
+            keep(ledger, 7, CONNECTION)
         return wait(api, 7, ledger, deadline_seconds=deadline, poll_seconds=5.0, cancel_confirm_seconds=30.0, clock=clock.time, sleep=clock.sleep), clock
 
     def test_a_job_that_ends_in_time_gives_its_terminal_status_and_is_not_cancelled(self) -> None:
@@ -219,6 +315,15 @@ class WaitTest(unittest.TestCase):
         self.assertEqual("job_still_active", caught.exception.error_code)
         self.assertIn("cancel_job 7", api.log)
 
+    def test_the_deadline_starts_before_the_ownership_reads_so_slow_reads_cannot_stretch_it(self) -> None:
+        clock = FakeClock()
+        api = StandIn()
+        api.clock, api.ownership_takes = clock, 15.0
+        api.statuses[7] = ["succeeded"]
+        with self.assertRaises(RawCopyError) as caught:
+            self.wait(api, deadline=20.0, clock=clock)
+        self.assertEqual("deadline", caught.exception.error_code)
+
     def test_a_job_that_this_tool_did_not_start_is_never_waited_for_or_cancelled(self) -> None:
         api = StandIn()
         with self.assertRaises(RawCopyError) as caught:
@@ -232,7 +337,7 @@ class CancelTest(unittest.TestCase):
         clock = FakeClock()
         if ledger is None:
             ledger = ledger_in(self)
-            ledger.record(7, CONNECTION)
+            keep(ledger, 7, CONNECTION)
         return cancel(api, 7, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
 
     def test_a_running_job_is_cancelled_and_its_terminal_status_is_returned(self) -> None:
@@ -271,7 +376,7 @@ class CancelTest(unittest.TestCase):
     def test_a_job_that_the_ledger_ties_to_another_connection_is_refused(self) -> None:
         api = StandIn()
         ledger = ledger_in(self)
-        ledger.record(7, "connection_2")
+        keep(ledger, 7, "connection_2")
         with self.assertRaises(RawCopyError) as caught:
             self.cancel(api, ledger)
         self.assertEqual("job_not_owned", caught.exception.error_code)
@@ -284,11 +389,11 @@ class CancelOwnedTest(unittest.TestCase):
         api.statuses[7] = ["running"]
         api.statuses[8] = ["succeeded"]
         ledger = ledger_in(self)
-        ledger.record(7, CONNECTION)
-        ledger.record(8, CONNECTION)
+        keep(ledger, 7, CONNECTION)
+        keep(ledger, 8, CONNECTION)
         clock = FakeClock()
         found = cancel_owned(api, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
-        self.assertEqual({"jobs": 2, "still_active": 0}, found)
+        self.assertEqual({"jobs": 2, "still_active": 0, "unresolved": 0}, found)
         self.assertIn("cancel_job 7", api.log)
         self.assertNotIn("cancel_job 8", api.log)
 
@@ -296,20 +401,79 @@ class CancelOwnedTest(unittest.TestCase):
         api = StandIn()
         api.cancel_stops = False
         ledger = ledger_in(self)
-        ledger.record(7, CONNECTION)
+        keep(ledger, 7, CONNECTION)
         clock = FakeClock()
         found = cancel_owned(api, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep)
-        self.assertEqual({"jobs": 1, "still_active": 1}, found)
+        self.assertEqual({"jobs": 1, "still_active": 1, "unresolved": 0}, found)
 
     def test_an_empty_ledger_cancels_nothing(self) -> None:
         api = StandIn()
-        self.assertEqual({"jobs": 0, "still_active": 0}, cancel_owned(api, ledger_in(self)))
+        self.assertEqual({"jobs": 0, "still_active": 0, "unresolved": 0}, cancel_owned(api, ledger_in(self)))
         self.assertEqual([], api.log)
+
+    def cleanup(self, api: StandIn, ledger: JobLedger, *, now: float = 100.0) -> dict[str, int]:
+        clock, wall = FakeClock(), FakeClock()
+        wall.now = now
+        return cancel_owned(api, ledger, confirm_seconds=30.0, poll_seconds=5.0, clock=clock.time, sleep=clock.sleep, now=wall.time)
+
+    def test_an_attempt_whose_reply_was_lost_is_reconciled_to_its_job_and_the_job_is_cancelled(self) -> None:
+        api = StandIn()
+        api.created.append((7, 101.0))
+        ledger = ledger_in(self)
+        ledger.begin(CONNECTION, 100.0)
+        self.assertEqual({"jobs": 1, "still_active": 0, "unresolved": 0}, self.cleanup(api, ledger))
+        self.assertIn("cancel_job 7", api.log)
+        self.assertEqual(([], [7]), (ledger.attempts(), ledger.jobs()))
+
+    def test_an_attempt_with_no_job_is_unresolved_until_it_has_settled_and_then_it_is_dropped(self) -> None:
+        api = StandIn()
+        ledger = ledger_in(self)
+        ledger.begin(CONNECTION, 100.0)
+        self.assertEqual({"jobs": 0, "still_active": 0, "unresolved": 1}, self.cleanup(api, ledger, now=110.0))
+        self.assertEqual(1, len(ledger.attempts()))
+        self.assertEqual({"jobs": 0, "still_active": 0, "unresolved": 0}, self.cleanup(api, ledger, now=100.0 + raw_copy.ATTEMPT_SETTLE_SECONDS))
+        self.assertEqual([], ledger.attempts())
+
+    def test_a_failed_lookup_of_one_attempt_is_counted_and_the_jobs_are_still_cancelled(self) -> None:
+        api = StandIn()
+        api.lookup_error = True
+        ledger = ledger_in(self)
+        ledger.begin(CONNECTION, 100.0)
+        keep(ledger, 7, CONNECTION)
+        self.assertEqual({"jobs": 1, "still_active": 0, "unresolved": 1}, self.cleanup(api, ledger))
+        self.assertIn("cancel_job 7", api.log)
+
+    def test_a_job_whose_ownership_cannot_be_read_is_counted_and_the_next_job_is_still_cancelled(self) -> None:
+        api = StandIn()
+        api.unreadable_jobs = {7}
+        api.statuses[8] = ["running"]
+        ledger = ledger_in(self)
+        keep(ledger, 7, CONNECTION)
+        keep(ledger, 8, CONNECTION)
+        self.assertEqual({"jobs": 2, "still_active": 1, "unresolved": 0}, self.cleanup(api, ledger))
+        self.assertIn("cancel_job 8", api.log)
+        self.assertNotIn("cancel_job 7", api.log)
+
+    def test_a_job_of_the_ledger_that_airbyte_ties_to_another_connection_is_counted_and_never_cancelled(self) -> None:
+        api = StandIn()
+        api.job_connection_id = "connection_2"
+        ledger = ledger_in(self)
+        keep(ledger, 7, CONNECTION)
+        self.assertEqual({"jobs": 1, "still_active": 1, "unresolved": 0}, self.cleanup(api, ledger))
+        self.assertNotIn("cancel_job 7", api.log)
+
+    def test_trimming_keeps_every_unresolved_attempt(self) -> None:
+        ledger = ledger_in(self)
+        token = ledger.begin(CONNECTION, 1.0)
+        for job in range(1, 60):
+            keep(ledger, job, CONNECTION)
+        self.assertEqual([token], [attempt.token for attempt in ledger.attempts()])
+        self.assertEqual(list(range(40, 60)), ledger.jobs())
 
     def test_the_ledger_keeps_the_latest_jobs_only_and_survives_a_reopen(self) -> None:
         ledger = ledger_in(self)
         for job in range(1, 40):
-            ledger.record(job, CONNECTION)
+            keep(ledger, job, CONNECTION)
         self.assertEqual(list(range(20, 40)), ledger.jobs())
         self.assertEqual(CONNECTION, JobLedger(ledger.directory).connection_of(39))
 
@@ -430,6 +594,26 @@ class ConnectionReadTest(unittest.TestCase):
                 with self.assertRaises(AirbyteError):
                     other.job_connection(7)
 
+    def test_the_jobs_of_the_connection_after_a_time_are_read_from_the_job_list_by_their_own_start_time(self) -> None:
+        sync = {"status": "succeeded", "jobType": "sync", "connectionId": CONNECTION}
+        api = Fake(
+            [
+                {"jobId": 5, "startTime": "2026-11-25T09:59:59Z", **sync},
+                {"jobId": 6, "startTime": "2026-11-25T10:00:00Z", **sync},
+                {"jobId": 7, "startTime": "2026-11-25T10:00:05+00:00", **sync},
+            ],
+            {},
+        )
+        since = datetime(2026, 11, 25, 10, 0, 0, tzinfo=UTC).timestamp()
+        self.assertEqual([6, 7], api.jobs_since(CONNECTION, since))
+        self.assertTrue(api.calls[0].startswith("/jobs?connectionId=connection_1&jobType=sync"))
+
+    def test_a_job_list_entry_without_a_start_time_as_text_or_of_another_connection_refuses_the_lookup(self) -> None:
+        sync = {"jobId": 7, "status": "running", "jobType": "sync", "connectionId": CONNECTION}
+        for entry in (sync, {**sync, "startTime": 5}, {**sync, "startTime": "yesterday"}, {**sync, "startTime": "2026-11-25T10:00:05", "connectionId": "x"}):
+            with self.subTest(entry=entry), self.assertRaises(AirbyteError):
+                Fake([entry], {}).jobs_since(CONNECTION, 0.0)
+
     def test_the_job_document_is_read_from_the_job_route(self) -> None:
         api = Fake([], {"/jobs/7": {"jobId": 7, "status": "running"}})
         self.assertEqual({"jobId": 7, "status": "running"}, api.job_document(7))
@@ -443,7 +627,7 @@ class CommandTest(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         for job in owned:
-            JobLedger(Path(folder.name)).record(job, CONNECTION)
+            keep(JobLedger(Path(folder.name)), job, CONNECTION)
         with (
             mock.patch.object(raw_copy, "open_api", factory),
             mock.patch.object(raw_copy, "open_ledger", lambda: JobLedger(Path(folder.name))),
@@ -507,13 +691,28 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual((1, "", "raw_copy refused: job_not_owned\n"), (code, out, err))
                 self.assertNotIn("cancel_job 7", api.log)
 
-    def test_cancel_owned_prints_two_counts_and_exits_1_when_a_job_stays_active(self) -> None:
+    def test_cancel_owned_prints_three_counts_and_exits_1_when_a_job_stays_active(self) -> None:
         code, out, _ = self.run_main(["cancel-owned"], StandIn(), owned=(7,))
-        self.assertEqual((0, {"jobs": 1, "still_active": 0}), (code, json.loads(out)))
+        self.assertEqual((0, {"jobs": 1, "still_active": 0, "unresolved": 0}), (code, json.loads(out)))
         stuck = StandIn()
         stuck.cancel_stops = False
         code, out, _ = self.run_main(["cancel-owned", "--confirm-seconds", "1", "--poll-seconds", "1"], stuck, owned=(7,))
-        self.assertEqual((1, {"jobs": 1, "still_active": 1}), (code, json.loads(out)))
+        self.assertEqual((1, {"jobs": 1, "still_active": 1, "unresolved": 0}), (code, json.loads(out)))
+
+    def test_cancel_owned_exits_1_while_an_attempt_is_unresolved(self) -> None:
+        api = StandIn()
+        api.lost_reply, api.never_arrives = True, True
+        code, out, err = self.run_main(["start", "--bucket", BUCKET], api)
+        self.assertEqual((1, "", "raw_copy refused: start_unconfirmed\n"), (code, out, err))
+        self.assertEqual(1, len(self.last_ledger.attempts()))
+        folder = self.last_ledger.directory
+        with (
+            mock.patch.object(raw_copy, "open_api", lambda: api),
+            mock.patch.object(raw_copy, "open_ledger", lambda: JobLedger(folder)),
+            contextlib.redirect_stdout(io.StringIO()) as shown,
+        ):
+            code = raw_copy.main(["cancel-owned"])
+        self.assertEqual((1, {"jobs": 0, "still_active": 0, "unresolved": 1}), (code, json.loads(shown.getvalue())))
 
     def test_cancel_prints_the_status_after_the_cancellation(self) -> None:
         code, out, _ = self.run_main(["cancel", "--job", "7"], owned=(7,))
