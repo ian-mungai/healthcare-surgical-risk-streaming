@@ -16,8 +16,8 @@ that a stopped command takes to leave (``KILL_WAIT_SECONDS`` in ``scripts/proces
 
 A given Spark image is bound to the reviewed commit by its content and not by its ID alone: ``SOURCE_SCRIPT`` lists the Git blob ID of each Python file that the
 image holds under ``/opt/jobs``, and ``source_problem`` compares the listing with the files that the commit's own Dockerfile copies there (every ``COPY`` into
-``/opt/jobs``, read from the Dockerfile at run time, with the blob IDs of ``git ls-tree -r HEAD``): a missing, extra or changed file refuses the image. The
-record keeps the Boolean only.
+``/opt/jobs``, read from the Dockerfile at run time, from the files of ``git ls-tree -r HEAD`` that the commit's Docker ignore file
+``spark/Dockerfile.dockerignore`` does not leave out): a missing, extra or changed file refuses the image. The record keeps the Boolean only.
 
 Every Compose and Docker call of a run gets an explicit environment (``docker_environment``): the path, the home folder, what Docker itself needs and the run's
 own binding, never the caller's other settings. Compose lets a variable of the environment beat the env file, so a caller's ``WAREHOUSE_LOCATION`` or
@@ -197,14 +197,68 @@ def dockerfile_copies(dockerfile: str) -> list[tuple[list[str], str]] | None:
     return copies
 
 
-def image_source_files(dockerfile: str, tree_output: str) -> dict[str, str] | None:
+# One line of a Docker ignore file: whether it is an exception (``!``), whether it starts with ``**/``, and the names of its path.
+IgnoreRule = tuple[bool, bool, tuple[str, ...]]
+IGNORE_NOT_READ = re.compile(r"[?\[\\]|\*\*")
+
+
+def dockerignore_rules(text: str) -> list[IgnoreRule] | None:
+    """The rules of a Docker ignore file, in order, or None when a line has a form that this check does not read.
+
+    The matching is that of the Docker documentation, "Build context", ".dockerignore files" (https://docs.docker.com/build/concepts/context/#dockerignore-files),
+    and only the forms that ``spark/Dockerfile.dockerignore`` uses are read: a blank line and a ``#`` comment (skipped), a path from the root of the context
+    whose names are plain or are a lone ``*`` (any one name), a leading ``**/`` (any number of folders), and ``!`` before a pattern (an exception). Anything
+    else (``*`` or ``**`` inside a name, ``?``, ``[``, a backslash, a rooted, ``.``, ``..``, empty or trailing-slash name, a bare ``!``) makes the check
+    unreadable, so that a form that it does not know is never read as a rule that it does."""
+    rules: list[IgnoreRule] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        exception = line.startswith("!")
+        names = (line[1:].strip() if exception else line).split("/")
+        anywhere = names[0] == "**"
+        if anywhere:
+            names = names[1:]
+        if not names or any(name in ("", ".", "..") or IGNORE_NOT_READ.search(name) or ("*" in name and name != "*") for name in names):
+            return None
+        rules.append((exception, anywhere, tuple(names)))
+    return rules
+
+
+def rule_matches(rule: IgnoreRule, path: tuple[str, ...]) -> bool:
+    """True when the rule matches the path or one of the folders on the way to it (a rule for a folder is a rule for everything in it)."""
+    _, anywhere, names = rule
+    for end in range(1, len(path) + 1):
+        part = path[:end]
+        if anywhere:
+            part = part[-len(names) :] if len(part) >= len(names) else ()
+        if len(part) == len(names) and all(name in ("*", seen) for name, seen in zip(names, part, strict=True)):
+            return True
+    return False
+
+
+def dockerignored(path: str, rules: list[IgnoreRule]) -> bool:
+    """True when the build context leaves the file out: the last rule that matches it decides, and an exception puts it back."""
+    left_out = False
+    for rule in rules:
+        if rule_matches(rule, tuple(path.split("/"))):
+            left_out = not rule[0]
+    return left_out
+
+
+def image_source_files(dockerfile: str, tree_output: str, dockerignore: str) -> dict[str, str] | None:
     """The Python files that an image built from this Dockerfile and this commit holds under ``JOBS_FOLDER``, as ``{path under it: Git blob ID}``, or None when
-    the Dockerfile or the tree cannot be read. It follows each ``COPY`` of the Dockerfile (the whole of a folder, a single file, a destination that ends in a
-    slash), takes the blob IDs of ``git ls-tree -r HEAD`` and lets a later ``COPY`` to the same path win."""
+    the Dockerfile, the tree or the Docker ignore file cannot be read. The build context is the tree without the files that the Docker ignore file
+    (``dockerignore``, the text of ``spark/Dockerfile.dockerignore`` of the same commit) leaves out, as ``docker build`` sends it, so a file that it
+    leaves out is in no ``COPY`` source. The check then follows each ``COPY`` of the Dockerfile (the whole of a folder, a single file, a destination that ends
+    in a slash), takes the blob IDs of ``git ls-tree -r HEAD`` and lets a later ``COPY`` to the same path win."""
     copies = dockerfile_copies(dockerfile)
+    rules = dockerignore_rules(dockerignore)
     tree = {found.group(2): found.group(1) for line in tree_output.splitlines() if (found := TREE_LINE.fullmatch(line))}
-    if not copies or not tree:
+    if not copies or not tree or rules is None:
         return None
+    tree = {path: blob for path, blob in tree.items() if not dockerignored(path, rules)}
     files: dict[str, str] = {}
     for sources, destination in copies:
         for source in sources:
@@ -222,13 +276,15 @@ def image_source_files(dockerfile: str, tree_output: str) -> dict[str, str] | No
     return files
 
 
-def source_problem(image_output: str, tree_output: str, dockerfile: str) -> str | None:
+def source_problem(image_output: str, tree_output: str, dockerfile: str, dockerignore: str) -> str | None:
     """A fixed code when the Python files of the given image are not the files that the Dockerfile copies from the reviewed commit, or None when they are.
 
-    ``image_output`` is what ``SOURCE_SCRIPT`` printed in the image, ``tree_output`` is ``git ls-tree -r HEAD`` of the checkout and ``dockerfile`` is the
-    Dockerfile of the same commit. The files that the image must hold are derived from the Dockerfile's own ``COPY`` instructions (``image_source_files``), so
-    that a copy that is added or changed there is checked with no second list. Every file of the image must be one of them with the same Git blob ID, and every
-    one of them must be in the image. A listing with no file, a line that is not a listing line and a Dockerfile or a tree that names no file are never a match.
+    ``image_output`` is what ``SOURCE_SCRIPT`` printed in the image, ``tree_output`` is ``git ls-tree -r HEAD`` of the checkout, ``dockerfile`` is the
+    Dockerfile of the same commit and ``dockerignore`` is its Docker ignore file (``spark/Dockerfile.dockerignore``). The files that the image must hold are
+    derived from the Dockerfile's own ``COPY`` instructions (``image_source_files``), so that a copy that is added or changed there is checked with no second
+    list. A Docker ignore file that has a form this check does not read is unreadable. Every file of the image must be one of them with the same Git blob ID,
+    and every one of them must be in the image. A listing with no file, a line that is not a listing line and a Dockerfile or a tree that names no file are
+    never a match.
     """
     image: dict[str, str] = {}
     for line in image_output.splitlines():
@@ -238,7 +294,7 @@ def source_problem(image_output: str, tree_output: str, dockerfile: str) -> str 
         if found is None:
             return "image_source_unreadable"
         image[found.group(2)] = found.group(1)
-    expected = image_source_files(dockerfile, tree_output)
+    expected = image_source_files(dockerfile, tree_output, dockerignore)
     if not image or not expected:
         return "image_source_unreadable"
     if any(expected.get(path) != blob for path, blob in image.items()):

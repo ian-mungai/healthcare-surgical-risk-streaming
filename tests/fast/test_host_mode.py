@@ -401,6 +401,8 @@ TREE = (
     f"100644 blob {SHA_V}\tfeatures/signal_validity.py\n100644 blob {SHA_C}\tcasefile/store.py\n100644 blob {'a7' * 20}\tcasefile/data.json\n"
     f"100644 blob {'d4' * 20}\tspark/Dockerfile\n100644 blob {'e5' * 20}\tREADME.md\n100644 blob {'b8' * 20}\tspark/requirements.txt\n"
 )
+# The Docker ignore file of the same build: everything is out except what is named (the form of ``spark/Dockerfile.dockerignore``).
+DOCKERIGNORE = "# a comment\n\n*\n!spark\n!scripts/stack/nessie.py\n!features/signal_validity.py\n!casefile\n**/__pycache__\n"
 IMAGE_FILES = (
     f"{SHA_C} casefile/store.py\n{SHA_V} features/signal_validity.py\n{SHA_Z} scripts/stack/nessie.py\n{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n"
 )
@@ -413,53 +415,53 @@ def committed(*arguments: str) -> str:
 
 class SourceProblemTest(unittest.TestCase):
     def test_an_image_that_holds_exactly_the_committed_files_it_copies_is_the_tested_build(self) -> None:
-        self.assertIsNone(source_problem(IMAGE_FILES, TREE, DOCKERFILE))
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_an_image_file_that_differs_from_the_committed_file_is_another_build(self) -> None:
         changed = IMAGE_FILES.replace(SHA_Y, "f6" * 20)
-        self.assertEqual("image_source_differs", source_problem(changed, TREE, DOCKERFILE))
+        self.assertEqual("image_source_differs", source_problem(changed, TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_an_image_file_that_the_commit_does_not_hold_is_another_build(self) -> None:
-        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n", TREE, DOCKERFILE))
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} spark/jobs/extra.py\n", TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_an_image_file_in_a_folder_that_the_dockerfile_copies_only_in_part_is_another_build(self) -> None:
-        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} features/extra.py\n", TREE, DOCKERFILE))
-        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} scripts/stack/extra.py\n", TREE, DOCKERFILE))
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} features/extra.py\n", TREE, DOCKERFILE, DOCKERIGNORE))
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES + f"{SHA_X} scripts/stack/extra.py\n", TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_committed_job_file_that_the_image_lacks_is_another_build(self) -> None:
         lacking = IMAGE_FILES.replace(f"{SHA_X} spark/jobs/x.py\n", "")
-        self.assertEqual("image_source_missing", source_problem(lacking, TREE, DOCKERFILE))
+        self.assertEqual("image_source_missing", source_problem(lacking, TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_committed_file_that_a_single_file_copy_names_and_the_image_lacks_is_another_build(self) -> None:
         for lost in (f"{SHA_V} features/signal_validity.py\n", f"{SHA_Z} scripts/stack/nessie.py\n"):
             with self.subTest(lost=lost):
-                self.assertEqual("image_source_missing", source_problem(IMAGE_FILES.replace(lost, ""), TREE, DOCKERFILE))
+                self.assertEqual("image_source_missing", source_problem(IMAGE_FILES.replace(lost, ""), TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_committed_file_of_a_copied_folder_other_than_spark_that_the_image_lacks_is_another_build(self) -> None:
-        self.assertEqual("image_source_missing", source_problem(IMAGE_FILES.replace(f"{SHA_C} casefile/store.py\n", ""), TREE, DOCKERFILE))
+        self.assertEqual("image_source_missing", source_problem(IMAGE_FILES.replace(f"{SHA_C} casefile/store.py\n", ""), TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_copied_file_whose_content_changed_in_a_folder_other_than_spark_is_another_build(self) -> None:
         for path in ("casefile/store.py", "features/signal_validity.py", "scripts/stack/nessie.py"):
             with self.subTest(path=path):
                 changed = "".join(f"{'0f' * 20 if line.endswith(path) else line.split()[0]} {line.split()[1]}\n" for line in IMAGE_FILES.splitlines())
-                self.assertEqual("image_source_differs", source_problem(changed, TREE, DOCKERFILE))
+                self.assertEqual("image_source_differs", source_problem(changed, TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_committed_file_that_the_dockerfile_does_not_copy_is_not_missing(self) -> None:
         extra = TREE + f"100644 blob {'a9' * 20}\tscripts/other.py\n100644 blob {'a8' * 20}\tfeatures/other.py\n"
-        self.assertIsNone(source_problem(IMAGE_FILES, extra, DOCKERFILE))
+        self.assertIsNone(source_problem(IMAGE_FILES, extra, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_file_that_is_not_python_is_not_listed_by_the_image_and_is_not_missing(self) -> None:
-        self.assertIsNone(source_problem(IMAGE_FILES, TREE, DOCKERFILE))
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, DOCKERFILE, DOCKERIGNORE))
         self.assertNotIn("data.json", IMAGE_FILES)
 
     def test_a_listing_with_no_file_is_unreadable_and_never_a_match(self) -> None:
         for listing in ("", "\n", "not a listing line\n", f"{SHA_X}  spark/jobs/x.py\n"):
             with self.subTest(listing=listing):
-                self.assertEqual("image_source_unreadable", source_problem(listing, TREE, DOCKERFILE))
+                self.assertEqual("image_source_unreadable", source_problem(listing, TREE, DOCKERFILE, DOCKERIGNORE))
 
     def test_a_tree_without_any_file_of_the_dockerfile_is_unreadable_and_never_a_match(self) -> None:
-        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, "", DOCKERFILE))
-        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, f"100644 blob {SHA_Z}\tscripts/stack/nessie.py\n", DOCKERFILE))
+        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, "", DOCKERFILE, DOCKERIGNORE))
+        self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, f"100644 blob {SHA_Z}\tscripts/stack/nessie.py\n", DOCKERFILE, DOCKERIGNORE))
 
     def test_a_dockerfile_that_the_check_cannot_read_is_unreadable_and_never_a_match(self) -> None:
         cases = {
@@ -473,41 +475,172 @@ class SourceProblemTest(unittest.TestCase):
         }
         for label, text in cases.items():
             with self.subTest(case=label):
-                self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, TREE, text))
+                self.assertEqual("image_source_unreadable", source_problem(IMAGE_FILES, TREE, text, DOCKERIGNORE))
 
     def test_a_copy_from_another_stage_and_a_destination_outside_the_jobs_folder_name_no_file_of_the_jobs_folder(self) -> None:
         both = DOCKERFILE + "COPY --from=build /out/tool.py /opt/jobs/tool.py\nCOPY scripts/stack/nessie.py /tmp/nessie.py\n"
-        self.assertIsNone(source_problem(IMAGE_FILES, TREE, both))
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, both, DOCKERIGNORE))
 
     def test_a_destination_with_a_trailing_slash_takes_the_name_of_the_source_file(self) -> None:
         text = (
             "COPY spark /opt/jobs/spark\nCOPY features/signal_validity.py /opt/jobs/features/\n"
             "COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/\nCOPY casefile /opt/jobs/casefile\n"
         )
-        self.assertIsNone(source_problem(IMAGE_FILES, TREE, text))
+        self.assertIsNone(source_problem(IMAGE_FILES, TREE, text, DOCKERIGNORE))
 
     def test_a_later_copy_to_the_same_path_decides_which_file_the_image_holds(self) -> None:
         text = DOCKERFILE + "COPY scripts/stack/nessie.py /opt/jobs/features/signal_validity.py\n"
-        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES, TREE, text))
+        self.assertEqual("image_source_differs", source_problem(IMAGE_FILES, TREE, text, DOCKERIGNORE))
         swapped = IMAGE_FILES.replace(f"{SHA_V} features", f"{SHA_Z} features")
-        self.assertIsNone(source_problem(swapped, TREE, text))
+        self.assertIsNone(source_problem(swapped, TREE, text, DOCKERIGNORE))
 
     def test_the_files_of_the_real_dockerfile_are_checked_in_every_folder_it_copies_from(self) -> None:
         tree = committed("ls-tree", "-r", "HEAD")
         dockerfile = committed("show", "HEAD:spark/Dockerfile")
-        found = host_mode.image_source_files(dockerfile, tree)
+        dockerignore = committed("show", "HEAD:spark/Dockerfile.dockerignore")
+        found = host_mode.image_source_files(dockerfile, tree, dockerignore)
         self.assertIsNotNone(found)
         files = found or {}
         for folder in ("spark/", "features/", "casefile/", "scripts/", "replay/"):
             self.assertTrue(any(path.startswith(folder) for path in files), folder)
         self.assertIn("features/signal_validity.py", files)
         listing = "".join(f"{blob} {path}\n" for path, blob in sorted(files.items()))
-        self.assertIsNone(source_problem(listing, tree, dockerfile))
+        self.assertIsNone(source_problem(listing, tree, dockerfile, dockerignore))
         for lost in ("features/signal_validity.py", "scripts/stack/nessie.py", "replay/events/wire.py", "casefile/__init__.py"):
             with self.subTest(lost=lost):
                 lacking = "".join(f"{blob} {path}\n" for path, blob in sorted(files.items()) if path != lost)
-                self.assertEqual("image_source_missing", source_problem(lacking, tree, dockerfile))
-        self.assertEqual("image_source_differs", source_problem(listing + f"{SHA_X} features/extra.py\n", tree, dockerfile))
+                self.assertEqual("image_source_missing", source_problem(lacking, tree, dockerfile, dockerignore))
+        self.assertEqual("image_source_differs", source_problem(listing + f"{SHA_X} features/extra.py\n", tree, dockerfile, dockerignore))
+
+    def test_the_real_ignore_file_keeps_the_command_line_module_out_of_the_image_and_an_image_that_holds_it_is_another_build(self) -> None:
+        tree = committed("ls-tree", "-r", "HEAD")
+        dockerfile = committed("show", "HEAD:spark/Dockerfile")
+        dockerignore = committed("show", "HEAD:spark/Dockerfile.dockerignore")
+        self.assertIn("scripts/ingestion/cli.py", dockerignore.splitlines())
+        committed_blobs = {path: blob for line in tree.splitlines() if (found := host_mode.TREE_LINE.fullmatch(line)) for blob, path in [found.groups()]}
+        files = host_mode.image_source_files(dockerfile, tree, dockerignore) or {}
+        self.assertNotIn("scripts/ingestion/cli.py", files)
+        self.assertIn("scripts/ingestion/check.py", files)
+        self.assertEqual(168, len(files))
+        listing = "".join(f"{blob} {path}\n" for path, blob in sorted(files.items()))
+        self.assertIsNone(source_problem(listing, tree, dockerfile, dockerignore))
+        with_cli = listing + f"{committed_blobs['scripts/ingestion/cli.py']} scripts/ingestion/cli.py\n"
+        self.assertEqual("image_source_differs", source_problem(with_cli, tree, dockerfile, dockerignore))
+
+
+def tree_of(*paths: str) -> str:
+    """A ``git ls-tree -r`` listing of the given paths, each with a blob ID of its own (the position, repeated)."""
+    return "".join(f"100644 blob {f'{index:02x}' * 20}\t{path}\n" for index, path in enumerate(paths, 1))
+
+
+def kept(ignore: str, dockerfile: str, *paths: str) -> list[str] | None:
+    """The paths under /opt/jobs that an image built from these files and this Docker ignore text holds (sorted), or None when the check cannot read them."""
+    found = host_mode.image_source_files(dockerfile, tree_of(*paths), ignore)
+    return None if found is None else sorted(found)
+
+
+APP = "COPY app /opt/jobs/app\n"
+
+
+class DockerIgnoreTest(unittest.TestCase):
+    """The Docker ignore file is applied to the build context before ``COPY`` reads it. The rules are those of the Docker documentation, "Build context",
+    ".dockerignore files" (https://docs.docker.com/build/concepts/context/#dockerignore-files): a pattern is read from the root of the context, ``*`` matches
+    any characters of one name, a leading ``**/`` matches any number of folders, a line that starts with ``!`` is an exception, a line that starts with ``#``
+    is a comment, and the last line that matches a path decides. A path is also matched by its folders (a rule for a folder is a rule for what is in it)."""
+
+    def test_a_file_that_no_rule_names_is_in_the_image_and_an_empty_ignore_file_has_no_rule(self) -> None:
+        for ignore in ("", "\n\n", "# only a comment\n", "  \n"):
+            with self.subTest(ignore=ignore):
+                self.assertEqual(["app/a.py", "app/sub/b.py"], kept(ignore, APP, "app/a.py", "app/sub/b.py", "other/c.py"))
+
+    def test_a_path_rule_leaves_out_that_file_only(self) -> None:
+        self.assertEqual(["app/b.py"], kept("app/a.py\n", APP, "app/a.py", "app/b.py", "other/a.py"))
+
+    def test_a_rule_for_a_folder_leaves_out_everything_in_it(self) -> None:
+        self.assertEqual(["app/a.py"], kept("app/sub\n", APP, "app/a.py", "app/sub/b.py", "app/sub/deep/c.py"))
+
+    def test_a_star_alone_leaves_out_everything_in_the_context_so_that_a_copy_of_it_has_no_source(self) -> None:
+        self.assertIsNone(kept("*\n", APP, "app/a.py", "app/sub/b.py"))
+
+    def test_a_star_matches_one_name_and_never_crosses_a_slash(self) -> None:
+        self.assertEqual(["app/sub/b.py"], kept("app/*\n!app/sub\n", APP, "app/a.py", "app/sub/b.py"))
+        self.assertEqual(["app/sub/b.py"], kept("*/a.py\n", APP, "app/a.py", "app/sub/b.py"))
+        self.assertEqual(["app/a.py", "app/sub/a.py", "app/sub/b.py"], kept("*/b.py\n", APP, "app/a.py", "app/b.py", "app/sub/a.py", "app/sub/b.py"))
+
+    def test_a_rule_with_a_star_in_the_middle_matches_one_folder_level_only(self) -> None:
+        self.assertEqual(["app/x/keep/a.py"], kept("app/*/drop\n", "COPY app /opt/jobs/app\n", "app/x/drop/a.py", "app/x/keep/a.py"))
+        self.assertEqual(["app/x/y/drop/a.py"], kept("app/*/drop\n", "COPY app /opt/jobs/app\n", "app/x/drop/a.py", "app/x/y/drop/a.py"))
+
+    def test_a_leading_double_star_matches_the_name_at_the_root_and_at_any_depth(self) -> None:
+        paths = ("app/a.py", "app/__pycache__/m.py", "app/sub/__pycache__/m.py", "app/sub/deep/__pycache__/x/m.py")
+        self.assertEqual(["app/a.py"], kept("**/__pycache__\n", APP, *paths))
+        self.assertIsNone(kept("**/__pycache__\n", "COPY __pycache__/m.py /opt/jobs/m.py\n", "__pycache__/m.py"))
+        self.assertEqual(["app/__pycache__/m.py"], kept("**/sub\n", APP, "app/__pycache__/m.py", "app/sub/a.py", "app/x/sub/b.py"))
+
+    def test_a_path_rule_is_read_from_the_root_so_the_same_name_deeper_down_stays(self) -> None:
+        self.assertEqual(["app/other/a.py"], kept("a.py\napp/a.py\n", APP, "app/a.py", "app/other/a.py"))
+
+    def test_an_exception_puts_back_what_an_earlier_rule_left_out(self) -> None:
+        self.assertEqual(["app/a.py", "app/sub/keep.py"], kept("app/sub\n!app/sub/keep.py\n", APP, "app/a.py", "app/sub/keep.py", "app/sub/drop.py"))
+        self.assertEqual(["app/a.py", "app/sub/b.py", "app/sub/c.py"], kept("app/sub/*\n!app/sub\n", APP, "app/a.py", "app/sub/b.py", "app/sub/c.py"))
+
+    def test_the_last_matching_line_decides_so_an_exception_before_the_rule_changes_nothing(self) -> None:
+        self.assertEqual(["app/a.py"], kept("!app/sub/keep.py\napp/sub\n", APP, "app/a.py", "app/sub/keep.py"))
+        self.assertEqual(["app/a.py"], kept("app/sub\n!app/sub/keep.py\napp/sub/keep.py\n", APP, "app/a.py", "app/sub/keep.py"))
+
+    def test_everything_out_first_and_a_named_folder_back_is_the_form_of_the_real_file(self) -> None:
+        ignore = "*\n!app\n!lib/one.py\nlib/one.py\n!lib/two.py\n"
+        dockerfile = APP + "COPY lib/two.py /opt/jobs/lib/two.py\n"
+        self.assertEqual(["app/a.py", "app/sub/b.py", "lib/two.py"], kept(ignore, dockerfile, "app/a.py", "app/sub/b.py", "lib/one.py", "lib/two.py", "x/y.py"))
+
+    def test_a_single_file_copy_of_a_file_that_the_ignore_file_leaves_out_has_no_source(self) -> None:
+        text = "COPY lib/one.py /opt/jobs/lib/one.py\n"
+        self.assertIsNone(kept("lib/one.py\n", text, "lib/one.py"))
+        self.assertEqual(["lib/one.py"], kept("lib/one.py\n!lib/one.py\n", text, "lib/one.py"))
+
+    def test_comments_blank_lines_and_the_white_space_and_line_ends_around_a_rule_are_not_part_of_it(self) -> None:
+        ignore = "# app/a.py is not a rule\n\n  app/b.py  \r\n\t! app/c.py\r\napp/c.py\r\n! app/c.py\n"
+        self.assertEqual(["app/a.py", "app/c.py"], kept(ignore, APP, "app/a.py", "app/b.py", "app/c.py"))
+
+    def test_a_comment_is_only_a_line_that_starts_with_a_hash(self) -> None:
+        self.assertEqual(["app/a.py", "app/b.py"], kept("app/b.py # not a comment here\napp/a.py\n!app/a.py\n", APP, "app/a.py", "app/b.py"))
+        self.assertEqual(["app/a.py", "app/b.py"], kept("#app/a.py\n#!app/b.py\n", APP, "app/a.py", "app/b.py"))
+
+    def test_a_form_that_the_check_does_not_implement_makes_the_listing_unreadable_and_never_a_match(self) -> None:
+        forms = {
+            "a star with other characters": "app/*.py\n",
+            "a star ending a name": "app/a*\n",
+            "a question mark": "app/a?.py\n",
+            "a character class": "app/[ab].py\n",
+            "an escape": "app/a\\.py\n",
+            "a double star inside a path": "app/**/a.py\n",
+            "a double star at the end": "app/**\n",
+            "a double star alone": "**\n",
+            "a double star joined to a name": "**a\n",
+            "a rooted path": "/app/a.py\n",
+            "a path that ends in a slash": "app/sub/\n",
+            "a current-folder mark": "./app/a.py\n",
+            "a parent mark": "app/../a.py\n",
+            "a doubled slash": "app//a.py\n",
+            "an exception mark alone": "!\n",
+            "an exception of an unread form": "!app/*.py\n",
+        }
+        tree = tree_of("app/a.py", "app/b.py")
+        for label, ignore in forms.items():
+            with self.subTest(form=label):
+                self.assertIsNone(kept(ignore, APP, "app/a.py", "app/b.py"))
+                listing = f"{'a1' * 20} app/a.py\n{'b2' * 20} app/b.py\n"
+                self.assertEqual("image_source_unreadable", source_problem(listing, tree, APP, ignore))
+                self.assertEqual("image_source_unreadable", source_problem(listing, tree, APP, "app/c.py\n" + ignore))
+
+    def test_the_ignore_file_decides_which_listing_matches_in_the_check_of_the_image(self) -> None:
+        tree = tree_of("app/a.py", "app/b.py")
+        both = f"{'01' * 20} app/a.py\n{'02' * 20} app/b.py\n"
+        only_a = f"{'01' * 20} app/a.py\n"
+        self.assertIsNone(source_problem(both, tree, APP, ""))
+        self.assertEqual("image_source_missing", source_problem(only_a, tree, APP, ""))
+        self.assertIsNone(source_problem(only_a, tree, APP, "app/b.py\n"))
+        self.assertEqual("image_source_differs", source_problem(both, tree, APP, "app/b.py\n"))
 
     def test_the_script_that_the_image_runs_prints_the_git_id_and_the_path_of_each_python_file_under_the_jobs_folder(self) -> None:
         with tempfile.TemporaryDirectory(prefix="host_mode_source_") as folder:

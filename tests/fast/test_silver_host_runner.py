@@ -74,6 +74,8 @@ TREE = (
 IMAGE_FILES = f"{SHA_X} spark/jobs/x.py\n{SHA_Y} spark/silver/y.py\n{SHA_Z} scripts/stack/nessie.py\n"
 # The Dockerfile of the same commit: what the image must hold under /opt/jobs is what its COPY instructions put there.
 DOCKERFILE = "COPY spark /opt/jobs/spark\nCOPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py\n"
+# Its Docker ignore file: what the build leaves out of the context before ``COPY`` reads it.
+DOCKERIGNORE = "*\n!spark\n!scripts/stack/nessie.py\n"
 # Settings of the deployed stack and of Compose that a caller may have exported. None of them may reach a call of the run.
 BOUND = {"WAREHOUSE_LOCATION", "NESSIE_URI", "AWS_REGION", "POSTGRES_HOST_PORT", "MEM_LIMIT_SPARK"}
 DEPLOYED = {
@@ -948,14 +950,24 @@ class HostRunnerCase(unittest.TestCase):
         self.assertNotIn("surgical-risk-spark:4.1.4", [word for args in removed for word in args])
 
     def image_run(
-        self, module: ModuleType, *, given: bool, answer: Any, code: Any = None, files: str = IMAGE_FILES, tree: str = TREE, dockerfile: str = DOCKERFILE
+        self,
+        module: ModuleType,
+        *,
+        given: bool,
+        answer: Any,
+        code: Any = None,
+        files: str = IMAGE_FILES,
+        tree: str = TREE,
+        dockerfile: str = DOCKERFILE,
+        dockerignore: str = DOCKERIGNORE,
     ) -> tuple[tuple[bool, bool], Calls, Record]:
         def with_source(args: list[str]) -> Any:
-            """The answers of the three source calls (the commit's tree, its Dockerfile and the Python files in the image) beside the test's own."""
+            """The answers of the four source calls (the commit's tree, its Dockerfile, its Docker ignore file and the Python files in the image) beside the
+            test's own."""
             if "ls-tree" in args:
                 return tree
             if "show" in args:
-                return dockerfile
+                return dockerignore if args[-1] == "HEAD:spark/Dockerfile.dockerignore" else dockerfile
             if args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT:
                 return files
             return answer(args)
@@ -1037,8 +1049,7 @@ class HostRunnerCase(unittest.TestCase):
         self.assertNotIn("surgical-risk-spark:4.1.4", probe)
         (tree,) = [args for _, args, _ in calls.items if "ls-tree" in args]
         self.assertEqual("HEAD", tree[tree.index("ls-tree") + 2])
-        (shown,) = [args for _, args, _ in calls.items if "show" in args]
-        self.assertEqual("HEAD:spark/Dockerfile", shown[-1])
+        self.assertEqual(["HEAD:spark/Dockerfile", "HEAD:spark/Dockerfile.dockerignore"], [args[-1] for _, args, _ in calls.items if "show" in args])
         self.assertTrue(self.passed(record, "image source"))
 
     def test_a_given_image_that_lacks_a_file_that_the_dockerfile_copies_from_a_folder_other_than_spark_is_refused_and_nothing_is_tagged(self) -> None:
@@ -1051,10 +1062,34 @@ class HostRunnerCase(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 answer = lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else ""  # noqa: E731
-                result, calls, record = self.image_run(module, given=True, answer=answer, files=files, tree=tree, dockerfile=dockerfile)
+                result, calls, record = self.image_run(
+                    module,
+                    given=True,
+                    answer=answer,
+                    files=files,
+                    tree=tree,
+                    dockerfile=dockerfile,
+                    dockerignore=DOCKERIGNORE + "!features/signal_validity.py\n",
+                )
                 self.assertEqual((problem, problem), result)
                 self.assertEqual(problem, any(words.startswith("image tag") for words in calls.words()))
                 self.assertEqual(problem, self.passed(record, "image source"))
+
+    def test_a_file_that_the_docker_ignore_file_leaves_out_is_not_in_the_image_that_the_run_accepts(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        answer = lambda args: f"{IMAGE_ID}\n" if args[:2] == ["image", "inspect"] else ""  # noqa: E731
+        without_x = f"{SHA_Y} spark/silver/y.py\n{SHA_Z} scripts/stack/nessie.py\n"
+        for label, files, ignore, accepted in (
+            ("the file is left out and the image lacks it", without_x, DOCKERIGNORE + "spark/jobs/x.py\n", True),
+            ("the file is left out and the image holds it", IMAGE_FILES, DOCKERIGNORE + "spark/jobs/x.py\n", False),
+            ("the file is not left out and the image lacks it", without_x, DOCKERIGNORE, False),
+            ("a rule of a form that is not read", without_x, DOCKERIGNORE + "spark/jobs/*.py\n", False),
+        ):
+            with self.subTest(case=label):
+                result, calls, record = self.image_run(module, given=True, answer=answer, files=files, dockerignore=ignore)
+                self.assertEqual((accepted, accepted), result)
+                self.assertEqual(accepted, any(words.startswith("image tag") for words in calls.words()))
+                self.assertEqual(accepted, self.passed(record, "image source"))
 
     def test_a_given_image_with_the_recorded_id_but_other_files_than_the_commit_is_refused_and_nothing_is_tagged(self) -> None:
         module = self.module(**{self.flag: "1"})
@@ -1074,13 +1109,14 @@ class HostRunnerCase(unittest.TestCase):
 
     def test_a_given_image_whose_files_cannot_be_read_or_whose_commit_cannot_be_listed_is_refused(self) -> None:
         module = self.module(**{self.flag: "1"})
-        for failing in ("probe", "tree", "dockerfile"):
+        for failing in ("probe", "tree", "dockerfile", "dockerignore"):
             with self.subTest(failing=failing):
 
                 def code(args: list[str], failing: str = failing) -> int:
                     probed = args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT
+                    named = {"dockerfile": "HEAD:spark/Dockerfile", "dockerignore": "HEAD:spark/Dockerfile.dockerignore"}.get(failing)
                     return (
-                        1 if (failing == "probe" and probed) or (failing == "tree" and "ls-tree" in args) or (failing == "dockerfile" and "show" in args) else 0
+                        1 if (failing == "probe" and probed) or (failing == "tree" and "ls-tree" in args) or (named is not None and args[-1:] == [named]) else 0
                     )
 
                 result, calls, record = self.image_run(
@@ -1152,7 +1188,7 @@ class HostRunnerCase(unittest.TestCase):
                     if "ls-tree" in args:
                         return TREE
                     if "show" in args:
-                        return DOCKERFILE
+                        return DOCKERIGNORE if args[-1] == "HEAD:spark/Dockerfile.dockerignore" else DOCKERFILE
                     if args[:1] == ["run"] and args[-1] == host_mode.SOURCE_SCRIPT:
                         return IMAGE_FILES
                     if args[:1] == [command] and (args[:2] == ["image", "tag"] or not given):
