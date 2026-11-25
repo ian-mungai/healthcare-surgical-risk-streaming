@@ -543,8 +543,9 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "spark/internal_classes.py": (),
     "spark/internal_diagnostic.py": (
-        "_any_of", "accepted_diagnostics", "class_chain", "frame_label", "frames_of", "internal_error_line", "is_diagnostic", "is_exception_class",
-        "is_frame", "module_class", "mro_of", "traceback_of", "trusted_classes",
+        "_any_of", "_contents", "accepted_diagnostics", "add_code", "class_chain", "frame_label", "frames_of", "held_code", "internal_error_line",
+        "is_class", "is_diagnostic", "is_exception_class", "is_frame", "is_held", "loaded_modules", "module_class", "module_name_of", "mro_of",
+        "traceback_of", "trusted_classes",
     ),
     "spark/jobs/__init__.py": (),
     "spark/jobs/bronze_clinical_lab.py": (

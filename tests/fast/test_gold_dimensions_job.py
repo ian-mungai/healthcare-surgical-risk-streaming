@@ -356,7 +356,7 @@ class CommandTests(unittest.TestCase):
                     self.assertEqual((wanted[0], "", f"{JOB}: {wanted[1]}\n"), (code, out, err))
 
     def test_an_error_whose_source_loader_raises_is_still_exit_70_with_both_lines(self) -> None:
-        error = error_with_raising_loader()
+        error = error_with_raising_loader(self)
 
         def execute(arguments: Namespace) -> dict[str, Any]:
             raise error

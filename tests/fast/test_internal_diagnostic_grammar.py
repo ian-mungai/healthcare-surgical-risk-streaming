@@ -45,9 +45,9 @@ class Accepted(unittest.TestCase):
         errors: list[BaseException] = [caught(outer), caught(lambda: nested(10)), RuntimeError(MARKER), KeyboardInterrupt(), ExceptionGroup("g", [OSError()])]
         errors += [type(name, (Exception,), {"__module__": module})(MARKER) for name in odd for module in ("m", "m-n", "m n", "")]
         source = f"def {ENTRY}():\n    raise KeyError\n"
-        errors += [from_file(f"/x/{name}-y.py", source) for name in ("spark", "a b")]
-        errors += [from_file(str(ROOT / TRACKED), source), from_file(f"{ROOT}/spark/../{TRACKED}", source)]
-        errors += [from_file(str(ROOT / "spark" / f"{name}.py"), source) for name in odd]
+        errors += [from_file(self, f"/x/{name}-y.py", source) for name in ("spark", "a b")]
+        errors += [from_file(self, str(ROOT / TRACKED), source), from_file(self, f"{ROOT}/spark/../{TRACKED}", source)]
+        errors += [from_file(self, str(ROOT / "spark" / f"{name}.py"), source) for name in odd]
         for error in errors:
             line = internal_error_line(error)
             with self.subTest(line=line[:80]):

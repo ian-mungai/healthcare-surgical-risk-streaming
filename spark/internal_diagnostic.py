@@ -13,11 +13,16 @@ and nothing that it holds: ``internal_error class=<a> <- <b> frames=<f1> | <f2>`
   owns, because they run its ``__class__``, ``__instancecheck__`` and ``__subclasscheck__``.
 - ``frames`` is the traceback of the first error, the last ``FRAME_LIMIT`` of them, the innermost last. The walk follows ``tb_next`` and reads the code
   object of each frame directly: no source line is read (``traceback`` and ``linecache`` are not used, so a source loader never runs). A frame is
-  ``path:function`` (the path from the root of the project, as in ``spark/result_file.py``) only when its file name, with ``..`` resolved as text, is
-  exactly the root of the project and a path of the fixed inventory of tracked code (``spark/internal_inventory.py``, which
-  ``scripts/quality/internal_inventory.py`` generates and a fast test checks against ``git ls-files`` and the AST of each file) and its function is a name
-  that the inventory holds for that file (or one of ``FIXED_NAMES``). Every other frame is the word ``other``, and a run of them is one: a name that data can
-  build (a generated file name, a function compiled at run time) is never in the inventory.
+  ``path:function`` (the path from the root of the project, as in ``spark/result_file.py``) only when two checks pass, the first before any name is read.
+  First, its code object is the very object (found by ``is``) that a loaded project module holds: a function, a method, a nested function, a lambda or a
+  generator expression that the module's own namespace reaches. PySpark 4.1 rebuilds a traceback from the message of a Java error and makes a NEW code object
+  for each frame with the file name, the function name and the line number of the text, so a message could choose a label of the inventory; a new object is
+  never one that a module holds, so a rebuilt frame is ``other`` whatever it says. Second, its file name, with ``..`` resolved as text, is exactly the root of
+  the project and a path of the fixed inventory of tracked code (``spark/internal_inventory.py``, which ``scripts/quality/internal_inventory.py`` generates
+  and a fast test checks against ``git ls-files`` and the AST of each file) and its function is a name that the inventory holds for that file (or one of
+  ``FIXED_NAMES``). Every other frame is the word ``other``, and a run of them is one. The code of a module's own body (``<module>``) is held by no object, so
+  its frame is ``other``. The holders are found in modules that are already in ``sys.modules`` (the inventory's modules and ``__main__``): nothing is imported
+  and no file is read, and no code of an object in a module runs (types are read from their slots, as for the classes).
 - A frame has **no line number**, in the producer or in the grammar. PySpark 4.1 rebuilds a traceback from the message of a Java error and sets the line of
   each frame (``co_firstlineno``, ``co_lines``) from a number in that message, so a value of the data could print as the line number beside the name of a
   tracked file and function. The line number is never read (``tb_lineno`` is not used), and a frame that has one is not a frame of the grammar. So a reader
@@ -33,6 +38,7 @@ and no project module (other than the lists in ``spark/internal_classes.py`` and
 from __future__ import annotations
 
 import builtins
+import functools
 import os
 import re
 import sys
@@ -47,6 +53,9 @@ CLASS_LIMIT = 5
 FRAME_LIMIT = 40
 WALK_LIMIT = 100_000
 ROOT_LIMIT = 4_096  # a file name longer than this is never a path of the project
+REGISTRY_LIMIT = (
+    200_000  # the objects of the loaded project modules that one walk visits; a longer walk stops and the frames that it has not found are ``other``
+)
 INTERNAL_EXIT_CODE = 70
 OTHER = "other"
 UNAVAILABLE = "unavailable"
@@ -67,6 +76,11 @@ _TRACEBACK = BaseException.__dict__["__traceback__"]
 _CAUSE = BaseException.__dict__["__cause__"]
 _CONTEXT = BaseException.__dict__["__context__"]
 _MRO = type.__dict__["__mro__"]
+_CLASS_DICT = type.__dict__["__dict__"]
+_FUNCTION_CODE = types.FunctionType.__dict__["__code__"]
+_FUNCTION_CLOSURE = types.FunctionType.__dict__["__closure__"]
+_CELL_CONTENTS = types.CellType.__dict__["cell_contents"]
+_CACHED = type(functools.cache(len))  # the type of a function that ``functools.cache`` or ``lru_cache`` wraps
 
 
 def mro_of(kind: type) -> tuple[type, ...]:
@@ -75,9 +89,14 @@ def mro_of(kind: type) -> tuple[type, ...]:
     return found
 
 
+def is_class(item: object) -> bool:
+    """Whether ``item`` is a class, by ``type(item)`` and its ``__mro__`` slot: never ``isinstance``."""
+    return any(base is type for base in mro_of(type(item)))
+
+
 def is_exception_class(item: object) -> bool:
     """Whether ``item`` is a class that derives from ``BaseException``, by ``type(item)`` and the ``__mro__`` slots: never ``isinstance`` or ``issubclass``."""
-    return any(base is type for base in mro_of(type(item))) and any(base is BaseException for base in mro_of(cast(type, item)))
+    return is_class(item) and any(base is BaseException for base in mro_of(cast(type, item)))
 
 
 # An alias (``IOError`` is ``OSError``) keeps the name of the class.
@@ -131,6 +150,73 @@ def traceback_of(error: BaseException) -> types.TracebackType | None:
     return found
 
 
+def module_name_of(path: str) -> str:
+    """The dotted module name of a file of the inventory (``spark/result_file.py`` is ``spark.result_file``; ``spark/__init__.py`` is ``spark``)."""
+    return path.removesuffix(".py").removesuffix("/__init__").replace("/", ".")
+
+
+MODULE_NAMES = (*(module_name_of(path) for path in INVENTORY), "__main__")
+
+
+def loaded_modules() -> list[types.ModuleType]:
+    """The modules of the inventory, and the main module, that are already loaded (a plain module only: nothing is imported)."""
+    found = (sys.modules.get(name) for name in MODULE_NAMES)
+    return [module for module in found if type(module) is types.ModuleType]
+
+
+def add_code(code: types.CodeType, held: dict[int, types.CodeType]) -> None:
+    """Put ``code`` and the code objects in its constants (nested functions, lambdas, generator expressions) into ``held``."""
+    stack = [code]
+    while stack:
+        current = stack.pop()
+        held[id(current)] = current
+        stack.extend(item for item in current.co_consts if type(item) is types.CodeType)
+
+
+def held_code() -> dict[int, types.CodeType]:
+    """The code objects that the loaded project modules hold, by ``id``: the functions of the namespace of each module and of its classes (methods, static
+    and class methods, properties), the functions that a cached function or a closure wraps, and the code nested in each. A new code object (``compile``,
+    ``replace`` or ``types.CodeType``: what PySpark makes for a rebuilt frame) is never in it, because only code that a module reaches is. The walk reads each
+    type from its slot and runs no code of an object. It stops after ``REGISTRY_LIMIT`` objects, and a frame that it has not found is ``other``."""
+    held: dict[int, types.CodeType] = {}
+    seen: set[int] = set()
+    pending: list[object] = [item for module in loaded_modules() for item in module.__dict__.values()]
+    budget = REGISTRY_LIMIT
+    while pending and budget > 0:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        budget -= 1
+        kind = type(item)
+        if kind is types.FunctionType:
+            add_code(_FUNCTION_CODE.__get__(item), held)
+            closure = _FUNCTION_CLOSURE.__get__(item)
+            pending.extend(_contents(cell) for cell in closure or ())
+        elif kind is staticmethod or kind is classmethod:
+            pending.append(item.__func__)  # type: ignore[attr-defined]
+        elif kind is property:
+            pending.extend((item.fget, item.fset, item.fdel))  # type: ignore[attr-defined]
+        elif kind is _CACHED:
+            pending.append(item.__wrapped__)  # type: ignore[attr-defined]
+        elif is_class(item):
+            pending.extend(_CLASS_DICT.__get__(item).values())
+    return held
+
+
+def _contents(cell: object) -> object:
+    """The value of a closure cell, or none when the cell is empty."""
+    try:
+        return _CELL_CONTENTS.__get__(cell)
+    except ValueError:
+        return None
+
+
+def is_held(code: object, held: dict[int, types.CodeType]) -> bool:
+    """Whether ``code`` is the very code object (``is``) of ``held``: a code object that is not a plain ``code`` or that a walk did not find is not."""
+    return type(code) is types.CodeType and held.get(id(code)) is code
+
+
 def frame_label(filename: object, name: object) -> str:
     """``path:function`` of a frame of the inventory, else ``other``. The two values come from a code object: the path (``..`` resolved as text) must be
     exactly the root of the project and a path of the inventory, and the function a name that the inventory holds for it. No line number is taken or printed."""
@@ -148,13 +234,16 @@ def frames_of(error: BaseException) -> list[str]:
     """The last ``FRAME_LIMIT`` frames of the traceback of ``error``, the innermost last, a run of ``other`` frames as one."""
     labels: list[str] = []
     step = traceback_of(error)
+    held: dict[int, types.CodeType] | None = None
     walked = 0
     while step is not None:
         walked += 1
         if walked > WALK_LIMIT:
             raise ValueError("the traceback does not end")
         code = step.tb_frame.f_code
-        label = frame_label(code.co_filename, code.co_name)
+        if held is None:
+            held = held_code()
+        label = frame_label(code.co_filename, code.co_name) if is_held(code, held) else OTHER  # a rebuilt frame is ``other`` before any name is read
         if label != OTHER or not labels or labels[-1] != OTHER:
             labels.append(label)
         step = step.tb_next

@@ -218,7 +218,7 @@ class CommandLine(InFolder):
         self.assertNotIn(MARKER, self.path.read_text())
 
     def test_a_line_number_on_a_tracked_frame_is_not_in_standard_error_or_the_result_file(self) -> None:
-        code, out, err = self.call(["verify", "--branch", "b"], raising(error_with_marked_line()))
+        code, out, err = self.call(["verify", "--branch", "b"], raising(error_with_marked_line(self)))
         self.assertEqual((70, ""), (code, out))
         assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", ("builtins.KeyError",), LINE_MARKER)
         self.assertEqual({"job": "silver_signals", "mode": "verify", "refusal": ["internal_error"]}, self.document())

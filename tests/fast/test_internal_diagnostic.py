@@ -7,10 +7,11 @@ Failure modes covered here:
 - The line carries a value. The message, the arguments, the ``repr`` or a local variable can hold a value of the test set, and so can a name: a class that
   a library built from data (its module or its name), a file name, a function compiled from a text (``<string>``) and the frames that PySpark 4 rebuilds from
   the message of a Java error. Only a class on a fixed list (found by identity, so a class with the same name is not on it) is named, and a frame is named
-  only when its path (``..`` resolved as text) is exactly the root of the project and a path of the fixed inventory of tracked files
-  (``spark/internal_inventory.py``) and its function is a name that the inventory holds for that file (or a fixed name such as ``<lambda>``). A generated file
-  name under ``spark/``, a function name that is made at run time beside a tracked file name and a path with ``..`` are all ``other``. Every other class and
-  frame is the fixed word ``other``, and no name of one is read.
+  only when its code object is the very object that a loaded project module holds (``test_internal_diagnostic_rebuilt.py``: PySpark rebuilds frames from a
+  message, with any file and function name) and its path (``..`` resolved as text) is exactly the root of the project and a path of the fixed inventory of
+  tracked files (``spark/internal_inventory.py``) and its function is a name that the inventory holds for that file (or a fixed name such as ``<lambda>``). A
+  generated file name under ``spark/``, a function name that is made at run time beside a tracked file name and a path with ``..`` are all ``other``. Every
+  other class and frame is the fixed word ``other``, and no name of one is read.
 - Reading a class runs code of a library or of the error: the ``__class__`` of an object, the ``__subclasscheck__`` or ``__instancecheck__`` of a metaclass.
   The lookup uses ``type(error)`` and the ``__mro__`` slot of each class and never ``isinstance`` or ``issubclass`` on a class that it does not own.
 - Reading a class or a frame runs code of the error or of a library: a source loader that raises (``traceback`` reads the source lines), a property of an
@@ -37,7 +38,7 @@ from spark.internal_classes import PACKAGES
 from spark.internal_diagnostic import CLASS_LIMIT, FRAME_LIMIT, internal_error_line
 from spark.internal_inventory import INVENTORY
 from tests.fast.internal_line_support import LINE_MARKER as MARKER_LINE
-from tests.fast.internal_line_support import RaisingLoader, assert_internal, error_with_marked_line
+from tests.fast.internal_line_support import RaisingLoader, assert_internal, error_with_marked_line, stand_in
 
 MARKER = "MARKER_4417"
 LINE_MARKER = int(MARKER_LINE)  # a number that a message can carry; it must not be in a line, a file or standard error
@@ -108,12 +109,13 @@ def parts(line: str) -> tuple[list[str], list[str]]:
     return head.partition("class=")[2].split(" <- "), [frame for frame in tail.split(" | ") if frame]
 
 
-def from_file(filename: str, source: str, entry: str = ENTRY, loader: object | None = None) -> BaseException:
-    """The error of ``entry()`` of ``source`` as if it were compiled from the file ``filename``."""
+def from_file(case: unittest.TestCase, filename: str, source: str, entry: str = ENTRY, loader: object | None = None) -> BaseException:
+    """The error of ``entry()`` of ``source`` as if it were compiled from the file ``filename`` and held by the loaded module of that file."""
     scope: dict[str, Any] = {"__name__": "fake_job"}
     if loader is not None:
         scope["__loader__"] = loader
     exec(compile(source, filename, "exec"), scope)  # noqa: S102 (a stand-in for the project's own module)
+    stand_in(case, filename, scope)
     return caught(scope[entry])
 
 
@@ -132,7 +134,7 @@ class TheLine(unittest.TestCase):
 
     def test_the_frames_of_the_project_are_named_with_path_line_and_function(self) -> None:
         source = f"def {ENTRY}():\n    {INNER}()\n\n\ndef {INNER}():\n    raise KeyError\n"
-        classes, frames = self.check(internal_error_line(from_file(OWN, source)))
+        classes, frames = self.check(internal_error_line(from_file(self, OWN, source)))
         self.assertEqual(["builtins.KeyError"], classes)
         self.assertEqual(["other", f"{TRACKED}:{ENTRY}", f"{TRACKED}:{INNER}"], frames)
 
@@ -141,7 +143,7 @@ class TheLine(unittest.TestCase):
             path = next(item for item in sorted(INVENTORY) if item.startswith(f"{package}/") and INVENTORY[item])
             name = INVENTORY[path][0]
             with self.subTest(package=package):
-                frames = parts(internal_error_line(from_file(str(ROOT / path), f"def {name}():\n    raise KeyError\n", name)))[1]
+                frames = parts(internal_error_line(from_file(self, str(ROOT / path), f"def {name}():\n    raise KeyError\n", name)))[1]
                 self.assertEqual(["other", f"{path}:{name}"], frames)
         source = f"def {ENTRY}():\n    raise KeyError\n"
         for filename in (
@@ -155,7 +157,7 @@ class TheLine(unittest.TestCase):
             f"{MARKER}.scala",
         ):
             with self.subTest(filename=filename):
-                self.assertEqual(["other"], self.check(internal_error_line(from_file(filename, source)))[1])
+                self.assertEqual(["other"], self.check(internal_error_line(from_file(self, filename, source)))[1])
 
     def test_a_file_that_the_inventory_does_not_hold_is_other_even_under_a_package_and_with_a_good_name(self) -> None:
         source = f"def {ENTRY}():\n    raise KeyError\n"
@@ -174,13 +176,13 @@ class TheLine(unittest.TestCase):
             "spark/.hidden/x.py",
         ):
             with self.subTest(relative=relative):
-                self.assertEqual(["other"], self.check(internal_error_line(from_file(str(ROOT / relative), source)))[1])
+                self.assertEqual(["other"], self.check(internal_error_line(from_file(self, str(ROOT / relative), source)))[1])
 
     def test_a_path_that_resolves_as_text_to_a_file_of_the_inventory_is_that_file(self) -> None:
         source = f"def {ENTRY}():\n    raise KeyError\n"
         for filename in (f"{ROOT}/spark/../{TRACKED}", f"{ROOT}/./{TRACKED}", f"{ROOT}//{TRACKED}"):
             with self.subTest(filename=filename):
-                self.assertEqual(["other", f"{TRACKED}:{ENTRY}"], self.check(internal_error_line(from_file(filename, source)))[1])
+                self.assertEqual(["other", f"{TRACKED}:{ENTRY}"], self.check(internal_error_line(from_file(self, filename, source)))[1])
 
     def test_a_function_name_that_the_inventory_does_not_hold_for_that_file_is_other(self) -> None:
         for name in (f"{MARKER}_function", FOREIGN, "has space", "a;b", "x" * 101, "é", "", "<string>", "<genexpr> ", ENTRY + "_"):
@@ -190,14 +192,16 @@ class TheLine(unittest.TestCase):
                 function = types.FunctionType(
                     scope[ENTRY].__code__.replace(co_name=name), scope
                 )  # the name is made at run time, the file name is a tracked one
+                stand_in(self, OWN, {"held": function})  # held by the loaded module: only the name is wrong
                 self.assertEqual(["other"], self.check(internal_error_line(caught(function)))[1])
 
     def test_the_fixed_names_of_code_without_a_function_are_named_in_a_file_of_the_inventory(self) -> None:
         source = f"def {ENTRY}():\n    return list(1 / n for n in [0])\n"
-        frames = self.check(internal_error_line(from_file(OWN, source)))[1]
+        frames = self.check(internal_error_line(from_file(self, OWN, source)))[1]
         self.assertEqual(["other", f"{TRACKED}:{ENTRY}", f"{TRACKED}:<genexpr>"], frames)
         scope: dict[str, Any] = {}
         exec(compile("run = lambda: 1 / 0\n", OWN, "exec"), scope)  # noqa: S102
+        stand_in(self, OWN, scope)
         self.assertEqual(["other", f"{TRACKED}:<lambda>"], self.check(internal_error_line(caught(scope["run"])))[1])
 
     def test_a_frame_is_the_path_and_the_function_and_never_a_line_number(self) -> None:
@@ -214,7 +218,7 @@ class TheLine(unittest.TestCase):
         # in it, so a value of the data can be the line number of a frame of a tracked file and function.
         for number in (LINE_MARKER, 1, 63):
             with self.subTest(number=number):
-                error = error_with_marked_line(str(number))
+                error = error_with_marked_line(self, str(number))
                 self.assertEqual(number, last_line(error))  # the innermost frame carries the number
                 line = internal_error_line(error)
                 self.assertEqual((["builtins.KeyError"], ["other", f"{TRACKED}:{ENTRY}"]), self.check(line))
@@ -225,6 +229,7 @@ class TheLine(unittest.TestCase):
         scope: dict[str, Any] = {}
         exec(compile(f"def {ENTRY}():\n    raise KeyError\n", OWN, "exec"), scope)  # noqa: S102
         function = types.FunctionType(scope[ENTRY].__code__.replace(co_firstlineno=LINE_MARKER), scope)
+        stand_in(self, OWN, {"held": function})
         line = internal_error_line(caught(function))
         self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:{ENTRY}", line)
         self.assertNotIn(str(LINE_MARKER + 1), line)
@@ -245,22 +250,17 @@ class TheLine(unittest.TestCase):
         classes, frames = self.check(internal_error_line(caught(scope[MARKER])))
         self.assertEqual((["builtins.KeyError"], ["other"]), (classes, frames))
 
-    def test_the_frames_that_pyspark_builds_from_the_message_of_a_java_error_are_other(self) -> None:
-        # PySpark 4 compiles one frame for each line of the Java stack, with the file and the function of the line (a name that can come from the message).
-        code = compile("\n" * 8 + "raise ValueError('x')", f"{MARKER}.scala", "exec").replace(co_name=f"{MARKER}_function")
-        classes, frames = self.check(internal_error_line(caught(lambda: exec(code, {}))))  # noqa: S102
-        self.assertEqual((["builtins.ValueError"], ["other"]), (classes, frames))
-
     def test_a_run_of_other_frames_is_one_and_the_project_frames_between_stay(self) -> None:
         source = f"def {ENTRY}():\n    callback()\n"
         scope: dict[str, Any] = {"callback": lambda: (_ for _ in ()).throw(KeyError())}
         exec(compile(source, OWN, "exec"), scope)  # noqa: S102
+        stand_in(self, OWN, scope)
         _, frames = self.check(internal_error_line(caught(scope[ENTRY])))
         self.assertEqual(["other", f"{TRACKED}:{ENTRY}", "other"], frames)
 
     def test_the_frames_are_cut_at_forty_with_the_innermost_last(self) -> None:
         source = f"def {ENTRY}(depth=200):\n    if depth == 0:\n        raise RuntimeError\n    {ENTRY}(depth - 1)\n"
-        _, frames = self.check(internal_error_line(from_file(OWN, source)))
+        _, frames = self.check(internal_error_line(from_file(self, OWN, source)))
         self.assertEqual(FRAME_LIMIT, len(frames))
         self.assertEqual(f"{TRACKED}:{ENTRY}", frames[-1])
         self.assertNotIn("other", frames)
@@ -460,12 +460,12 @@ class TheClasses(unittest.TestCase):
 class TheFallback(unittest.TestCase):
     def test_a_source_loader_that_raises_does_not_stop_the_line(self) -> None:
         source = f"def {ENTRY}():\n    raise KeyError\n"
-        line = internal_error_line(from_file(OWN, source, loader=RaisingLoader()))
+        line = internal_error_line(from_file(self, OWN, source, loader=RaisingLoader()))
         self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:{ENTRY}", line)
 
     def test_no_source_line_of_any_file_is_read(self) -> None:
         with mock.patch("linecache.getlines", side_effect=AssertionError("a source line was read")) as read, mock.patch("linecache.getline", read):
-            self.assertTrue(diagnostic.is_diagnostic(internal_error_line(from_file(OWN, f"def {ENTRY}():\n    raise KeyError\n"))))
+            self.assertTrue(diagnostic.is_diagnostic(internal_error_line(from_file(self, OWN, f"def {ENTRY}():\n    raise KeyError\n"))))
 
     def test_any_failure_of_the_formatter_is_the_fixed_line_and_never_an_error(self) -> None:
         self.assertEqual("internal_error class=unavailable frames=unavailable", diagnostic.UNAVAILABLE_LINE)
