@@ -32,6 +32,7 @@ class Setting:
     value: int
     count: int
     flag: str | None
+    java_property: str | None
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,7 @@ class Budget:
 TOP_LEVEL_KEYS = {"postgres", "clients", "not_clients"}
 POSTGRES_KEYS = {"max_connections", "superuser_reserved_connections", "margin"}
 CLIENT_KEYS = {"account", "services", "max", "allotment", "settings", "source"}
-SETTING_KEYS = {"file", "path", "value", "count", "flag"}
+SETTING_KEYS = {"file", "path", "value", "count", "flag", "java_property"}
 SETTING_REQUIRED = {"file", "path", "value", "count"}
 
 
@@ -82,12 +83,16 @@ def parse_setting(client: str, entry: object) -> Setting:
     what = f"client {client}: a setting"
     setting = mapping(entry, what)
     exact_keys(setting, SETTING_KEYS, SETTING_REQUIRED, what)
-    file, path, flag = setting["file"], setting["path"], setting.get("flag")
-    if not (isinstance(file, str) and file and isinstance(path, str) and path and (flag is None or isinstance(flag, str) and flag)):
-        raise BudgetError(f"{what}: file, path and flag must be text")
+    file, path, flag, java_property = setting["file"], setting["path"], setting.get("flag"), setting.get("java_property")
+    if not (isinstance(file, str) and file and isinstance(path, str) and path):
+        raise BudgetError(f"{what}: file and path must be text")
+    if not (flag is None or isinstance(flag, str) and flag) or not (java_property is None or isinstance(java_property, str) and java_property):
+        raise BudgetError(f"{what}: flag and java_property must be text")
+    if flag is not None and java_property is not None:
+        raise BudgetError(f"{what}: a setting names a flag or a java_property, not both")
     if not whole_number(setting["value"], minimum=1) or not whole_number(setting["count"], minimum=0):
         raise BudgetError(f"{what}: value must be a positive whole number and count a whole number (0 for a setting that holds no connection)")
-    return Setting(file, path, int(str(setting["value"])), int(str(setting["count"])), flag)
+    return Setting(file, path, int(str(setting["value"])), int(str(setting["count"])), flag, java_property)
 
 
 def parse_client(name: str, entry: object) -> Client:
@@ -204,12 +209,21 @@ def coverage_problems(budget: Budget, limit_services: Iterable[str], tool_accoun
     return problems
 
 
+def java_property_value(options: object, name: str) -> str | None:
+    """The value of ``-D<name>=<value>`` in a text of Java options, or ``None`` when no option sets exactly that name."""
+    prefix = f"-D{name}="
+    values = [item[len(prefix) :] for item in str(options).split() if item.startswith(prefix)]
+    return values[-1] if values else None
+
+
 def find_setting(document: object, setting: Setting) -> object | None:
     node = document
     for part in setting.path.split("."):
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
+    if setting.java_property is not None:
+        return java_property_value(node, setting.java_property)
     if setting.flag is None:
         return node
     if not isinstance(node, list) or setting.flag not in node or node.index(setting.flag) + 1 >= len(node):
@@ -224,7 +238,7 @@ def setting_problems(budget: Budget, read: Callable[[str], str]) -> list[str]:
     for client in budget.clients.values():
         for setting in client.settings:
             where = f"{client.name}: {setting.file}"
-            name = setting.path if setting.flag is None else f"{setting.path} {setting.flag}"
+            name = " ".join(item for item in (setting.path, setting.flag, setting.java_property) if item)
             try:
                 found = find_setting(load_yaml(read(setting.file)), setting)
             except OSError:
@@ -240,19 +254,33 @@ def setting_problems(budget: Budget, read: Callable[[str], str]) -> list[str]:
     return problems
 
 
+def passed_figures(command: object) -> dict[str, list[str]]:
+    """Each ``name=value`` that follows a ``-c`` item of the server's command, with every value it was given. An item that no ``-c`` introduces sets nothing."""
+    found: dict[str, list[str]] = {}
+    if not isinstance(command, list):
+        return found
+    for before, item in zip(command, command[1:], strict=False):
+        if before == "-c" and isinstance(item, str) and "=" in item:
+            name, value = item.split("=", 1)
+            found.setdefault(name, []).append(value)
+    return found
+
+
 def postgres_problems(budget: Budget, postgres_service_text: str) -> list[str]:
-    """Each figure of the budget that the PostgreSQL service does not pass to the server as ``-c name=value``, so that the image default would decide."""
+    """Each figure of the budget that the PostgreSQL service does not pass as the pair ``-c``, ``name=value``, so that the image default would decide."""
     try:
         document = load_yaml(postgres_service_text)
     except YamlError as error:
         return [f"the PostgreSQL service file is not valid YAML: {error}"]
     service = document.get("services", {}).get("postgres", {}) if isinstance(document, dict) else {}
-    command = service.get("command", []) if isinstance(service, dict) else []
-    passed = {item.split("=", 1)[0]: item.split("=", 1)[1] for item in command if isinstance(item, str) and "=" in item} if isinstance(command, list) else {}
+    passed = passed_figures(service.get("command", []) if isinstance(service, dict) else [])
     problems = []
     for name, wanted in (("max_connections", budget.max_connections), ("superuser_reserved_connections", budget.superuser_reserved_connections)):
-        if name not in passed:
-            problems.append(f"{name}: the postgres service does not pass it with -c, so the image default decides; the budget says {wanted}")
-        elif passed[name] != str(wanted):
-            problems.append(f"{name}: the postgres service passes {passed[name]}; the budget says {wanted}")
+        values = passed.get(name, [])
+        if not values:
+            problems.append(f"{name}: the postgres service does not pass it as -c {name}=<value>, so the image default decides; the budget says {wanted}")
+        elif len(set(values)) > 1:
+            problems.append(f"{name}: the postgres service passes it twice with different values {values}; the budget says {wanted}")
+        elif values[0] != str(wanted):
+            problems.append(f"{name}: the postgres service passes {values[0]}; the budget says {wanted}")
     return problems

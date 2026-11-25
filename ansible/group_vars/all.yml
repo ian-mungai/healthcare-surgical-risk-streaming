@@ -128,6 +128,10 @@ airbyte_owner: root
 airbyte_group: root
 airbyte_namespace: airbyte
 airbyte_release: airbyte
+# The Airbyte deployments that hold database connections and that the chart leaves to a rolling update, which starts the new pod while the old one still holds its
+# connections (Temporal alone holds 24, compose/postgres_connections.yml). The role makes each one Recreate before it upgrades and restarts them. The name is the part
+# after the release name. The chart already gives the server and the workload launcher the Recreate strategy; a test renders the release and compares the two lists.
+airbyte_recreate_deployments: [temporal, cron, worker, workload-api-server]
 airbyte_kubeconfig: /etc/rancher/k3s/k3s.yaml
 # The web service listens on the host's local address only. The forwarder maps this local port to the server service's port.
 airbyte_web_port: 8000
