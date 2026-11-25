@@ -7,8 +7,11 @@ starts. Nothing binds a port. The runner is untracked, so each test skips when i
 Failure modes covered here:
 
 - The probe passed on a job that exited 124 with any other diagnostic, or with none, because it never looked at the line that the job writes.
-- The text of the diagnostic was kept: the stack gives back the one fixed line when standard error is exactly that line and nothing otherwise, and the run
-  records only whether it matched.
+- The text of the diagnostic was kept: the stack gives back the one fixed line when the job's own lines of standard error are exactly that line and nothing
+  otherwise, and the run records only whether it matched.
+- The probe failed a job that stopped correctly because Docker, Compose or the Python runtime wrote a line of their own beside the stop line (the job's code
+  writes nothing else on this path): the check was on the whole stream, not on the job's own lines. It must still fail a stop line that is twice there, a
+  second line with the job's prefix (a failed-check code, a usage or settings code) and a traceback.
 - The probe passed on a job that exited 124 and left a result file or a container, or on a job that exited with another code.
 """
 
@@ -98,7 +101,10 @@ class Probe(unittest.TestCase):
 
 
 class StackDiagnostic(unittest.TestCase):
-    """``Stack.job_with_line`` gives back that line only when standard error is exactly it, and keeps no other text of the stream."""
+    """``Stack.job_with_line`` gives back that line only when the job's own lines of standard error are exactly it, and keeps no other text of the stream.
+
+    A line is the job's own when it starts with the job's prefix (``silver_cases: ``), the form of every line that the job writes, or is a traceback. The other
+    lines come from Docker, Compose or the Python runtime and are not kept."""
 
     def job(self, error: str, **keywords: Any) -> tuple[tuple[int, dict[str, Any], str, float], list[str]]:
         module = runner("silver_cases")
@@ -123,16 +129,32 @@ class StackDiagnostic(unittest.TestCase):
                 answer, _ = self.job(error, stderr_is=LINE)
                 self.assertEqual((124, {}, LINE), answer[:3])
 
-    def test_any_other_standard_error_gives_nothing(self) -> None:
+    def test_the_line_with_lines_of_docker_compose_or_the_runtime_around_it_gives_the_line(self) -> None:
+        for error in (
+            " Container run-postgres-1  Running\n" + LINE + "\n",
+            LINE + "\n Container run-spark-1  Stopped\n",
+            "WARN[0000] a variable is not set\n" + LINE + "\nsomething from the runtime\n",
+            "silver_labels: timeout\n" + LINE + "\n",
+        ):
+            with self.subTest(error=repr(error)):
+                answer, _ = self.job(error, stderr_is=LINE)
+                self.assertEqual((124, {}, LINE), answer[:3])
+
+    def test_any_other_lines_of_the_job_give_nothing(self) -> None:
         for error in (
             "",
             "\n",
-            LINE + "\nanother line\n",
-            "another line\n" + LINE + "\n",
+            LINE + "\n" + LINE + "\n",
+            LINE + "\nsilver_cases: failed\n",
+            "silver_cases: internal_error\n" + LINE + "\n",
+            "silver_cases: usage\n",
+            "Traceback (most recent call last):\n" + LINE + "\n",
+            LINE + "\nTraceback (most recent call last):\n",
             "x" + LINE,
             LINE + " x",
             "silver_labels: timeout\n",
             "Traceback: boom\n",
+            " Container run-postgres-1  Running\n",
         ):
             with self.subTest(error=repr(error)):
                 answer, _ = self.job(error, stderr_is=LINE)
@@ -153,7 +175,7 @@ class StackDiagnostic(unittest.TestCase):
 
 class ComposeProgress(unittest.TestCase):
     """Compose writes its own container progress (``Container x Creating``) to the standard error of ``docker compose run``, before the job's line. The probe
-    asks for no progress, so that the exact-line check sees the job's line alone."""
+    asks for no progress to keep that stream short; the check on the job's own lines does not depend on it."""
 
     PROGRESS = " Container run-postgres-1  Running\n Container run-nessie-1  Running\n"
 
@@ -188,8 +210,8 @@ class ComposeProgress(unittest.TestCase):
         (command,) = commands
         self.assertLess(command.index("--progress"), command.index("run"))
         self.assertEqual("quiet", command[command.index("--progress") + 1])
-        # The exact-line check is still the one that decides: a stop line with another line beside it gives nothing.
-        stack.run = lambda command, limit, **_: (124, "", LINE + "\nanother line\n")
+        # The check on the job's own lines still decides: a stop line with another line of the job beside it gives nothing.
+        stack.run = lambda command, limit, **_: (124, "", LINE + "\nsilver_cases: failed\n")
         self.assertEqual("", stack.job_with_line(["-c", "pass"], None, None, {}, 300, ("cases", "verify", "stalled_catalog"), LINE)[2])
 
     def test_every_job_of_the_stack_runs_without_progress(self) -> None:
