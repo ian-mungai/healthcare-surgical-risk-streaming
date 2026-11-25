@@ -8,18 +8,24 @@ Failure modes covered here, each against a stand-in of the host, of Airbyte, of 
   reading is unreadable, and the measurement still passes.
 - A third sync that copies bytes, repeats an earlier job or changes a version of landing/ or of the warehouse prefix passes for the idempotent copy.
 - A second load of the same manifest makes a branch of its own or writes to the warehouse, and the idempotence assertion still passes.
-- A planted file, load record, results folder or Nessie branch that the run did not create is deleted by its cleanup, or one that it did create stays, or an
+- A planted file, load record, results folder or staging folder that the run did not create is deleted by its cleanup, or one that it did create stays, or an
   absence is read from a failed readback.
-- A planted load record that Spark rejects is not rejected by Spark (the planted failure is a data fault that Spark's check finds, not only a record that the
-  controller refuses before Spark runs), or it is merged.
+- The planted Spark case writes to the lake: the runner starts a Spark job other than the table checks job (which writes nothing), starts it with a writable
+  staging volume, or deletes or puts an object under the warehouse prefix.
+- The planted staging folder is not the one the controller's own code builds: it skips the gate (a substituted object version is staged), another file than the
+  laboratory copy differs from the verified bytes, the plan is of another form, or a refused staging leaves a staged file behind.
+- The runner's launch differs from the controller's own one-off by more than the slot, or the job's container outlives the case (a deadline, a lost reply), or
+  a container of another launch is removed.
 - A planted-file case that passes without the exact failed-check refusal and finding, or with a changed manifest inventory.
 - A Dagster run or an Airbyte job that the run started is still running after a failure, or a success that arrives after the deadline passes.
 - A Dagster launch whose reply is lost, or whose run ID is another run's, leaves a run that nothing ends: each attempt is kept before it is sent and tagged with
   a token of its own, and the cleanup reconciles it by that tag, ends the run it finds and reports an attempt that stays unresolved as a failure. A failed
   lookup in one step of the cleanup stops no other step.
 - A host script that refuses a run folder, a receipt or a lookup shows content, or a lookup error (a permission error) reads as an absence.
-- The planted Spark case's results folder is not made by this run (exclusively) and is removed anyway, or stays; its check list holds fewer checks than the
-  required ones for a table that is not the laboratory table; its publish refusal holds more than the fixed text.
+- The planted Spark case's results or staging folder is not made by this run (exclusively) and is removed anyway, or stays; its check list holds fewer checks
+  than the required ones for a table that is not the laboratory table.
+- The job's output (its result holds the checks of two sealed tables, and its standard error can hold row text) leaves the host, or an unexpected word of a host
+  script is taken for a judged result.
 - A sampler that is started and fails to be ready is left running.
 - The held-out rule: a table check's counts or values reach the host's answer or the evidence files (only check names and flags may). A receipt with a
   duplicated or a missing check passes, or a run folder with a secret-shaped text, another run's ID or another commit is copied into ``runs/``.
@@ -30,6 +36,7 @@ name, attribute and call of the runner's flow fits together, which no other test
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import importlib
@@ -47,17 +54,18 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest import mock
-from urllib.parse import unquote
 
 from scripts.ingestion import table_checks as checks
 from scripts.ingestion.connection import fixed_sample_selection
 from scripts.ingestion.landing import LANDING_PREFIX
-from scripts.ingestion.manifest import MANIFEST_PREFIX, ManifestRef
-from scripts.ingestion.record_catalog import CatalogError
+from scripts.ingestion.manifest import MANIFEST_PREFIX, ManifestRef, publish_manifest
 from scripts.ingestion.record_load import RefState
-from scripts.stack.nessie import NessieError, Reference
+from scripts.process import CompletedProcess
+from scripts.stack.groups import Settings
+from scripts.stack.nessie import Reference
 from spark import table_checks as rules
 from tests.e2e.run_record import Record
+from tests.fast.ingestion_support import Landed, digest, landed_set, list_text_for, synthetic_pin
 from tests.fast.memory_store import MemoryStore
 from tests.fast.record_support import FakeClock
 
@@ -66,7 +74,6 @@ RUNNER = ROOT / "tests" / "e2e" / "ingestion_host.py"
 SAMPLE = sorted(fixed_sample_selection().source_keys)
 SOURCE_PREFIX = "vitaldb/1.0.0/"
 HASH_BEFORE, HASH_AFTER, BRANCH_HEAD = "a" * 64, "b" * 64, "c" * 64
-PLANTED_HEAD = "7" * 64
 PLANTED_SNAPSHOT = 99
 SNAPSHOTS = {"clinical_data": 11, "lab_data": 12, "track_list": 13}
 REQUIRED = {
@@ -81,6 +88,9 @@ TOKEN = "abcd1234"  # noqa: S105 - the run token of a stand-in, no secret
 RUN_ID = "run_20261125_abcd1234"
 PLANT_PREFIX = f"{LANDING_PREFIX}p4_host_{TOKEN}/"
 LOAD_RECORD = f"/opt/dagster/runs/record_loads/{RUN_ID}.load_record.json"
+STAGING = f"/opt/dagster/staging/p4_host_{TOKEN}_fault"
+SLOT_NAME = "surgical-risk-spark-slot"
+OWNER_LABEL = "surgical-risk.spark_slot_owner"
 
 
 def good_tables(*, failed: tuple[tuple[str, str], ...] = ()) -> list[dict[str, Any]]:
@@ -118,7 +128,11 @@ class World:
         self.removed: list[str] = []
         self.deleted: list[tuple[str, str]] = []
         self.puts: list[tuple[str, str]] = []
-        self.planted_branches: dict[str, str] = {}
+        self.staged: dict[str, str] = {}
+        self.containers: dict[str, str] = {}
+        self.spark_jobs: list[list[str]] = []
+        self.compose_runs: list[list[str]] = []
+        self.catalog_writes: list[str] = []
         self.disk_reads = 0
         self.launch_seen: list[bool] = []
         self.run_tokens: dict[str, str] = {}
@@ -129,9 +143,6 @@ class World:
         self.sampler_stops = 0
         self.sampler_starts = 0
         self.sampler_readies = 0
-        self.branch_deleted = False
-        self.appended: list[str] = []
-        self.planted_record: dict[str, Any] = {}
         self.instance = INSTANCE
         self.commit = COMMIT
 
@@ -163,40 +174,26 @@ class FakeAws:
         if arguments[1] == "delete-object":
             key, version_id = arguments[arguments.index("--key") + 1], arguments[arguments.index("--version-id") + 1]
             self.world.deleted.append((key, version_id))
-            if not self.world.delete_fails and not ("warehouse_plant_stays" in self.world.faults and key.endswith("data_planted.parquet")):
+            if not self.world.delete_fails:
                 self.world.store.remove_version(key, version_id)
         return {}
 
 
 class FakeClient:
-    """The Nessie calls of the planted failing Spark check: read a table's content, make a branch, delete it."""
+    """The catalog client's calls that write: no case of the runner may make one, so each is kept."""
 
     def __init__(self, world: World) -> None:
         self.world = world
 
     def request(self, method: str, path: str, body: Any = None, query: Any = None) -> Any:
-        table = unquote(path).rsplit(".", 1)[1]
-        planted = table == "lab_data" and "p4_host_" in unquote(path)
-        return {
-            "content": {
-                "type": "ICEBERG_TABLE",
-                "id": f"id_{table}",
-                "snapshotId": PLANTED_SNAPSHOT if planted else SNAPSHOTS[table],
-                "metadataLocation": f"s3://example-bucket/warehouse/{table}/metadata.json",
-                "schemaId": 0,
-                "specId": 0,
-                "sortOrderId": 0,
-            }
-        }
+        return {"content": {"type": "ICEBERG_TABLE", "id": "id_1", "snapshotId": PLANTED_SNAPSHOT}}
 
     def create_reference(self, kind: str, name: str, source: Reference) -> Reference:
-        self.world.planted_branches[name] = source.hash
+        self.world.catalog_writes.append(f"create_reference {name}")
         return Reference(kind, name, source.hash)
 
     def delete_reference(self, name: str, hash_value: str, kind: str | None = None) -> None:
-        if "spark_branch_stays" not in self.world.faults and self.world.planted_branches.get(name) == hash_value:
-            del self.world.planted_branches[name]
-            self.world.branch_deleted = True
+        self.world.catalog_writes.append(f"delete_reference {name}")
 
 
 class FakeNessie:
@@ -208,16 +205,8 @@ class FakeNessie:
         return self.world.main if name == "main" else BRANCH_HEAD
 
     def reference(self, name: str) -> RefState | None:
-        if "reference_lookup_error" in self.world.faults and name.endswith("_fault"):
-            raise NessieError("the Nessie lookup of the reference did not finish")
-        if "branch_readback_error" in self.world.faults and name.endswith("_fault") and self.world.branch_deleted:
-            raise NessieError("the Nessie lookup of the reference did not finish")
-        if "reference_catalog_error" in self.world.faults and name.endswith("_fault"):
-            raise CatalogError("catalog_error: reference failed")
-        if "branch_readback_catalog_error" in self.world.faults and name.endswith("_fault") and self.world.branch_deleted:
-            raise CatalogError("catalog_error: reference failed")
-        if name in self.world.planted_branches:
-            return RefState("BRANCH", self.world.planted_branches[name])
+        if name == self.world.branch and "spark_moves_load_branch" in self.world.faults and self.world.spark_jobs:
+            return RefState("BRANCH", "8" * 64)
         hidden = "second_load_hidden_branch" in self.world.faults and name.startswith("load_run_") and name != f"load_{RUN_ID}"
         if name == self.world.branch or hidden or (self.world.second_load_branches and name.startswith("load_run_") and name != f"load_{RUN_ID}"):
             return RefState("BRANCH", BRANCH_HEAD)
@@ -245,10 +234,25 @@ def build(module: ModuleType, world: World) -> type:
             self.port = 3000
             self.compose = ["docker", "compose"]
             self.bucket = "example-bucket"
+            self.project = "surgical_risk"
             self.instance = INSTANCE
             self.log: list[str] = []
 
         def run(self, args: list[str], *, stdin: str | None = None, timeout: float = 0, quiet: bool = False) -> tuple[int, str, str]:
+            if args[:2] == ["docker", "compose"] and "run" in args:
+                world.compose_runs.append(list(args))
+            if args[:2] == ["python3", "-c"] and len(args) == 7:
+                return self.planted_job(args)
+            if args[:3] == ["docker", "container", "ls"]:
+                if "spark_listing_fails" in world.faults:
+                    return 1, "", ""
+                owner = args[args.index("--filter") + 1].removeprefix(f"label={OWNER_LABEL}=")
+                return 0, "".join(f"{name}\n" for name, held in world.containers.items() if held == owner), ""
+            if args[:4] == ["docker", "container", "rm", "--force"]:
+                world.calls.append(f"container_rm {args[4]}")
+                if "spark_container_stays" not in world.faults:
+                    world.containers.pop(args[4], None)
+                return 0, "", ""
             if "--quiet" in args:
                 return 0, "container\n", ""
             if "inspect" in args:
@@ -266,8 +270,55 @@ def build(module: ModuleType, world: World) -> type:
                 return 0, "Avail Size\n123 456\n", ""
             return 0, "", ""
 
+        def planted_job(self, args: list[str]) -> tuple[int, str, str]:
+            """The host script that runs the table checks job and hands its reply to the judge in the code location: the stand-in plays both."""
+            job, judge = json.loads(args[5]), json.loads(args[6])
+            world.spark_jobs.append(job)
+            world.compose_runs.append(job)
+            owner = job[job.index("--label") + 1].removeprefix(f"{OWNER_LABEL}=")
+            staging, run_folder = judge[-2], judge[-1]
+            if "spark_slot_busy" in world.faults:
+                world.containers["another_launch"] = "another_owner"
+                return 1, "slot_busy", ""
+            if "spark_job_deadline" in world.faults:
+                world.containers["this_launch"] = owner
+                return 1, "job_deadline", ""
+            if "spark_container_stays" in world.faults or "spark_listing_fails" in world.faults:
+                world.containers["this_launch"] = owner
+            if "spark_unknown_word" in world.faults:
+                return 0, "judged and 12 rows", ""
+            if "spark_moves_main" in world.faults:
+                world.main = "e" * 64
+            if "spark_refused_before_spark" in world.faults or staging not in world.staged or job[-1] != f"/staging/{staging.rsplit('/', 1)[-1]}":
+                return 1, "result_refused", ""
+            if "spark_passes" in world.faults:
+                failed: list[tuple[str, str]] = []
+            else:
+                failed = [("lab_data", name) for name in LAB_FAULT]
+            if "spark_clinical_fails" in world.faults:
+                failed.append(("clinical_data", "row count"))
+            tables = good_tables(failed=tuple(failed))
+            if "spark_clinical_checks_missing" in world.faults:
+                tables[0]["checks"] = tables[0]["checks"][:2]
+            if "spark_lab_checks_missing" in world.faults:
+                tables[1]["checks"] = tables[1]["checks"][:3]
+            passed = "spark_passes" in world.faults
+            world.receipts[f"{run_folder}/table_checks.json"] = {"passed": passed, "merged": False, "merged_hash": "", "main_hash_before": "", "tables": tables}
+            world.files[f"{run_folder}/table_checks.json"] = "{}"
+            if not passed:
+                world.files[f"{run_folder}/job_output.txt"] = "refusal: checks_failed\nexit code: 1\nresult lines: 1\n"
+            return 0, "judged", ""
+
         def in_code(self, args: list[str], *, stdin: str | None = None, timeout: float = 0, quiet: bool = False) -> tuple[int, str, str]:
             world.calls.append(" ".join(args[:3]))
+            if args[:2] == ["python", "-c"] and args[2] == getattr(module, "STAGE_PLANTED_LAB_SCRIPT", None):
+                if "stage_refused" in world.faults:
+                    return 1, "refused", ""
+                if args[4] not in world.folders or args[3] not in world.files:
+                    return 1, "refused", ""
+                world.staged[args[4]] = args[3]
+                world.files[f"{args[4]}/plan.json"] = "{}"
+                return 0, "staged", ""
             if args[:2] == ["printenv", "PLATFORM_COMMIT"]:
                 return 0, f"{world.commit}\n", ""
             return 0, "", ""
@@ -301,21 +352,14 @@ def build(module: ModuleType, world: World) -> type:
             world.calls.append(f"remove {path}")
             if "planted_record_stays" in world.faults and path.endswith("_planted.load_record.json"):
                 return True
-            if "results_dir_stays" in world.faults and tree:
+            if "results_dir_stays" in world.faults and tree and "table_checks_planted_" in path:
+                return True
+            if "staging_stays" in world.faults and tree and path.startswith("/opt/dagster/staging/"):
                 return True
             world.removed.append(path)
             world.folders.discard(path)
             for name in [name for name in world.files if name == path or (tree and name.startswith(path + "/"))]:
                 del world.files[name]
-            return True
-
-        def append_lab_row(self, branch: str, budget: float = 0) -> bool:
-            world.calls.append(f"append_lab_row {branch}")
-            if "append_fails" in world.faults:
-                return False
-            world.appended.append(branch)
-            world.planted_branches[branch] = PLANTED_HEAD
-            world.store.put_object("warehouse/raw_records/lab_data/data_planted.parquet", b"one more row")
             return True
 
         def first_line(self, path: str, budget: float = 0) -> str | None:
@@ -395,8 +439,6 @@ def build(module: ModuleType, world: World) -> type:
             world.final.add(run_id)
             if job == "table_checks_job":
                 path = config["ops"]["table_checks_step"]["config"]["load_record"]
-                if "_planted_spark" in path:
-                    return self.spark_run(path, config["ops"]["table_checks_step"]["config"]["results_root"])
                 planted = "_planted" in path
                 if planted and not world.planted_merges:
                     if "planted_moves_main" in world.faults:
@@ -453,35 +495,6 @@ def build(module: ModuleType, world: World) -> type:
                 tags["surgical_risk/records/load_branch"] = f"load_{given}"
             return {"status": "SUCCESS", "tags": [{"key": key, "value": value} for key, value in tags.items()]}
 
-        def spark_run(self, path: str, results_root: str) -> dict[str, Any]:
-            root = f"{results_root}/{world.sha}"
-            if "spark_passes" in world.faults:
-                world.main = HASH_AFTER
-                world.receipts[f"{root}/table_checks.json"] = {
-                    "passed": True,
-                    "merged": True,
-                    "merged_hash": HASH_AFTER,
-                    "main_hash_before": HASH_BEFORE,
-                    "tables": good_tables(),
-                }
-                world.files[f"{root}/table_checks.json"] = "{}"
-                return {"status": "SUCCESS", "tags": []}
-            world.planted_record = json.loads(world.files[path])
-            at_planted_head = (world.planted_record["branch_hash"], world.planted_record["tables"]["lab_data"]) == (PLANTED_HEAD, PLANTED_SNAPSHOT)
-            if "spark_refused_before_spark" not in world.faults and at_planted_head:
-                failed = [("lab_data", name) for name in LAB_FAULT]
-                if "spark_clinical_fails" in world.faults:
-                    failed.append(("clinical_data", "row count"))
-                tables = good_tables(failed=tuple(failed))
-                if "spark_clinical_checks_missing" in world.faults:
-                    tables[0]["checks"] = tables[0]["checks"][:2]
-                if "spark_lab_checks_missing" in world.faults:
-                    tables[1]["checks"] = tables[1]["checks"][:3]
-                world.receipts[f"{root}/table_checks.json"] = {"passed": False, "merged": False, "merged_hash": "", "main_hash_before": "", "tables": tables}
-                world.files[f"{root}/table_checks.json"] = "{}"
-                world.files[f"{root}/job_output.txt"] = "refusal: checks_failed\nexit code: 1\nresult lines: 1\n"
-            return {"status": "FAILURE", "tags": []}
-
         def terminate(self, run_id: str, budget: float = 0) -> bool:
             world.terminated.append(run_id)
             if "terminate_fails" not in world.faults:
@@ -516,10 +529,6 @@ def build(module: ModuleType, world: World) -> type:
             planted = job == "table_checks_job" and "_planted" in world.runs[run_id][1]["ops"]["table_checks_step"]["config"]["load_record"]
             wrong = "planted_wrong_error" in world.faults
             document["outputs"] = {"error": "the snapshot of clinical_data at the recorded hash is not the recorded one" if planted and not wrong else ""}
-            if planted and "_planted_spark" in world.runs[run_id][1]["ops"]["table_checks_step"]["config"]["load_record"]:
-                document["outputs"] = {
-                    "error": "a table check failed and nothing was merged: lab_data: row count, lab_data: key multiset, lab_data: row payload"
-                }
             document.update(run_id=run_id, job_name=job, commit=commit)
             leaked = "folder_leaks_record" in world.faults
             return {"ok": not problems, "problems": problems, "record": document if leaked or not problems else None}
@@ -725,9 +734,11 @@ class WalkTest(unittest.TestCase):
         self.assertEqual({"fixed_sample"}, manifests)
         self.assertEqual(1, len([item for item in self.world.store.list_versions(MANIFEST_PREFIX)]))
         self.assertEqual(3, len([call for call in self.world.calls if call == "raw_copy start"]))
-        self.assertEqual({}, self.world.planted_branches)
-        self.assertEqual([], [name for name in self.world.files if "_planted" in name or "table_checks_planted" in name])
-        self.assertEqual([], [item.key for item in self.world.store.list_versions("warehouse/") if item.key.endswith("data_planted.parquet")])
+        self.assertEqual([], self.world.catalog_writes)
+        self.assertEqual({}, self.world.containers)
+        self.assertEqual([], [name for name in self.world.files if "_planted" in name or "table_checks_planted" in name or name.startswith(STAGING)])
+        self.assertEqual(set(), self.world.folders)
+        self.assertEqual(1, len(self.world.spark_jobs))
 
     def test_the_evidence_holds_check_names_and_flags_and_no_count_of_a_table(self) -> None:
         _, _, evidence = self.walk()
@@ -856,10 +867,16 @@ class WalkTest(unittest.TestCase):
             "spark_passes": "planted failing spark check (fault)",
             "spark_refused_before_spark": "planted failing spark check (fault)",
             "spark_clinical_fails": "planted failing spark check (fault)",
-            "spark_branch_stays": "planted failing spark check (cleanup)",
             "retry_wait_fails": "copy resumed (sync)",
-            "append_fails": "planted failing spark check (setup)",
-            "warehouse_plant_stays": "planted failing spark check (cleanup)",
+            "stage_refused": "planted failing spark check (setup)",
+            "staging_stays": "planted failing spark check (cleanup)",
+            "spark_job_deadline": "planted failing spark check (fault)",
+            "spark_slot_busy": "planted failing spark check (fault)",
+            "spark_unknown_word": "planted failing spark check (fault)",
+            "spark_moves_main": "planted failing spark check (fault)",
+            "spark_moves_load_branch": "planted failing spark check (fault)",
+            "spark_container_stays": "planted failing spark check (cleanup)",
+            "spark_listing_fails": "planted failing spark check (cleanup)",
             "spark_clinical_checks_missing": "planted failing spark check (fault)",
             "spark_lab_checks_missing": "planted failing spark check (fault)",
             "publish_extra_text": "planted changed file (fault)",
@@ -902,28 +919,29 @@ class WalkTest(unittest.TestCase):
         self.assertIn("planted failed table check (reserve)", self.failed(record))
         self.assertIn(f"{self.module.PLANTED_RESULTS_ROOT}/old/table_checks.json", self.world.files)
 
-    def test_the_spark_case_makes_its_own_results_folder_exclusively_and_removes_it_and_reads_it_gone(self) -> None:
-        root = self.module.planted_results_root(TOKEN)
+    def test_the_spark_case_makes_its_own_results_and_staging_folders_exclusively_and_removes_them_and_reads_them_gone(self) -> None:
         record, _, _ = self.walk()
         self.assertEqual([], self.failed(record))
-        self.assertIn(f"remove {root}", self.world.calls)
-        self.assertNotIn(root, self.world.folders)
-        self.assertEqual([], [name for name in self.world.files if name.startswith(root)])
+        for folder in (self.module.planted_results_root(TOKEN), STAGING):
+            self.assertIn(f"remove {folder}", self.world.calls)
+            self.assertNotIn(folder, self.world.folders)
+            self.assertEqual([], [name for name in self.world.files if name.startswith(folder)])
 
-    def test_a_results_folder_of_the_spark_case_that_exists_already_is_refused_and_never_removed_even_when_it_is_empty(self) -> None:
-        root = self.module.planted_results_root(TOKEN)
-        for existing in ("folder_with_a_file", "empty_folder"):
-            with self.subTest(existing=existing):
-                self.world = World()
-                if existing == "folder_with_a_file":
-                    self.world.files[f"{root}/old/table_checks.json"] = "someone's"
-                else:
-                    self.world.folders.add(root)
-                record, _, _ = self.walk()
-                failed = self.failed(record)
-                self.assertTrue({"planted failing spark check (reserve)", "planted failing spark check (setup)"} & set(failed), failed)
-                self.assertNotIn(f"remove {root}", self.world.calls)
-                self.assertTrue(root in self.world.folders or f"{root}/old/table_checks.json" in self.world.files)
+    def test_a_results_or_staging_folder_of_the_spark_case_that_exists_already_is_refused_and_never_removed_even_when_it_is_empty(self) -> None:
+        for folder in (self.module.planted_results_root(TOKEN), STAGING):
+            for existing in ("folder_with_a_file", "empty_folder"):
+                with self.subTest(folder=folder, existing=existing):
+                    self.world = World()
+                    if existing == "folder_with_a_file":
+                        self.world.files[f"{folder}/old/table_checks.json"] = "someone's"
+                    else:
+                        self.world.folders.add(folder)
+                    record, _, _ = self.walk()
+                    failed = self.failed(record)
+                    self.assertTrue({"planted failing spark check (reserve)", "planted failing spark check (setup)"} & set(failed), failed)
+                    self.assertNotIn(f"remove {folder}", self.world.calls)
+                    self.assertTrue(folder in self.world.folders or f"{folder}/old/table_checks.json" in self.world.files)
+                    self.assertEqual([], self.world.spark_jobs)
 
     def test_a_results_folder_that_stays_after_its_removal_is_a_failed_cleanup_read_back_from_the_host(self) -> None:
         self.assertIn("planted failing spark check (cleanup)", self.with_faults("results_dir_stays"))
@@ -968,7 +986,7 @@ class WalkTest(unittest.TestCase):
 
     def test_each_launch_attempt_is_kept_before_it_is_sent_and_carries_a_token_of_its_own(self) -> None:
         self.walk()
-        self.assertGreaterEqual(len(self.world.launch_seen), 6)
+        self.assertGreaterEqual(len(self.world.launch_seen), 5)
         self.assertTrue(all(self.world.launch_seen))
         tokens = list(self.world.run_tokens.values())
         self.assertEqual(len(tokens), len(set(tokens)))
@@ -1019,16 +1037,6 @@ class WalkTest(unittest.TestCase):
         record, _, _ = self.walk()
         self.assertIn("planted failed table check (fault)", self.failed(record))
 
-    def test_a_reference_lookup_that_fails_is_unreadable_and_nothing_is_planted(self) -> None:
-        failed = self.with_faults("reference_lookup_error")
-        self.assertIn("planted failing spark check (reserve)", failed)
-        self.assertEqual({}, self.world.planted_branches)
-
-    def test_a_branch_readback_that_fails_is_a_failed_cleanup_and_does_not_stop_the_run(self) -> None:
-        failed = self.with_faults("branch_readback_error")
-        self.assertIn("planted failing spark check (cleanup)", failed)
-        self.assertNotIn("table checks (run)", failed)
-
     def test_a_sampler_that_fails_to_start_or_to_be_ready_is_stopped(self) -> None:
         for fault, stops in (("sampler_start_raises", 1), ("sampler_ready_raises", 1), ("second_sampler_start_raises", 2), ("second_sampler_ready_raises", 2)):
             with self.subTest(fault=fault):
@@ -1036,44 +1044,52 @@ class WalkTest(unittest.TestCase):
                 self.assertIsInstance(raised, OSError)
                 self.assertEqual(stops, self.world.sampler_stops)
 
-    def test_the_planted_branch_holds_the_laboratory_table_with_one_more_row_and_the_record_names_its_head_and_snapshot(self) -> None:
-        self.walk()
-        branch = f"p4_host_{TOKEN}_fault"
-        self.assertEqual([branch], self.world.appended)
-        self.assertEqual(f"append_lab_row {branch}", next(call for call in self.world.calls if call.startswith("append_lab_row")))
-        self.assertEqual(branch, self.world.planted_record["branch"])
-        self.assertEqual(PLANTED_HEAD, self.world.planted_record["branch_hash"])
-        self.assertEqual({**SNAPSHOTS, "lab_data": PLANTED_SNAPSHOT}, self.world.planted_record["tables"])
-
-    def test_the_objects_that_the_append_wrote_are_deleted_by_version_and_read_back_and_nothing_else_of_the_warehouse_is(self) -> None:
-        self.world.store.put_object("warehouse/raw_records/lab_data/data_kept.parquet", b"the load's own")
-        before = {(item.key, item.version_id) for item in self.world.store.list_versions("warehouse/")}
+    def test_the_planted_job_stages_the_real_load_record_and_starts_the_table_checks_job_once_on_that_folder(self) -> None:
         record, _, _ = self.walk()
         self.assertEqual([], self.failed(record))
-        self.assertEqual(before, {(item.key, item.version_id) for item in self.world.store.list_versions("warehouse/") if "planted" not in item.key} & before)
-        deleted = [key for key, _ in self.world.deleted if key.startswith("warehouse/")]
-        self.assertEqual(["warehouse/raw_records/lab_data/data_planted.parquet"], deleted)
+        self.assertEqual({STAGING: LOAD_RECORD}, self.world.staged)
+        (job,) = self.world.spark_jobs
+        owner = job[job.index("--label") + 1].removeprefix(f"{OWNER_LABEL}=")
+        self.assertRegex(owner, r"[0-9a-f]{32}")
+        self.assertEqual(
+            self.module.table_check_job_arguments(["docker", "compose"], "surgical_risk", f"p4_host_{TOKEN}_fault", owner),
+            job,
+        )
 
-    def test_an_append_that_fails_fails_the_setup_and_the_cleanup_still_removes_the_branch(self) -> None:
-        failed = self.with_faults("append_fails")
+    def test_a_refused_staging_starts_no_job_and_the_cleanup_removes_both_folders(self) -> None:
+        failed = self.with_faults("stage_refused")
         self.assertIn("planted failing spark check (setup)", failed)
-        self.assertEqual({}, self.world.planted_branches)
+        self.assertNotIn("planted failing spark check (cleanup)", failed)
+        self.assertEqual([], self.world.spark_jobs)
+        self.assertEqual(set(), self.world.folders)
 
-    def test_an_object_of_the_append_that_stays_is_a_failed_cleanup(self) -> None:
-        self.assertIn("planted failing spark check (cleanup)", self.with_faults("warehouse_plant_stays"))
+    def test_a_job_that_passes_its_deadline_has_its_own_container_removed_and_read_back(self) -> None:
+        failed = self.with_faults("spark_job_deadline")
+        self.assertNotIn("planted failing spark check (cleanup)", failed)
+        self.assertEqual(["container_rm this_launch"], [call for call in self.world.calls if call.startswith("container_rm")])
+        self.assertEqual({}, self.world.containers)
 
-    def test_a_catalog_error_of_a_reference_lookup_is_an_unreadable_location_and_not_an_escape(self) -> None:
-        record, raised = self.walk_to_the_end("reference_catalog_error")
-        self.assertIsNone(raised)
-        self.assertIn("planted failing spark check (reserve)", self.failed(record))
-        self.assertEqual({}, self.world.planted_branches)
+    def test_a_container_of_another_launch_that_holds_the_slot_is_never_removed(self) -> None:
+        failed = self.with_faults("spark_slot_busy")
+        self.assertIn("planted failing spark check (fault)", failed)
+        self.assertEqual({"another_launch": "another_owner"}, self.world.containers)
+        self.assertEqual([], [call for call in self.world.calls if call.startswith("container_rm")])
 
-    def test_a_catalog_error_of_the_branch_readback_is_a_failed_cleanup_and_does_not_stop_the_run(self) -> None:
-        record, raised = self.walk_to_the_end("branch_readback_catalog_error")
-        self.assertIsNone(raised)
-        failed = self.failed(record)
-        self.assertIn("planted failing spark check (cleanup)", failed)
-        self.assertNotIn("table checks (run)", failed)
+    def test_the_only_compose_run_of_the_runner_is_the_table_checks_job_with_a_read_only_staging_volume_and_no_inline_script(self) -> None:
+        record, _, _ = self.walk()
+        self.assertEqual([], self.failed(record))
+        self.assertEqual(1, len(self.world.compose_runs), self.world.compose_runs)
+        (job,) = self.world.compose_runs
+        self.assertEqual(["-m", "spark.jobs.table_checks", "--staging", f"/staging/p4_host_{TOKEN}_fault"], job[-4:])
+        self.assertNotIn("-c", job)
+        self.assertEqual(["surgical_risk_table_check_staging:/staging:ro"], [job[i + 1] for i, word in enumerate(job) if word == "--volume"])
+
+    def test_the_run_writes_no_catalog_reference_and_deletes_and_puts_nothing_under_the_warehouse_prefix(self) -> None:
+        self.world.store.put_object("warehouse/raw_records/lab_data/data_kept.parquet", b"the load's own")
+        record, _, _ = self.walk()
+        self.assertEqual([], self.failed(record))
+        self.assertEqual([], self.world.catalog_writes)
+        self.assertEqual([], [key for key, _ in [*self.world.puts, *self.world.deleted] if not key.startswith(LANDING_PREFIX)])
 
 
 @unittest.skipUnless(RUNNER.is_file(), "the runner is untracked and not on this computer")
@@ -1546,16 +1562,112 @@ class PureTest(unittest.TestCase):
         self.assertFalse(self.module.exact_check_set(renamed)[0])
 
 
-HASH_64 = "a" * 64
+LAB = b"caseid,dt,name,result\r\n7,5,alb,2.9\r\n8,6,cr,1.1\r\n"
+LAB_ONE_ROW_MORE = LAB + b"7,5,alb,2.9\r\n"
+CLINICAL = b"caseid,age\r\n7,60\r\n8,\r\n"
 
 
-def producer_plan() -> rules.Plan:
-    tables = (
-        rules.PlanTable("clinical_data", 11, "clinical_data.csv", HASH_64, 10),
-        rules.PlanTable("lab_data", PLANTED_SNAPSHOT, "lab_data.csv", HASH_64, 10),
-        rules.PlanTable("track_list", 13, rows=5, rows_sha256=HASH_64),
-    )
-    return rules.Plan("0" * 32, "branch_x", HASH_64, "empty", tables)
+def host_script(script: str, arguments: list[str], stdin: str = "") -> tuple[int, str]:
+    """Run a script that the runner sends to the code location, in this process (so that the project's store can be a stand-in): its exit code and output."""
+    out = io.StringIO()
+    code = 0
+    with mock.patch.object(sys, "argv", ["-c", *arguments]), mock.patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out):
+        try:
+            exec(compile(script, "<host script>", "exec"), {"__name__": "__main__"})  # noqa: S102 - the runner's own script text
+        except SystemExit as stopped:
+            code = int(stopped.code or 0)
+    return code, out.getvalue()
+
+
+class Planted:
+    """A published manifest of the two tables in a stand-in store, the load record of a load of it, and an empty staging folder that the test made."""
+
+    def __init__(self, test: unittest.TestCase, *, lab: bytes = LAB) -> None:
+        source = {"vital_files/0001.vital": b"a recording", "clinical_data.csv": CLINICAL, "lab_data.csv": lab}
+        test.enterContext(synthetic_pin(list_text_for(source).encode()))
+        folder = tempfile.TemporaryDirectory(prefix="ingestion_host_planted_")
+        test.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        self.staging = root / "staging"
+        self.staging.mkdir(mode=0o700)
+        self.results = root / "results"
+        self.landed: Landed = landed_set(source)
+        self.reference = publish_manifest(self.landed.store, self.landed.selection, self.landed.check())
+        self.record = checks.LoadRecord("load_run_one", "c" * 64, self.reference, dict(SNAPSHOTS), "a" * 64)
+        self.record_path = root / "run_one.load_record.json"
+        document = {
+            "format": checks.LOAD_RECORD_FORMAT,
+            "branch": self.record.branch,
+            "branch_hash": self.record.branch_hash,
+            "base_hash": self.record.base_hash,
+            "manifest": json.loads(self.reference.to_json()),
+            "tables": SNAPSHOTS,
+        }
+        self.record_path.write_text(json.dumps(document))
+        real_secure = checks.secure
+        # This computer's user is in no group 10001, so the staged files take the test's own group; their mode is the controller's.
+        test.enterContext(mock.patch.object(checks, "secure", lambda path, mode, gid: real_secure(path, mode, os.getgid())))
+        test.enterContext(mock.patch("scripts.ingestion.record_run.project_store", lambda environment: self.landed.store))
+
+    def stage(self, module: ModuleType) -> tuple[int, str]:
+        return host_script(module.STAGE_PLANTED_LAB_SCRIPT, [str(self.record_path), str(self.staging)])
+
+    def staged_files(self) -> list[str]:
+        return sorted(path.name for path in self.staging.iterdir()) if self.staging.is_dir() else []
+
+
+@unittest.skipUnless(RUNNER.is_file(), "the runner is untracked and not on this computer")
+class PlantedStagingTest(unittest.TestCase):
+    """The staging script of the planted case, run for real: the controller's own functions build the folder, and only the laboratory copy is changed."""
+
+    def setUp(self) -> None:
+        self.module = importlib.import_module("tests.e2e.ingestion_host")
+
+    def test_the_folder_is_the_controllers_own_with_one_laboratory_row_duplicated_and_a_plan_that_binds_the_changed_copy(self) -> None:
+        planted = Planted(self)
+        with (
+            mock.patch.object(checks, "stage_verified_files", wraps=checks.stage_verified_files) as staged,
+            mock.patch.object(checks, "build_plan", wraps=checks.build_plan) as built,
+            mock.patch.object(checks, "write_plan", wraps=checks.write_plan) as written,
+        ):
+            code, out = planted.stage(self.module)
+        self.assertEqual((0, "staged"), (code, out))
+        self.assertEqual((1, 1, 1), (staged.call_count, built.call_count, written.call_count), "the folder is built by the controller's own functions")
+        self.assertEqual(["clinical_data.csv", "lab_data.csv", "plan.json"], planted.staged_files())
+        self.assertEqual(CLINICAL, (planted.staging / "clinical_data.csv").read_bytes())
+        self.assertEqual(LAB_ONE_ROW_MORE, (planted.staging / "lab_data.csv").read_bytes())
+        self.assertEqual({0o640}, {path.stat().st_mode & 0o777 for path in planted.staging.iterdir()})
+        self.assertEqual(0o750, planted.staging.stat().st_mode & 0o777)
+        plan = rules.parse_plan((planted.staging / "plan.json").read_text())
+        files = [
+            checks.Staged("clinical_data", "clinical_data.csv", digest(CLINICAL), len(CLINICAL)),
+            checks.Staged("lab_data", "lab_data.csv", digest(LAB_ONE_ROW_MORE), len(LAB_ONE_ROW_MORE)),
+        ]
+        expected = checks.build_plan(planted.record, files, checks.read_track_pin(), rules.EMPTY_FORM, plan.run_id)
+        self.assertEqual(expected, json.loads((planted.staging / "plan.json").read_text()))
+
+    def test_a_substituted_object_version_is_refused_by_the_gate_and_nothing_stays_staged(self) -> None:
+        planted = Planted(self)
+        planted.landed.store.put_object(planted.landed.keys["lab_data.csv"], LAB)
+        code, out = planted.stage(self.module)
+        self.assertEqual((1, "refused"), (code, out))
+        self.assertEqual([], planted.staged_files())
+
+    def test_a_laboratory_file_without_a_whole_first_row_is_refused_and_nothing_stays_staged(self) -> None:
+        for name, lab in (
+            ("no row", b"caseid,dt,name,result\r\n"),
+            ("blank first row", b"caseid,dt,name,result\r\n\r\n7,5,alb,2.9\r\n"),
+            ("an open quoted field", b'caseid,dt,name,result\r\n7,5,"al\r\nb",2.9\r\n'),
+        ):
+            with self.subTest(name):
+                planted = Planted(self, lab=lab)
+                self.assertEqual((1, "refused"), planted.stage(self.module))
+                self.assertEqual([], planted.staged_files())
+
+    def test_a_last_row_without_a_line_end_is_closed_before_the_copy_is_added(self) -> None:
+        planted = Planted(self, lab=b"caseid,dt,name,result\n7,5,alb,2.9")
+        self.assertEqual((0, "staged"), planted.stage(self.module))
+        self.assertEqual(b"caseid,dt,name,result\n7,5,alb,2.9\n7,5,alb,2.9\n", (planted.staging / "lab_data.csv").read_bytes())
 
 
 def producer_results(plan: rules.Plan, *, lab: str) -> list[rules.TableResult]:
@@ -1592,35 +1704,36 @@ def producer_results(plan: rules.Plan, *, lab: str) -> list[rules.TableResult]:
     return results
 
 
+@unittest.skipUnless(RUNNER.is_file(), "the runner is untracked and not on this computer")
 class ProducerReceiptTest(unittest.TestCase):
-    """The receipt that the table checks write, made by their own functions (the job's result, the controller's parse of it and its receipt), is read by the
-    runner's own host script and judged by ``exact_lab_fault``."""
+    """The planted case from the staged folder to the flags: the runner's staging script, the job's result made by its own rules, the runner's judge script
+    (the controller's parse, refusal record and receipt), the runner's host script that selects the flags, and ``exact_lab_fault``."""
 
     def setUp(self) -> None:
         self.module = importlib.import_module("tests.e2e.ingestion_host")
+        self.planted = Planted(self)
+        self.assertEqual((0, "staged"), self.planted.stage(self.module))
+        self.plan = rules.parse_plan((self.planted.staging / "plan.json").read_text())
+        self.run_folder = self.planted.results / self.planted.reference.sha256
         self.host = self.module.Host.__new__(self.module.Host)
         self.host.log, self.host.port, self.host.compose, self.host.bucket = [], 3000, ["docker", "compose"], "example-bucket"
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.folder = Path(folder.name)
 
         def in_code(args: list[str], *, stdin: str | None = None, timeout: float = 0, quiet: bool = False) -> tuple[int, str, str]:
             result = subprocess.run([sys.executable, "-I", *args[1:]], input=stdin, capture_output=True, text=True, timeout=30, check=False)  # noqa: S603
             return result.returncode, result.stdout, result.stderr
 
-        patcher = mock.patch.object(self.host, "in_code", in_code)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.enterContext(mock.patch.object(self.host, "in_code", in_code))
+
+    def judge(self, stdout: str, exit_code: int) -> tuple[int, str]:
+        arguments = [str(self.planted.record_path), str(self.planted.staging), str(self.run_folder)]
+        return host_script(self.module.JUDGE_TABLE_CHECK_SCRIPT, arguments, json.dumps({"exit_code": exit_code, "stdout": stdout}))
+
+    def printed(self, lab: str) -> str:
+        return "a log line of Spark\nRESULT " + json.dumps(rules.job_document(self.plan, producer_results(self.plan, lab=lab))) + "\n"
 
     def flags(self, lab: str) -> dict[str, Any]:
-        plan = producer_plan()
-        job = json.loads(json.dumps(rules.job_document(plan, producer_results(plan, lab=lab))))
-        result = rules.parse_result(json.dumps(job), plan)
-        manifest = ManifestRef("example-bucket", "manifests/x.json", "v1", HASH_64)
-        load = checks.LoadRecord("branch_x", HASH_64, manifest, {entry.name: entry.snapshot_id for entry in plan.tables}, HASH_64)
-        path = self.folder / "table_checks.json"
-        path.write_text(json.dumps(checks.receipt(load, "empty", result.document(), passed=result.passed)))
-        found = self.host.receipt_flags(str(path))
+        self.assertEqual((0, "judged"), self.judge(self.printed(lab), 1))
+        found = self.host.receipt_flags(str(self.run_folder / checks.RESULT_FILE))
         self.assertIsNotNone(found)
         return found or {}
 
@@ -1632,6 +1745,7 @@ class ProducerReceiptTest(unittest.TestCase):
         self.assertEqual(
             list(LAB_FAULT), [check["name"] for check in lab["checks"] if not check["passed"]], "the staged file, the snapshot and the columns passed"
         )
+        self.assertEqual("refusal: checks_failed", (self.run_folder / checks.JOB_OUTPUT_FILE).read_text().splitlines()[0])
 
     def test_a_laboratory_table_of_another_schema_stops_at_the_columns_check_and_is_not_the_intended_negative_result(self) -> None:
         found = self.flags("columns")
@@ -1640,6 +1754,163 @@ class ProducerReceiptTest(unittest.TestCase):
         verdict, problems = self.module.exact_lab_fault(found["tables"])
         self.assertFalse(verdict)
         self.assertIn("checks_differ:lab_data", problems)
+
+    def test_a_reply_that_the_controller_refuses_leaves_no_receipt_and_says_only_that_it_was_refused(self) -> None:
+        for name, stdout, exit_code in (
+            ("no result line", "Spark stopped, 4719238 rows\n", 1),
+            ("an exit code that disagrees", self.printed("rows"), 0),
+            ("a result that is not of the plan", 'RESULT {"rows": 4719238}\n', 1),
+        ):
+            with self.subTest(name):
+                self.assertEqual((1, "result_refused"), self.judge(stdout, exit_code))
+                self.assertFalse((self.run_folder / checks.RESULT_FILE).exists())
+                self.assertNotIn("4719238", (self.run_folder / checks.JOB_OUTPUT_FILE).read_text())
+
+    def test_an_input_that_cannot_be_read_says_only_that_the_judge_failed(self) -> None:
+        arguments = [str(self.planted.record_path), str(self.planted.staging / "missing"), str(self.run_folder)]
+        self.assertEqual((1, "judge_failed"), host_script(self.module.JUDGE_TABLE_CHECK_SCRIPT, arguments, '{"exit_code": 1, "stdout": ""}'))
+
+
+@unittest.skipUnless(RUNNER.is_file(), "the runner is untracked and not on this computer")
+class PlantedJobTest(unittest.TestCase):
+    """The launch of the planted job: its arguments against the controller's own, the host script that keeps the job's output on the host (real processes) and
+    the removal of the job's container."""
+
+    def setUp(self) -> None:
+        self.module = importlib.import_module("tests.e2e.ingestion_host")
+
+    def test_the_launch_names_the_service_the_slot_the_owner_the_user_and_a_read_only_staging_volume(self) -> None:
+        self.assertEqual(
+            [
+                "docker",
+                "compose",
+                "--profile",
+                "batch",
+                "run",
+                "--rm",
+                "--no-TTY",
+                "--no-deps",
+                "--name",
+                SLOT_NAME,
+                "--label",
+                f"{OWNER_LABEL}=owner_1",
+                "--user",
+                "10100:10001",
+                "--volume",
+                "surgical_risk_table_check_staging:/staging:ro",
+                "--entrypoint",
+                "python",
+                "spark",
+                "-m",
+                "spark.jobs.table_checks",
+                "--staging",
+                "/staging/folder_1",
+            ],
+            self.module.table_check_job_arguments(["docker", "compose"], "surgical_risk", "folder_1", "owner_1"),
+        )
+
+    def test_apart_from_the_slot_the_launch_is_the_controllers_own_one_off(self) -> None:
+        seen: list[list[str]] = []
+
+        def run_command(program: str, arguments: list[str], **options: Any) -> CompletedProcess[str]:
+            seen.append(list(arguments))
+            return CompletedProcess(list(arguments), 0, "", "")
+
+        runner = checks.compose_runner(
+            Settings(ROOT / "compose", "surgical_risk"), volume="surgical_risk_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=5
+        )
+        with mock.patch.object(checks, "run_command", run_command):
+            runner(Path("/opt/dagster/staging/folder_1"))
+        controller = seen[0][seen[0].index("--profile") :]
+        mine = self.module.table_check_job_arguments(["docker", "compose"], "surgical_risk", "folder_1", "owner_1")[2:]
+        slot = mine.index("--name")
+        self.assertEqual(controller, mine[:slot] + mine[slot + 4 :])
+
+    def host_run(self, job: str, judge: str, *, job_seconds: int = 30) -> tuple[int, str]:
+        command = [sys.executable, "-I", "-c", self.module.RUN_TABLE_CHECK_JOB_SCRIPT, str(job_seconds), "30"]
+        command += [json.dumps([sys.executable, "-I", "-c", job]), json.dumps([sys.executable, "-I", "-c", judge])]
+        done = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)  # noqa: S603
+        self.assertEqual("", done.stderr)
+        return done.returncode, done.stdout
+
+    def test_the_jobs_output_goes_only_to_the_judge_with_its_exit_code_and_only_a_fixed_word_comes_back(self) -> None:
+        job = "import sys; print('RESULT 4719238'); sys.stderr.write('ROW_TEXT'); sys.exit(1)"
+        reads = "import json,sys; r=json.load(sys.stdin); ok = r == {'exit_code': 1, 'stdout': 'RESULT 4719238\\n'}; "
+        self.assertEqual((0, "judged"), self.host_run(job, reads + "print('judged' if ok else 'result_refused')"))
+        for printed, word in (("result_refused", "result_refused"), ("judged 4719238", "judge_failed"), ("Traceback ROW_TEXT", "judge_failed")):
+            with self.subTest(printed=printed):
+                self.assertEqual((1, word), self.host_run(job, f"print({printed!r})"))
+
+    def test_a_job_past_its_deadline_is_a_fixed_word_and_the_judge_never_runs(self) -> None:
+        self.assertEqual((1, "job_deadline"), self.host_run("import time; time.sleep(20)", "print('judged')", job_seconds=1))
+
+    def test_a_job_that_cannot_take_the_slots_name_is_reported_as_the_slot_being_busy_and_the_judge_never_runs(self) -> None:
+        job = "import sys; sys.stderr.write('Conflict. The container name \"/surgical-risk-spark-slot\" is already in use'); sys.exit(1)"
+        self.assertEqual((1, "slot_busy"), self.host_run(job, "print('judged')"))
+
+    def test_the_host_scripts_parse_as_the_hosts_older_python(self) -> None:
+        ast.parse(self.module.RUN_TABLE_CHECK_JOB_SCRIPT, feature_version=(3, 12))
+
+    def removal(self, replies: list[tuple[int, str]]) -> tuple[bool, list[list[str]]]:
+        host = self.module.Host.__new__(self.module.Host)
+        commands: list[list[str]] = []
+
+        def run(args: list[str], *, stdin: str | None = None, timeout: float = 0, quiet: bool = False) -> tuple[int, str, str]:
+            commands.append(list(args))
+            code, out = replies.pop(0)
+            return code, out, ""
+
+        with mock.patch.object(host, "run", run, create=True):
+            return host.remove_job_container("owner_1"), commands
+
+    def test_only_the_containers_with_this_launchs_owner_label_are_removed_and_their_end_is_read_back(self) -> None:
+        listing = ["docker", "container", "ls", "--all", "--quiet", "--no-trunc", "--filter", f"label={OWNER_LABEL}=owner_1"]
+        self.assertEqual((True, [listing, listing]), self.removal([(0, ""), (0, "")]))
+        removed, commands = self.removal([(0, "id_1\n"), (0, ""), (0, "")])
+        self.assertEqual((True, [listing, ["docker", "container", "rm", "--force", "id_1"], listing]), (removed, commands))
+
+    def test_a_listing_that_fails_or_a_container_that_stays_is_not_removed(self) -> None:
+        self.assertFalse(self.removal([(1, "")])[0])
+        self.assertFalse(self.removal([(0, "id_1\n"), (1, ""), (0, "id_1\n")])[0])
+        self.assertFalse(self.removal([(0, ""), (255, "")])[0])
+
+
+FORBIDDEN_IN_CODE = ("warehouse/", "writeTo", "saveAsTable", "build_session", "INSERT INTO", ".append()")
+
+
+@unittest.skipUnless(RUNNER.is_file(), "the runner is untracked and not on this computer")
+class RunnerSourceTest(unittest.TestCase):
+    """The contract is the text: the runner holds no Spark code of its own and names the warehouse prefix only where it lists it."""
+
+    def setUp(self) -> None:
+        self.tree = ast.parse(RUNNER.read_text())
+
+    def code_strings(self) -> list[str]:
+        """Every string of the runner's code, the host scripts among them, but no docstring."""
+        documented = [node for node in ast.walk(self.tree) if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))]
+        docstrings = {id(node.body[0].value) for node in documented if node.body and isinstance(node.body[0], ast.Expr)}
+        return [n.value for n in ast.walk(self.tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings]
+
+    def test_the_runner_holds_no_spark_write_and_the_only_spark_job_it_names_is_the_table_checks_job(self) -> None:
+        strings = self.code_strings()
+        self.assertEqual([], [(word, text[:80]) for text in strings for word in FORBIDDEN_IN_CODE if word in text])
+        self.assertEqual({"spark.jobs.table_checks"}, {found for text in strings for found in re.findall(r"spark\.jobs\.\w+", text)})
+        self.assertEqual([], [text[:80] for text in strings if "from spark.session" in text or "import pyspark" in text])
+
+    def test_the_warehouse_prefix_is_used_only_by_the_listing_of_the_inventories(self) -> None:
+        holders = {
+            function.name
+            for function in ast.walk(self.tree)
+            if isinstance(function, ast.FunctionDef)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Name) and node.id == "WAREHOUSE_PREFIX"
+        }
+        self.assertEqual({"inventories"}, holders)
+        loads = [node for node in ast.walk(self.tree) if isinstance(node, ast.Name) and node.id == "WAREHOUSE_PREFIX"]
+        self.assertEqual(1, len(loads))
+        inventories = next(node for node in ast.walk(self.tree) if isinstance(node, ast.FunctionDef) and node.name == "inventories")
+        called = {node.attr for node in ast.walk(inventories) if isinstance(node, ast.Attribute)}
+        self.assertEqual({"store", "list_versions"}, called)
 
 
 class Clock:
