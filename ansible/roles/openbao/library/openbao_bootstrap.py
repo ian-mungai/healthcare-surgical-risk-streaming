@@ -397,7 +397,7 @@ def generated_secret(params: dict[str, Any], *, check_only: bool) -> dict[str, A
         stored = False
         value = read_file(dest, f"password file {dest.name}") if dest.is_file() and dest.stat().st_size else secrets.token_urlsafe(SECRET_BYTES)
         if value != value.strip():
-            raise BootstrapError(f"the file {dest.name} starts or ends with white space, which a password of this host never does")
+            raise BootstrapError(f"the file {dest.parent.name}/{dest.name} has whitespace at its start or its end, which its reader trims")
         if not check_only:
             kv_store(api, token, path, value)
     changed = write_when_different(dest, value, owner, check_only=check_only)

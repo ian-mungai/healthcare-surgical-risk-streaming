@@ -1,0 +1,16 @@
+# Reads openbao_fetch_consumer, openbao_fetch_name and openbao_fetch_dest (set by the caller), and openbao_secrets_directory, openbao_external_secrets_file,
+# openbao_address and secret_files_root_owner. The consumer logs in with its own AppRole and reads its own external secret (compose/external_secrets.txt) from OpenBao;
+# the value goes to a root-only file (mode 0400) at openbao_fetch_dest and to no result, variable or message. The caller removes the file when it is done.
+- name: Write the external secret from OpenBao to a root-only file for its consumer
+  openbao_bootstrap:
+    step: fetch
+    secrets_directory: "{{ openbao_secrets_directory }}"
+    external_secrets_file: "{{ openbao_external_secrets_file }}"
+    address: "{{ openbao_address }}"
+    consumer: "{{ openbao_fetch_consumer }}"
+    name: "{{ openbao_fetch_name }}"
+    dest: "{{ openbao_fetch_dest }}"
+    file_owner: "{{ secret_files_root_owner }}"
+  changed_when: false
+  timeout: 120
+  no_log: true

@@ -55,7 +55,7 @@ SSH_ATTEMPT_SECONDS = 30
 # files and fails when this figure is lower. The stack deployment (ansible/stack.yml, after the launcher's intake of the external secrets) and the connection
 # step (ansible/connection.yml: the Airbyte connection step and the start of the orchestration services) each have their own budget from the same sum.
 HOST_SETUP_TIMEOUT_SECONDS = 6600
-STACK_TIMEOUT_SECONDS = 16800
+STACK_TIMEOUT_SECONDS = 17100
 CONNECTION_TIMEOUT_SECONDS = 4800
 PLAYBOOKS = {
     "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stdout
@@ -133,6 +134,38 @@ class SendTest(unittest.TestCase):
             self.place(Refusing(["empty", "bad_form"]))
         self.assertIn(NAME, str(caught.exception))
         self.assertNotIn(VALUE, str(caught.exception))
+
+
+class InstalledFormTest(unittest.TestCase):
+    """The command line that the launcher runs is the one that the role installs and the sudoers drop-in names, so input recording is off for exactly it."""
+
+    def test_the_drop_in_turns_every_recording_off_for_the_one_command_line_that_the_launcher_runs(self) -> None:
+        text = host.INTAKE_POLICY_SOURCE.read_text()
+        alias = re.search(r"^Cmnd_Alias (\w+) = (.+)$", text, re.MULTILINE)
+        if alias is None:
+            self.fail("the drop-in has no command alias")
+        self.assertEqual(" ".join(host.INTAKE_COMMAND), alias[2].strip())
+        defaults = re.search(rf"^Defaults!{alias[1]} (.+)$", text, re.MULTILINE)
+        if defaults is None:
+            self.fail("the drop-in has no defaults line for the alias")
+        self.assertEqual(
+            {"!log_input", "!log_output", "!log_stdin", "!log_stdout", "!log_stderr", "!log_ttyin", "!log_ttyout"},
+            {item.strip() for item in defaults[1].split(",")},
+        )
+
+    def test_the_role_installs_the_script_and_the_drop_in_where_the_launcher_expects_them(self) -> None:
+        from tests.fast.test_host_budget import variables
+
+        found = variables()
+        self.assertEqual(host.INTAKE_SCRIPT, f"{found['airbyte_bin_directory']}/external_secret_intake")
+        self.assertEqual(host.INTAKE_SUDOERS, found["openbao_intake_sudoers"])
+
+    def test_the_launcher_and_the_script_agree_on_the_codes_that_name_a_refusal(self) -> None:
+        from tests.fast.test_external_intake_script import SCRIPT
+
+        codes = set(re.findall(r'Refusal\("(\w+)"\)', SCRIPT.read_text())) - {"unchanged"}
+        known = {key.removeprefix("script_") for key in external_intake.MESSAGES if key.startswith("script_")}
+        self.assertEqual(set(), codes - known, "every refusal code of the script has a fixed message in the launcher")
 
 
 if __name__ == "__main__":

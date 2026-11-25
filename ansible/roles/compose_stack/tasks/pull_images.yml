@@ -7,7 +7,8 @@
 # runs the pull with DOCKER_CONFIG set to that folder and with DOCKER_AUTH_CONFIG and the project image settings removed from the environment, and removes that folder
 # on every exit. The task refuses before any write when a docker-credential-* program is on the PATH (Docker would pick it, and read no auth from the file). The token is one
 # file on the host, which only root reads. The shell task reads it on its standard input, so it is on no command line, in no environment, in no printed output and in
-# no variable that Ansible keeps. A caller that gets the token another way pipes it into the same task.
+# no variable that Ansible keeps. The token is kept in the host's OpenBao, where the launcher's intake stored it (compose/external_secrets.txt: dockerhub_read, for the
+# consumer deploy). Just before the pull, the deploy consumer's own login to OpenBao writes it to that file (mode 0400), and the always section removes the file right after.
 # The task keeps its own deadline, ten seconds before compose_stack_pull_deadline_seconds (the pull is ended with a TERM signal past it), so its cleanup runs before
 # Ansible's own timeout, which is the backstop. The final step removes a folder path that the task printed and nothing else, for a task that Ansible ended anyway.
 - name: Stop when the registry user or the token file is not set
@@ -18,24 +19,33 @@
     quiet: true
     fail_msg: "set compose_stack_registry_user and compose_stack_registry_token_file: the project's images are in a private Docker Hub repository"
 
-- name: Look at the registry token file
-  ansible.builtin.stat:
-    path: "{{ compose_stack_registry_token_file }}"
-  register: compose_stack_registry_token_stat
-
-- name: Stop when the registry token file is missing, empty, not a plain file or readable by anyone but root
-  ansible.builtin.assert:
-    that:
-      - compose_stack_registry_token_stat.stat.exists
-      - compose_stack_registry_token_stat.stat.isreg | default(false)
-      - compose_stack_registry_token_stat.stat.size | default(0) | int > 0
-      - compose_stack_registry_token_stat.stat.pw_name | default('') == compose_stack_owner
-      - compose_stack_registry_token_stat.stat.mode | default('') == '0400'
-    quiet: true
-    fail_msg: "the registry token file is missing, is empty or is not a plain file that only {{ compose_stack_owner }} reads (mode 0400)"
-
-- name: Pull the images with a login that only the pull task holds
+- name: Fetch the token and pull the images with a login that only the pull task holds
   block:
+    - name: Write the registry token from OpenBao to a root-only temporary file
+      ansible.builtin.include_role:
+        name: openbao
+        tasks_from: fetch_external.yml
+      vars:
+        openbao_fetch_consumer: deploy
+        openbao_fetch_name: dockerhub_read
+        openbao_fetch_dest: "{{ compose_stack_registry_token_file }}"
+
+    - name: Look at the registry token file
+      ansible.builtin.stat:
+        path: "{{ compose_stack_registry_token_file }}"
+      register: compose_stack_registry_token_stat
+
+    - name: Stop when the registry token file is missing, empty, not a plain file or readable by anyone but root
+      ansible.builtin.assert:
+        that:
+          - compose_stack_registry_token_stat.stat.exists
+          - compose_stack_registry_token_stat.stat.isreg | default(false)
+          - compose_stack_registry_token_stat.stat.size | default(0) | int > 0
+          - compose_stack_registry_token_stat.stat.pw_name | default('') == compose_stack_owner
+          - compose_stack_registry_token_stat.stat.mode | default('') == '0400'
+        quiet: true
+        fail_msg: "the registry token file is missing, is empty or is not a plain file that only {{ compose_stack_owner }} reads (mode 0400)"
+
     - name: Pull every image of the Compose files, each by its digest
       ansible.builtin.shell:
         cmd: |
@@ -108,6 +118,12 @@
           else 'the image pull failed with status ' ~ compose_stack_pull.rc) }}
       when: compose_stack_pull.rc != 0
   always:
+    - name: Remove the temporary registry token file
+      ansible.builtin.file:
+        path: "{{ compose_stack_registry_token_file }}"
+        state: absent
+      changed_when: false
+
     - name: Find the login folder that the pull task printed
       ansible.builtin.set_fact:
         compose_stack_pull_leftovers: >-

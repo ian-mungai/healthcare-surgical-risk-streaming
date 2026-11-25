@@ -28,6 +28,7 @@ def environment(folder: Path) -> dict[str, str]:
         "ANSIBLE_LOCAL_TEMP": str(folder / "tmp"),
         "ANSIBLE_REMOTE_TMP": str(folder / "remote_tmp"),
         "ANSIBLE_PYTHON_INTERPRETER": str(ROOT / ".venv" / "bin" / "python"),
+        "ANSIBLE_ROLES_PATH": str(ROLES),
         "ANSIBLE_NOCOLOR": "1",
         "ANSIBLE_FORCE_COLOR": "0",
     }
