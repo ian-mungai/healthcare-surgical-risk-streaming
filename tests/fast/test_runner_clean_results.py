@@ -197,6 +197,8 @@ class CatalogFinish(unittest.TestCase):
         pin_error: Exception | None = None,
         delete_error: Exception | None = None,
         remove_error: Exception | None = None,
+        never_made: tuple[str, ...] = (),
+        unreadable: tuple[str, ...] = (),
     ) -> tuple[Record, str]:
         module = runner("catalog_proof")
         run = record()
@@ -224,7 +226,15 @@ class CatalogFinish(unittest.TestCase):
             pin_trino=pin,
             target=SimpleNamespace(remove_file=remove),
         )
-        nessie = SimpleNamespace(reference=lambda name: SimpleNamespace(hash="h"), delete_reference=delete)
+
+        def reference(name: str) -> SimpleNamespace:
+            if name in never_made:
+                raise module.NessieError("missing", status=404, error_code="REFERENCE_NOT_FOUND")
+            if name in unreadable:
+                raise module.NessieError("unavailable", status=503, error_code=None)
+            return SimpleNamespace(hash="h")
+
+        nessie = SimpleNamespace(reference=reference, delete_reference=delete)
         proof = SimpleNamespace(stack=stack, nessie=nessie, made=["a", "b"], pin_file="/pin.env", facts={})
         return run, module.finish(proof, run)
 
@@ -303,6 +313,18 @@ class CatalogFinish(unittest.TestCase):
 
     def test_a_pin_file_that_cannot_be_removed_fails_the_run(self) -> None:
         self.assertEqual(failed(self.finish(file_removed=False)[0]), ["pin file removed"])
+
+    def test_a_reference_that_nessie_reports_as_not_found_is_absent_not_left(self) -> None:
+        run, text = self.finish(never_made=("a",))
+        self.assertEqual(failed(run), [])
+        self.assertEqual(self.deleted, ["b"])
+        self.assertIn("deleted: 1", text)
+        self.assertIn("already absent: 1", text)
+
+    def test_a_reference_that_cannot_be_read_is_left_not_absent(self) -> None:
+        run, text = self.finish(unreadable=("a",))
+        self.assertEqual(failed(run), ["references deleted"])
+        self.assertIn("already absent: 0", text)
 
     def test_every_leftover_is_reported_at_once(self) -> None:
         run, _ = self.finish(restored=False, refuses=("a",), file_removed=False)
