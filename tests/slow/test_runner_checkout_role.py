@@ -941,7 +941,7 @@ class InterpreterTest(unittest.TestCase):
         operators.append(self.role_folder(scratch, "badtext1", "not a digest\n"))
         operators.append(self.role_folder(scratch, "twolines", "a" * 64 + "\nmore\n"))
         linked = self.role_folder(scratch, "linkmark", None)
-        (linked / PYTHON_MARKER).symlink_to(first / PYTHON_MARKER if (first / PYTHON_MARKER).exists() else backup / PYTHON_MARKER)
+        (linked / PYTHON_MARKER).symlink_to(backup / PYTHON_MARKER)  # a valid marker that stays, whatever the order of the removals
         folder_marker = self.role_folder(scratch, "dirmark1", None)
         (folder_marker / PYTHON_MARKER).mkdir()
         operators += [linked, folder_marker]
