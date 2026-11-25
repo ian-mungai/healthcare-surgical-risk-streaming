@@ -18,6 +18,11 @@
 # reserve keeps at least four seconds beyond it (tests/fast/test_pull_images_budget.py works this out from this file). The cleanup runs once (a guard flag) and ignores
 # HUP, INT and TERM while it runs. A watchdog, a job in a process group of its own, outlives a shell that is killed: when the shell is gone it does the same cleanup,
 # so no pull and no login file stays behind.
+# The cleanup removes the login folder only when the pull's group is gone. If the group is still there after KILL and the reap wait, the cleanup keeps the folder, keeps the
+# watchdog (which tries the same cleanup once more when the shell is gone), prints a fixed refusal and exits with status 65; a failed removal of the folder does the same
+# with its own fixed message. The refusal texts hold no folder path and no token.
+# Accepted limits (owner, Nov 25 2026): if the machine reboots, or the shell dies in the instant between starting the pull and starting its watchdog, the pull and its
+# login folder can survive. The folder is a root-only (0700) folder that holds one read-only token.
 - name: Stop when the registry user or the token file is not set
   ansible.builtin.assert:
     that:
@@ -87,16 +92,28 @@
                 wait_gone "$grace"
                 kill -s KILL -- "-$pull" 2>/dev/null
                 wait_gone "$reap"
-                alive || wait "$pull" 2>/dev/null
+                if alive; then return 1; fi
+                wait "$pull" 2>/dev/null
                 pull=
               fi
+              return 0
             }
             cleanup() {
               if [ -z "$cleaned" ]; then
                 cleaned=1
                 trap '' HUP INT TERM
-                end_pull
-                case $folder in "$parent"/login.*) rm -rf -- "$folder" ;; esac
+                if ! end_pull; then
+                  printf 'REFUSED=%s\n' "the image pull could not be stopped, so its login folder was kept"
+                  exit 65
+                fi
+                case $folder in
+                  "$parent"/login.*)
+                    if ! rm -rf -- "$folder"; then
+                      printf 'REFUSED=%s\n' "the pull's login folder could not be removed"
+                      exit 65
+                    fi
+                    ;;
+                esac
                 if [ -n "$watch" ]; then kill -s KILL -- "-$watch" 2>/dev/null; fi
               fi
             }

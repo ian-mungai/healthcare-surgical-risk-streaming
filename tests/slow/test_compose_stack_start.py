@@ -798,6 +798,53 @@ class PullTest(unittest.TestCase):
         self.assertFalse(early, "the folder was removed while the client still ran")
         self.assertEqual(["term"], terms)
 
+    def test_a_pull_that_survives_kill_keeps_its_login_folder_fails_with_a_fixed_message_and_the_watchdog_removes_the_folder_once_the_client_is_gone(
+        self,
+    ) -> None:
+        deadline = self.pull_numbers()["reserve"] + 5
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            (stand_in.parent / "ignore_term_pull").write_text("")
+            swallow = folder / "swallow_kill.sh"
+            swallow.write_text('kill() { case "$*" in "-s KILL -- -$pull") return 0 ;; esac; builtin kill "$@"; }\n')
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": deadline}, environment={"BASH_ENV": str(swallow)})
+            pid = self.watch_pull(stand_in)
+            alive = not self.is_gone(pid, tries=1)
+            left = os.listdir(self.parent(folder))
+            early = (stand_in.parent / "folder_gone_early").exists()
+            os.kill(pid, signal.SIGKILL)
+            for _ in range(150):
+                after = os.listdir(self.parent(folder))
+                if not after:
+                    break
+                time.sleep(0.1)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the image pull could not be stopped", output)
+        self.assertNotIn("ran past its deadline", output, "the deadline message hid that the pull could not be stopped")
+        self.assertTrue(alive, "the injected KILL failure did not leave the client alive: the case proves nothing")
+        self.assertEqual(1, len(left), "the folder was removed while the client was alive")
+        self.assertFalse(early, "the folder was removed while the client was alive")
+        self.assertNotIn(self.TOKEN, output)
+        self.assertNotIn(left[0], output)
+        self.assertEqual([], after, "the watchdog did not remove the folder once the client was gone")
+
+    def test_a_login_folder_that_cannot_be_removed_fails_the_task_with_a_fixed_message(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, values = self.prepare_pull(folder)
+            failing = folder / "failing_rm.sh"
+            failing.write_text('rm() { case "$*" in *login.*) return 1 ;; esac; command rm "$@"; }\n')
+            code, output = run_tasks("pull_images.yml", values, environment={"BASH_ENV": str(failing)})
+            left = os.listdir(self.parent(folder))
+            running = self.running_from(scratch)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the pull's login folder could not be removed", output)
+        self.assertEqual(1, len(left), "the injected removal failure left no folder: the case proves nothing")
+        self.assertNotIn(left[0], output)
+        self.assertNotIn(self.TOKEN, output)
+        self.assertEqual([], running, "the task left a process of its own")
+
     @staticmethod
     def is_gone(pid: int, tries: int = 50) -> bool:
         for _ in range(tries):
