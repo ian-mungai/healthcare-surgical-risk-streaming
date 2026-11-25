@@ -1205,6 +1205,13 @@ class HostCheckArgumentsTest(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn(render(Notice(Code.USAGE)), errors)
 
+    def test_a_host_name_that_is_not_the_name_of_an_environments_host_is_refused_without_naming_it(self) -> None:
+        for value in ("planted_name", "platform", "platform-staging", "platform-dev extra", "other-dev"):
+            with self.subTest(value=value):
+                code, errors = self.run_main("check", "--host-name", value, "--instance-id", INSTANCE)
+                self.assertEqual(2, code)
+                self.assertNotIn(value, errors)
+
 
 class DeployWorkflowTest(unittest.TestCase):
     """The workflow's text is the contract: the host is checked against the instance ID of a protected variable."""

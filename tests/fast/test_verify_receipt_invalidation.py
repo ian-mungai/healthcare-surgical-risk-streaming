@@ -66,13 +66,13 @@ class ReceiptInvalidationTest(unittest.TestCase):
         self.env_file.write_text(GOOD_ENV.replace("us-west-2", "not a region"))
         code, error = self.run_main()
         self.assertEqual(1, code)
-        self.assertIn("ConfigurationError", error)
+        self.assertEqual(".env: missing or malformed values for: AWS_REGION\n", error)
         self.assert_removed()
 
     def test_a_missing_configuration_file_removes_the_earlier_receipt_and_signature(self) -> None:
         code, error = self.run_main()
         self.assertEqual(1, code)
-        self.assertIn("ConfigurationError", error)
+        self.assertEqual(".env is missing; copy .env.example to .env and fill it in\n", error)
         self.assert_removed()
 
     def test_the_earlier_receipt_is_already_gone_when_the_configuration_is_read(self) -> None:
@@ -107,7 +107,7 @@ class ReceiptInvalidationTest(unittest.TestCase):
         self.binding.unlink()
         code, error = self.run_main()
         self.assertEqual(1, code)
-        self.assertIn("WrapperError", error)
+        self.assertEqual("no run binding: run the state bootstrap step first\n", error)
 
 
 if __name__ == "__main__":

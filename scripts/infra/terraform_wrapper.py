@@ -35,7 +35,7 @@ from typing import Any
 from scripts.infra.created import created_entries, merge_created
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem, run_suffix
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import describe_error
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.heavy_inputs import heavy_inputs_text
@@ -76,7 +76,13 @@ def kept_note(run_id: str, name: str, text: str, what: str) -> str:
 
 
 class WrapperError(RuntimeError):
-    """The wrapper refused to continue or a Terraform call failed."""
+    """The wrapper refused to continue or a Terraform call failed. Its text can hold a value of a file, a plan or the limits, so a command shows only its type
+    name."""
+
+
+class FixedWrapperError(WrapperError, FixedTextError):
+    """A refusal whose whole text is fixed advice: constants, the run's names and counts, and never a value of a file, a plan, the limits or Terraform's
+    output. A command shows it."""
 
 
 PINNED_TERRAFORM = ".tools/bin/terraform"
@@ -86,7 +92,7 @@ def pinned_terraform() -> Path:
     """The project's own pinned Terraform, the only Terraform this project runs. A missing copy is never replaced by the computer's."""
     path = ROOT / PINNED_TERRAFORM
     if not path.is_file() or not os.access(path, os.X_OK):
-        raise WrapperError(f"the pinned Terraform is missing or not an executable file at {PINNED_TERRAFORM}; run `make setup` to install it")
+        raise FixedWrapperError(f"the pinned Terraform is missing or not an executable file at {PINNED_TERRAFORM}; run `make setup` to install it")
     return path
 
 
@@ -321,16 +327,16 @@ def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
     except TimeoutExpired as error:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
         note = f"; {kept_note(run.run_id, name, partial, 'partial output')}" if partial else ""
-        raise WrapperError(timeout_text(f"terraform {arguments[0]}", timeout) + note) from None
+        raise FixedWrapperError(timeout_text(f"terraform {arguments[0]}", timeout) + note) from None
     if result.returncode != 0:
         kept = kept_note(run.run_id, name, result.stdout + result.stderr, "full output")
-        raise WrapperError(f"terraform {arguments[0]} failed with exit status {result.returncode}; {kept}")
+        raise FixedWrapperError(f"terraform {arguments[0]} failed with exit status {result.returncode}; {kept}")
     return result.stdout
 
 
 def load_run(path: Path) -> RunBinding:
     if not path.is_file():
-        raise WrapperError("no run binding: run the state bootstrap step first")
+        raise FixedWrapperError("no run binding: run the state bootstrap step first")
     return RunBinding(**json.loads(path.read_text()))
 
 
@@ -338,10 +344,10 @@ def initialise(run: RunBinding, configuration: dict[str, str], inputs: str | Non
     """Initialise the run's own configuration copy and refuse when Terraform's backend or workspace is not the bound one. ``inputs`` is for a plan only."""
     mode_problem = bucket_problem(run, configuration)
     if mode_problem:
-        raise WrapperError(f"refused before any plan or change: {mode_problem}")
+        raise FixedWrapperError(f"refused before any plan or change: {mode_problem}")
     mismatch = region_problem(run, configuration)
     if mismatch:
-        raise WrapperError(f"refused before any plan or change: {mismatch}")
+        raise FixedWrapperError(f"refused before any plan or change: {mismatch}")
     folder = prepare_configuration(run, inputs)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
     record_file = folder / ".terraform" / "terraform.tfstate"
@@ -393,11 +399,11 @@ def plan_changes(plan: dict[str, Any]) -> list[tuple[str, str]]:
 def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> int:
     """Save the plan with its text, JSON and binding, print its changes and return how many resources and outputs change."""
     if run.status != "verified":
-        raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
+        raise FixedWrapperError("the run's bucket is not verified: run the state bootstrap step")
     inputs = heavy_inputs()
     overrides = environment_override_problems(os.environ)
     if overrides:
-        raise WrapperError("refused before Terraform starts: " + "; ".join(overrides))
+        raise FixedWrapperError("refused before Terraform starts: " + "; ".join(overrides))
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
     folder.chmod(0o700)
@@ -405,7 +411,7 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     initialise(run, configuration, inputs)
     missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
     if missing:
-        raise WrapperError(f".env: missing values for: {', '.join(missing)}")
+        raise FixedWrapperError(f".env: missing values for: {', '.join(missing)}")
     values = run_variables(run, configuration) | {key.lower(): configuration[key] for key in TAILSCALE_KEYS}
     # The limits loader's file is the last variable file, so no other source of a heavy input can win over it.
     variables = [
@@ -445,15 +451,15 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
     configuration = configuration or load_configuration()
     mode_problem = bucket_problem(run, configuration)
     if mode_problem:
-        raise WrapperError(f"refused before any change: {mode_problem}")
+        raise FixedWrapperError(f"refused before any change: {mode_problem}")
     mismatch = region_problem(run, configuration)
     if mismatch:
-        raise WrapperError(f"refused before any change: {mismatch}; then save a new plan")
+        raise FixedWrapperError(f"refused before any change: {mismatch}; then save a new plan")
     folder = ROOT / "runs" / run.run_id / "plans"
     plan_file = folder / "apply.tfplan"
     binding_file = folder / "apply_binding.json"
     if not plan_file.is_file() or not binding_file.is_file():
-        raise WrapperError("no saved apply plan for this run: run plan first")
+        raise FixedWrapperError("no saved apply plan for this run: run plan first")
     plan = plan_file.read_bytes()
     problems = binding_problems(run, json.loads(binding_file.read_text()), plan, code, "apply")
     if problems:
@@ -465,7 +471,7 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         try:
             applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
         except ValueError as error:
-            raise WrapperError("refused before any change: the JSON of the saved plan cannot be read, so its heavy inputs are unknown") from error
+            raise FixedWrapperError("refused before any change: the JSON of the saved plan cannot be read, so its heavy inputs are unknown") from error
         stale = stale_inputs_problem(applied_plan)
         if stale:
             raise WrapperError(f"refused before any change: {stale}")
