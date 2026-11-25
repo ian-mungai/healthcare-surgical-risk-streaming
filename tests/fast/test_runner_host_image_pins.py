@@ -15,7 +15,6 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import os
 import re
@@ -28,6 +27,7 @@ from unittest import mock
 
 from scripts.images import pins
 from scripts.process import run_command
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 E2E = ROOT / "tests" / "e2e"
@@ -61,7 +61,7 @@ def git(folder: Path, *arguments: str) -> None:
 @unittest.skipUnless(HELPER.is_file(), "the temporary runners are not in this checkout")
 class CommittedReferences(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.pinned_images")
+        self.module: ModuleType = import_runner("pinned_images")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.repository = Path(scratch.name)
@@ -126,7 +126,7 @@ class CommittedReferences(unittest.TestCase):
 @unittest.skipUnless(HELPER.is_file(), "the temporary runners are not in this checkout")
 class LocalSparkImage(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.pinned_images")
+        self.module: ModuleType = import_runner("pinned_images")
         self.text = (ROOT / "compose" / "services" / "spark.yml").read_text()
 
     def test_the_image_line_of_the_tracked_spark_file_names_the_runners_own_image_and_nothing_else_changes(self) -> None:
@@ -148,7 +148,7 @@ class LocalSparkImage(unittest.TestCase):
 @unittest.skipUnless(all((E2E / f"{name}.py").is_file() for name in (*HOST_RUNNERS, *LOCAL_BUILDERS)), "the temporary runners are not in this checkout")
 class HostModesNameNoLocalTag(unittest.TestCase):
     def source(self, name: str, function: str | None = None) -> str:
-        module = importlib.import_module(f"tests.e2e.{name}")
+        module = import_runner(name)
         return inspect.getsource(getattr(module, function)) if function else (E2E / f"{name}.py").read_text()
 
     def test_the_stream_host_runner_names_no_local_tag_in_its_code(self) -> None:
@@ -182,7 +182,7 @@ class BronzeHostMode(unittest.TestCase):
     """The Bronze host mode inspects and runs the pinned Spark and replay images of the commit, never the publisher's local tags."""
 
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.bronze_host")
+        self.module: ModuleType = import_runner("bronze_host")
 
     def test_the_runner_names_no_local_tag_and_no_image_name_of_the_decoder_runner(self) -> None:
         source = (E2E / "bronze_host.py").read_text()

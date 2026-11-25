@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib
 import io
 import json
 import os
@@ -31,6 +30,7 @@ from typing import Any
 from unittest import mock
 
 from tests.e2e import run_record
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "record_load.py"
@@ -65,7 +65,7 @@ def passing_cases(record: Any, log: list[str], folder: Path) -> None:
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class ContainerCleanup(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.record_load")
+        self.module: ModuleType = import_runner("record_load")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.scratch = Path(scratch.name).resolve()
@@ -195,7 +195,7 @@ class FakeCatalog:
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class RecordAssertions(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.record_load")
+        self.module: ModuleType = import_runner("record_load")
 
     def record(self) -> run_record.Record:
         return run_record.Record(feature="stand-in", slug="stand_in", rerun="none")

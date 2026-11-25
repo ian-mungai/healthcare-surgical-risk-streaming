@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib
 import inspect
 import io
 import json
@@ -35,6 +34,7 @@ from unittest import mock
 
 from scripts.stack.nessie import NessieConflict, NessieError, Reference
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNERS = (ROOT / "tests" / "e2e" / "stream_host.py", ROOT / "tests" / "e2e" / "stream_features.py")
@@ -71,8 +71,8 @@ class FakeNessie:
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
 class EvidenceCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.host: ModuleType = importlib.import_module("tests.e2e.stream_host")
-        self.features: ModuleType = importlib.import_module("tests.e2e.stream_features")
+        self.host: ModuleType = import_runner("stream_host")
+        self.features: ModuleType = import_runner("stream_features")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.scratch = Path(scratch.name)

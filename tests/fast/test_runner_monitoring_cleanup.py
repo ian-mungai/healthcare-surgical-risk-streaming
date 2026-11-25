@@ -17,7 +17,6 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import importlib
 import shlex
 import subprocess
 import unittest
@@ -27,15 +26,14 @@ from typing import Any
 from unittest import mock
 
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 OTHER_RUN = "ffffff"
 
 
 def runner() -> ModuleType:
-    if not (E2E / "stack_monitoring.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module("tests.e2e.stack_monitoring")
+    return import_runner("stack_monitoring")
 
 
 class HostDocker:

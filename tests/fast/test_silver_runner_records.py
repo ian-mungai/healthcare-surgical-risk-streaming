@@ -42,6 +42,7 @@ from spark.silver import cli
 from spark.silver.checks import FLAG, SilverSignalsError
 from tests.e2e.run_record import Record
 from tests.fast import test_silver_acceptance as accept
+from tests.fast.runner_import import import_runner
 from tests.fast.silver_accept import HYPOTENSION_JOB, accept_refusal, accept_write
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
@@ -51,10 +52,7 @@ MARKERS = ("48171", "90417", "5521", "8812", "3331", "77123", "60917")
 
 
 def runner(name: str) -> ModuleType:
-    path = E2E / f"{name}.py"
-    if not path.is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def digits_left(text: str) -> list[str]:

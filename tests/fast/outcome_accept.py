@@ -450,7 +450,12 @@ SEALED_CALL = "sealed_observed"
 RAW_TEXT_CALLS = frozenset({"str", "repr", "format"})
 FACT_NAMES = frozenset({"facts", "environment"})
 STREAM_NAMES = frozenset({"out", "err", "output", "stdout", "stderr"})
-CONSTANT_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+# The module constants that the written text of a record may name as a field of an f-string (an expectation, a log line, a limit, a cleanup line). Any other
+# name is refused, a capital name too, so a text is never built from a value that the allowlist does not name. ``tests/fast/test_heldout_figures.py`` renders
+# each such text with the constant's value in the runner and requires that it holds no count from which a test-set count follows.
+EXPECTATION_CONSTANTS = frozenset(
+    {"IMAGE", "JOB_SECONDS", "NO_PROGRESS_SECONDS", "STALL_SECONDS", "NESSIE_USER", "CASE_COUNT", "FULL_CASES", "CUTOFF_FRACTIONS"}
+)
 BOOLEAN_CALLS = frozenset({"bool", "all", "any", "isinstance"})
 # The lists and texts that the record saves besides the observations and the facts, with the rule that each one breaks.
 SAVED_LISTS = {"log": "log_not_sealed", "limits": "limits_not_fixed", "cleanup": "cleanup_not_fixed", "commands": "command_not_sealed"}
@@ -574,13 +579,13 @@ def printed_problem(call: ast.Call) -> bool:
 
 
 def is_constant_name(node: ast.AST) -> bool:
-    """A module constant: a name in capitals, as ``JOB_SECONDS`` or ``PROJECT``."""
-    return isinstance(node, ast.Name) and CONSTANT_NAME.fullmatch(node.id) is not None
+    """A name of the allowlist ``EXPECTATION_CONSTANTS``, as ``JOB_SECONDS`` or ``IMAGE``."""
+    return isinstance(node, ast.Name) and node.id in EXPECTATION_CONSTANTS
 
 
 def is_constant_text(node: ast.AST) -> bool:
-    """Text that the runner writes: a string constant, an f-string whose only fields are module constants (no conversion, no format), or a choice between two
-    of them."""
+    """Text that the runner writes: a string constant, an f-string whose only fields are names of ``EXPECTATION_CONSTANTS`` (no conversion, no format), or a
+    choice between two of them."""
     if is_fixed_text(node):
         return True
     if isinstance(node, ast.JoinedStr):
@@ -803,7 +808,7 @@ def sink_leaks(source: str) -> list[tuple[str, int]]:
       the expectation of ``expect`` (a parameter of that function).
     - ``passed_not_boolean``: a verdict that is not an exact Boolean expression (``and`` and ``or`` count each operand).
     - ``log_not_sealed``, ``limits_not_fixed``, ``cleanup_not_fixed`` and ``command_not_sealed``: a line of the log, a limit, a cleanup line or a command that
-      is not written text or a sealed text. Written text may name module constants in capitals in an f-string, and nothing else.
+      is not written text or a sealed text. Written text may name the allowlisted constants (``EXPECTATION_CONSTANTS``) in an f-string, and nothing else.
 
     A source that does not parse raises ``SyntaxError``."""
     tree = ast.parse(source)
@@ -811,3 +816,35 @@ def sink_leaks(source: str) -> list[tuple[str, int]]:
     found = [(problem, getattr(node, "lineno", 0)) for node in ast.walk(tree) if (problem := sink_problem(node, forwarded)) is not None]
     found += [("expected_not_fixed", call.lineno) for call in called if not forwarded_text_ok(call, called[call])]
     return sorted(found, key=lambda item: item[1])
+
+
+def saved_text_nodes(tree: ast.AST) -> list[ast.AST]:
+    """The expressions that give the written text of a record, in source order: the expectation of each ``expect`` call (not one that passes a parameter on,
+    which is read at the calls of its function), each item put into a saved list, the value assigned to one or to the cleanup text, and the text that a call
+    gives to a function that passes it on as an expectation. A choice between two texts is one node."""
+    forwarded, called = forwarded_expectations(tree)
+    found: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if call_name(node) == "expect":
+                expected = call_argument(node, 2, "expected")
+                if expected is not None and id(node) not in forwarded:
+                    found.append(expected)
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and SAVED_LISTS.get(terminal_name(node.func.value) or "")
+                and node.func.attr in ("append", "insert", "extend")
+            ):
+                item = node.args[-1] if node.args else None
+                found += (item.elts if isinstance(item, ast.List) else []) if node.func.attr == "extend" else ([item] if item is not None else [])
+        elif isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            written = any(
+                (rule := SAVED_LISTS.get(terminal_name(target) or "")) is not None
+                and (isinstance(node, ast.AugAssign) or rule in ("limits_not_fixed", "cleanup_not_fixed"))
+                for target in targets
+            )
+            if written and not joined_cleanup(node.value):
+                found += node.value.elts if isinstance(node.value, ast.List) else [node.value]
+    found += [given for call, forwarder in called.items() if (given := forwarded_argument(call, forwarder)) is not None]
+    return sorted(found, key=lambda item: (getattr(item, "lineno", 0), getattr(item, "col_offset", 0)))

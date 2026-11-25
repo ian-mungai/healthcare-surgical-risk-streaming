@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import importlib
 import os
 import re
 import tempfile
@@ -41,6 +40,7 @@ from scripts.images import pins
 from scripts.process import CompletedProcess
 from scripts.stack.yaml_text import load_yaml
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "stream_host.py"
@@ -56,7 +56,7 @@ def done(code: int = 0, text: str = "", error: str = "") -> CompletedProcess[str
 @unittest.skipUnless(RUNNER.is_file(), "the temporary host runner is not in this checkout")
 class HostRunnerCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.stream_host")
+        self.module: ModuleType = import_runner("stream_host")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.scratch = Path(scratch.name)

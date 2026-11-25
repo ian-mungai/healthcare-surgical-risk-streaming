@@ -31,6 +31,8 @@ from types import ModuleType
 from typing import Any
 from unittest import mock
 
+from tests.fast.runner_import import import_runner, safe_execute
+
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "signal_profile.py"
 RELEASE = "tests/fixtures/vitaldb/release.json"
@@ -278,7 +280,7 @@ class GuardTemplate(unittest.TestCase):
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class RunnerEntry(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.signal_profile")
+        self.module: ModuleType = import_runner("signal_profile")
         self.parent_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.parent_directory.cleanup)
         self.parent = Path(self.parent_directory.name).resolve()
@@ -426,12 +428,8 @@ class RunnerImport(unittest.TestCase):
                 os.link(manifest, alias)
             except OSError:
                 self.skipTest("a hard link to the manifest cannot be made here")
-            spec = importlib.util.spec_from_file_location("signal_profile_fresh", RUNNER)
-            if spec is None or spec.loader is None:
-                self.fail("the runner cannot be loaded")
-            module = importlib.util.module_from_spec(spec)
             with mock.patch.dict(os.environ, {"CLINICAL_FILE": str(alias), "TRACK_LIST_FILE": str(other)}), recorded_opens() as seen:
-                spec.loader.exec_module(module)
+                module = safe_execute(RUNNER, "signal_profile_fresh")
             self.assertEqual([], opened_inputs(seen, [alias, other]))
             self.assertFalse(hasattr(module, "PINS"), "the pins are read at import")
             with mock.patch.object(module, "ROOT", ROOT), recorded_opens() as seen:

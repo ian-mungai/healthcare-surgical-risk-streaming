@@ -17,7 +17,6 @@ Failure modes covered here:
 from __future__ import annotations
 
 import contextlib
-import importlib
 import io
 import json
 import tempfile
@@ -29,6 +28,7 @@ from unittest import mock
 
 from scripts.process import CompletedProcess
 from scripts.stack.nessie import NessieError, Reference
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNERS = (ROOT / "tests" / "e2e" / "stream_host.py", ROOT / "tests" / "e2e" / "stream_features.py")
@@ -97,7 +97,7 @@ class Broker:
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
 class TeardownCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.host: ModuleType = importlib.import_module("tests.e2e.stream_host")
+        self.host: ModuleType = import_runner("stream_host")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)

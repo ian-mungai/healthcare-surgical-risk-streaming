@@ -17,7 +17,6 @@ Failure modes covered here:
 from __future__ import annotations
 
 import ast
-import importlib
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -25,14 +24,13 @@ from types import ModuleType
 from scripts.stack.nessie import Initialised, NessieError, put_namespace
 from tests.e2e.run_record import Record
 from tests.fast.host_nessie_stand_in import EMPTY, HostNessie
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def record() -> Record:

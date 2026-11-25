@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib
 import io
 import json
 import tempfile
@@ -32,6 +31,7 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from tests.e2e.run_record import Record
 from tests.fast.label_accept import refusal_ok
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 JOB = "silver_labels"
@@ -63,9 +63,7 @@ def real_refusal(error: Exception, mode: str = "build") -> tuple[int, dict[str, 
 
 
 def runner() -> ModuleType:
-    if not (E2E / "silver_labels.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module("tests.e2e.silver_labels")
+    return import_runner("silver_labels")
 
 
 class RealCommandLine(unittest.TestCase):

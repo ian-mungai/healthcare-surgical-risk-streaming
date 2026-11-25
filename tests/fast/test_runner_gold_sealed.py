@@ -45,18 +45,20 @@ from typing import Any
 from unittest import mock
 
 from scripts.process import TimeoutExpired
+from spark import split_table
 from spark.internal_diagnostic import internal_error_line
+from spark.profile.counts import BY_NAME
 from spark.settings import SettingsError
 from tests.e2e.run_record import Record
 from tests.fast.internal_line_support import ENTRY_FRAME
+from tests.fast.runner_import import import_runner
+from tests.fast.test_heldout_figures import FIGURE, figure_derivable
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def texts(record: Record) -> str:
@@ -1428,9 +1430,15 @@ class ProfileDump(unittest.TestCase):
     printed = ""
 
     def run_dump(
-        self, tables: dict[str, tuple[list[dict[str, Any]], list[str]]], source: str | None = None, sealed: tuple[str, ...] = ("whole_cohort_count",)
+        self,
+        tables: dict[str, tuple[list[dict[str, Any]], list[str]]],
+        source: str | None = None,
+        sealed: tuple[str, ...] = ("whole_cohort_count",),
+        **given: Any,
     ) -> dict[str, Any]:
-        """Run the stand-in's own ``dump`` (and the two functions it calls) on ``tables``, with Spark stood in, and return what it printed."""
+        """Run the stand-in's own ``dump`` (and the two functions it calls) on ``tables``, with Spark stood in and the rule's pinned counts given, and return
+        what it printed. ``given`` replaces a key of the spec that the runner sends: ``names``, ``want_values`` and ``count_expected`` (the table's own two
+        counts unless it is given)."""
         tree = ast.parse(source or self.module.STAND_IN)
         keep: list[ast.stmt] = [
             node
@@ -1438,8 +1446,16 @@ class ProfileDump(unittest.TestCase):
             if (isinstance(node, ast.FunctionDef) and node.name in ("dump", "profile_sql", "grid_by_case"))
             or (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant | ast.Tuple))
         ]
-        names = namespace(ast.unparse(ast.Module(body=keep, type_ignores=[])), F=FakeFunctions)
-        spec = {"dev_cases": self.DEV, "causes": self.CAUSES, "sealed": list(sealed)}
+        names = namespace(ast.unparse(ast.Module(body=keep, type_ignores=[])), F=FakeFunctions, PINNED_COUNTS=split_table.PINNED_COUNTS, BY_NAME=BY_NAME)
+        spec = {
+            "dev_cases": self.DEV,
+            "causes": self.CAUSES,
+            "sealed": list(sealed),
+            "names": ["n", "whole_cohort_count"],
+            "want_values": {"n": 1.0},
+            "count_expected": {"n": 1.0, "whole_cohort_count": 5.0},
+            **given,
+        }
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             names["dump"](FakeSession(tables), spec)
@@ -1457,18 +1473,93 @@ class ProfileDump(unittest.TestCase):
         planted = self.run_dump(self.tables(full=424242.5))
         self.assertNotIn("424242", self.printed)
         self.assertIs(False, planted["sealed_values_empty"])
-        row = next(item for item in planted["counts"] if item["name"] == "whole_cohort_count")
-        self.assertNotIn("value", row)
-        self.assertEqual(5.0, row["expected"])
+        self.assertFalse("counts" in planted, "a row of the counts table is printed")
 
-    def test_a_full_cohort_count_with_no_value_gives_a_true_flag_and_a_development_count_keeps_its_value(self) -> None:
+    def test_a_full_cohort_count_with_no_value_gives_a_true_flag_and_the_development_count_is_compared_there(self) -> None:
         found = self.run_dump(self.tables())
         self.assertIs(True, found["sealed_values_empty"])
-        self.assertEqual(1.0, next(item for item in found["counts"] if item["name"] == "n")["value"])
+        self.assertEqual((True, True, True), (found["count_names_equal"], found["development_values_equal"], found["expected_equal"]))
+        self.assertNotIn('"value": 1.0', self.printed, "a development count's value is compared in the container and never printed")
 
     def test_the_flag_looks_at_the_names_that_the_runner_sends_and_a_zero_value_is_a_value(self) -> None:
         self.assertIs(False, self.run_dump(self.tables(full=0.0))["sealed_values_empty"])
         self.assertIs(True, self.run_dump(self.tables(full=424242.5), sealed=())["sealed_values_empty"])
+
+    def real_tables(self, **edits: Any) -> tuple[dict[str, tuple[list[dict[str, Any]], list[str]]], dict[str, Any]]:
+        """The counts table of a pinned build, one row for each prespecified count: the development counts hold their value, the full cohort counts hold
+        none, and each row holds the expected value. ``edits`` changes one row by name: ``{"name": {"value": 1}}``. The second item is the spec that the
+        runner sends: the names, the wanted value of the development counts that are no patient count and the expected value of the counts that are none."""
+        counts = self.module.PRESPECIFIED
+        patient_counts = {"patients", "development_patients_training", "development_patients_validation", "cases"}
+        rows = []
+        for count in counts:
+            row = {
+                "name": count.name,
+                "value": None if count.scope == "full cohort" else float(count.expected),
+                "expected": float(count.expected),
+                "matches": True,
+            }
+            rows.append({**row, **edits.get(count.name, {})})
+        tables = self.tables()
+        tables["lake.silver.source_counts"] = (rows, ["name", "value", "expected", "matches"])
+        spec = {
+            "sealed": sorted(count.name for count in counts if count.scope == "full cohort"),
+            "names": sorted(count.name for count in counts),
+            "want_values": {count.name: float(count.expected) for count in counts if count.scope != "full cohort" and count.name not in patient_counts},
+            "count_expected": {count.name: float(count.expected) for count in counts if count.name not in patient_counts},
+        }
+        return tables, spec
+
+    def run_real(self, **edits: Any) -> dict[str, Any]:
+        tables, spec = self.real_tables(**edits)
+        return self.run_dump(tables, sealed=tuple(spec.pop("sealed")), **spec)
+
+    def test_the_dump_of_a_pinned_build_gives_no_number_that_the_test_count_follows_from(self) -> None:
+        found = self.run_real()
+        self.assertFalse(figure_derivable(found), "the test count follows from the numbers of the dump")
+        self.assertFalse(figure_derivable(self.printed), "the test count follows from the numbers of the printed line")
+        self.assertNotIn(str(FIGURE), self.printed)
+
+    def test_the_dump_of_a_pinned_build_compares_the_totals_in_the_container_and_prints_flags_only(self) -> None:
+        found = self.run_real()
+        self.assertFalse("counts" in found, "a row of the counts table is printed, with an expected total or a value")
+        self.assertEqual((True, True, True), (found["count_names_equal"], found["development_values_equal"], found["expected_equal"]))
+        self.assertIs(True, found["sealed_values_empty"])
+        total = sum(split_table.PINNED_COUNTS.values())
+        for number in (total, *split_table.PINNED_COUNTS.values()):
+            self.assertNotIn(str(number), self.printed, "a total of patients is printed")
+
+    def test_each_flag_turns_false_for_its_own_difference(self) -> None:
+        training, validation = split_table.PINNED_COUNTS["training"], split_table.PINNED_COUNTS["validation"]
+        wrong: dict[str, tuple[dict[str, Any], str]] = {
+            "a training count that is not the pinned one": ({"development_patients_training": {"value": float(training + 1)}}, "development_values_equal"),
+            "a validation count that is not the pinned one": (
+                {"development_patients_validation": {"value": float(validation - 1)}},
+                "development_values_equal",
+            ),
+            "a development count with another value": ({"development_cases": {"value": 1.0}}, "development_values_equal"),
+            "a development count with no value": ({"development_cases": {"value": None}}, "development_values_equal"),
+            "an expected patient total that is not the pinned total": (
+                {"patients": {"expected": float(sum(split_table.PINNED_COUNTS.values()) + 1)}},
+                "expected_equal",
+            ),
+            "an expected value of another count": ({"tracks": {"expected": 1.0}}, "expected_equal"),
+            "an expected value that is missing": ({"cases": {"expected": None}}, "expected_equal"),
+        }
+        for label, (edit, flag) in wrong.items():
+            with self.subTest(label):
+                found = self.run_real(**edit)
+                self.assertIs(False, found[flag])
+                self.assertFalse(figure_derivable(found), "the test count follows from the numbers of the dump")
+
+    def test_the_names_flag_turns_false_for_a_row_more_or_less(self) -> None:
+        tables, spec = self.real_tables()
+        rows, columns = tables["lake.silver.source_counts"]
+        for label, kept in (("a row less", rows[1:]), ("a row more", [*rows, {"name": "extra", "value": None, "expected": 1.0, "matches": True}])):
+            with self.subTest(label):
+                tables["lake.silver.source_counts"] = (kept, columns)
+                found = self.run_dump(tables, sealed=tuple(spec["sealed"]), **{key: value for key, value in spec.items() if key != "sealed"})
+                self.assertIs(False, found["count_names_equal"])
 
     def test_a_change_of_held_out_rows_alone_leaves_the_dump_identical(self) -> None:
         self.assertEqual(self.run_dump(self.tables()), self.run_dump(self.tables(extra=True)))

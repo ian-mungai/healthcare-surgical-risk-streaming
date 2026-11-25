@@ -21,13 +21,13 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import importlib
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 from scripts.project_config import ROOT
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 WARNING = "Warning: Permanently added '100.64.0.9' (ED25519) to the list of known hosts.\n"
@@ -42,9 +42,7 @@ HOST_MODES = {
 
 
 def runner() -> ModuleType:
-    if not (E2E / "stack_openbao.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module("tests.e2e.stack_openbao")
+    return import_runner("stack_openbao")
 
 
 class HostTarget:
@@ -201,9 +199,7 @@ class NessieStatAnswers(unittest.TestCase):
         return stack, record
 
     def cases(self, process: tuple[int, str], stat: tuple[int, str]) -> dict[str, tuple[bool, str]]:
-        if not (E2E / "stack_nessie.py").is_file():
-            raise unittest.SkipTest("the untracked runners are not on this machine")
-        module = importlib.import_module("tests.e2e.stack_nessie")
+        module = import_runner("stack_nessie")
         stack, record = self.stack(module, process, stat)
         module.container_user(stack, True)
         return {item.case: (item.passed, item.observed) for item in record.observations}

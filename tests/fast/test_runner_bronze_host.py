@@ -22,14 +22,13 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import importlib
 import json
 import unittest
-from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-E2E = Path(__file__).resolve().parents[1] / "e2e"
+from tests.fast.runner_import import import_runner
+
 HASH = "a" * 64
 OTHER = "b" * 64
 REFERENCE = json.dumps({"bucket": "b", "key": "manifests/x/" + HASH + ".json", "sha256": HASH, "version_id": "v1"})
@@ -37,9 +36,7 @@ TABLES = ("numeric_observations", "waveform_seconds", "tracks", "string_events")
 
 
 def runner() -> ModuleType:
-    if not (E2E / "bronze_host.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module("tests.e2e.bronze_host")
+    return import_runner("bronze_host")
 
 
 def dumps(**changes: str) -> dict[str, str]:

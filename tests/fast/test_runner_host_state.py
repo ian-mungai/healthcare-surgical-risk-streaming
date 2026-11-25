@@ -15,7 +15,6 @@ Failure modes covered here:
 from __future__ import annotations
 
 import contextlib
-import importlib
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -25,15 +24,14 @@ from unittest import mock
 from scripts.stack.caddy import Route, load_routes
 from tests.e2e.run_record import Record
 from tests.fast.docker_host_stand_in import HEALTHY, PROJECT, DockerHost
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 SERVICES = ("postgres", "prometheus", "grafana", "loki", "alloy")
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 @contextlib.contextmanager

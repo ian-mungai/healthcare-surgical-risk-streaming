@@ -29,7 +29,6 @@ Failure modes covered here:
 from __future__ import annotations
 
 import contextlib
-import importlib
 import io
 import json
 import re
@@ -51,8 +50,8 @@ from scripts.stack.tags import NotOnTrunk, TagConflict, tag_and_record
 from tests.e2e import run_record
 from tests.e2e.run_record import Record
 from tests.fast.nessie_stand_in import HASH_ONE, HASH_TWO, METADATA, NAMESPACE_ENTRY, StandIn, table_entry
+from tests.fast.runner_import import import_runner
 
-E2E = Path(__file__).resolve().parents[1] / "e2e"
 HASH = "a" * 64
 CHECKED = "c" * 64
 REFERENCE = json.dumps({"bucket": "b", "key": "manifests/x/" + HASH + ".json", "sha256": HASH, "version_id": "v1"})
@@ -64,9 +63,7 @@ TRUNK = f"{PREFIX}_trunk"
 
 
 def runner() -> ModuleType:
-    if not (E2E / "bronze_host.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module("tests.e2e.bronze_host")
+    return import_runner("bronze_host")
 
 
 class HostNessie(StandIn):

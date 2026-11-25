@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib
 import json
 import re
 import unittest
@@ -42,6 +41,7 @@ from scripts.stack.nessie import NessieError
 from scripts.stack.trino import TrinoError
 from tests.e2e.run_record import Record
 from tests.fast.host_nessie_stand_in import HostNessie
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 BUCKET = "bucket-x"
@@ -49,9 +49,7 @@ TAG_STATE = "ready"
 
 
 def runner() -> ModuleType:
-    if not (E2E / "catalog_proof.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module("tests.e2e.catalog_proof")
+    return import_runner("catalog_proof")
 
 
 def record() -> Record:

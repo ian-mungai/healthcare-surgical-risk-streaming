@@ -34,7 +34,6 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
-import importlib
 import io
 import json
 import sys
@@ -46,11 +45,13 @@ from typing import Any
 from spark.split_table import COLUMNS, RULE_VERSION, SplitRow, build_assignments
 from tests.e2e.run_record import Record
 from tests.fast.fake_spark import Functions, Session
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 NAMES = ("cases_with_arterial_waveform", "tracks")
 TOTAL = 987654
 FLAG_NODES = (ast.Compare, ast.BoolOp, ast.Constant)
+FLAG_CALLS = frozenset({"all", "any", "bool"})
 
 
 def flag_shaped(node: ast.expr) -> bool:
@@ -64,9 +65,7 @@ ALLOWED_NAMES = {"STEPS"}
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 def texts(record: Record) -> str:
@@ -208,7 +207,7 @@ class ProfileMismatch(unittest.TestCase):
         self.assertEqual({"as_planted"}, {key for function, key, _ in result_values(source, ("counts_flag",))})
         self.assertEqual([], total_values(source, ("counts_flag",)))
 
-    def test_the_dump_holds_no_flag_for_a_named_count(self) -> None:
+    def test_the_dump_prints_flags_for_the_counts_and_no_row_of_the_counts_table(self) -> None:
         source = runner("signal_profile").STAND_IN
         dump = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "dump")
         result = next(
@@ -217,15 +216,13 @@ class ProfileMismatch(unittest.TestCase):
             if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "result" and isinstance(node.value, ast.Dict)
         )
         values = {getattr(key, "value", ""): value for key, value in zip(result.keys, result.values, strict=True)}
-        row = values["counts"].elt  # type: ignore[attr-defined]
-        self.assertEqual({"name", "expected"}, {key.value for key in row.keys if key is not None})
-        spread = [value for key, value in zip(row.keys, row.values, strict=True) if key is None]
-        self.assertEqual(1, len(spread))
-        self.assertIsInstance(spread[0], ast.IfExp)
-        self.assertEqual({"value"}, {key.value for key in spread[0].orelse.keys}, "the value is held for a count that is not sealed only")
-        self.assertEqual([], spread[0].body.keys, "a sealed count holds no value field")
-        self.assertIn("count_flags", values)
-        self.assertIn("sealed_values_empty", values)
+        self.assertNotIn("counts", values, "a row of the counts table holds an expected total and a value")
+        for flag in ("count_names_equal", "development_values_equal", "expected_equal", "count_flags", "sealed_values_empty"):
+            self.assertIn(flag, values)
+        for flag in ("count_names_equal", "development_values_equal", "expected_equal", "sealed_values_empty"):
+            node = values[flag]
+            compared = isinstance(node, ast.Compare) or (isinstance(node, ast.Call) and getattr(node.func, "id", "") in FLAG_CALLS)
+            self.assertTrue(compared, f"{flag} is not a comparison or a Boolean call")
 
     def test_the_dump_holds_no_row_total_of_the_silver_tables(self) -> None:
         source = runner("signal_profile").STAND_IN
@@ -359,9 +356,10 @@ class ProfileLoadSteps(LoadStepCase):
 
     runner_name = "signal_profile"
     FUNCTIONS = ("load_clinical", "load_track_list", "write_split")
-    CLINICAL = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(CLIN).count() == spec["expected"]["cases"], '
-    TRACKS = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(TLIST).count() == spec["expected"]["tracks"], '
-    SPLIT = 'print("RESULT " + json.dumps({"patients_as_pinned": len(rows) == spec["expected"]["patients"], '
+    totals: tuple[int, int] = (0, 0)
+    CLINICAL = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(CLIN).count() == BY_NAME["cases"].expected, '
+    TRACKS = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(TLIST).count() == BY_NAME["tracks"].expected, '
+    SPLIT = 'print("RESULT " + json.dumps({"patients_as_pinned": len(rows) == sum(PINNED_COUNTS.values()), '
 
     def inputs(self, held: int) -> tuple[Session, dict[str, Any]]:
         cases = [*DEVELOPMENT, *held_cases(held), 424242]
@@ -370,13 +368,17 @@ class ProfileLoadSteps(LoadStepCase):
             for case in cases
         ]
         tracks = [{"caseid": str(case), "tname": f"T{index}", "tid": f"{case:04d}{index}"} for case in cases for index in range(1 + (case >= HELD_BASE) * held)]
-        spec = {"pins": {"clinical": {}, "track_list": {}}, "expected": {"cases": len(clinical), "tracks": len(tracks), "patients": len(clinical)}}
+        spec: dict[str, Any] = {"pins": {"clinical": {}, "track_list": {}}}
+        self.totals = (len(clinical), len(tracks))
         files = {"/pinned/clinical_data.csv": (clinical, CLINICAL_COLUMNS), "/pinned/trks_plain.csv": (tracks, ["caseid", "tname", "tid"])}
         return Session(files=files), spec
 
     def outputs(self, held: int, source: str | None = None) -> dict[str, dict[str, Any]]:
-        names = stand_in_namespace(source or self.source, self.FUNCTIONS)
+        """The three load steps on the stand-in tables. The container reads the totals itself (the rule's pinned counts and the prespecified table): here they
+        are the sizes of the stand-in tables, and the spec holds no total."""
         session, spec = self.inputs(held)
+        counted = {name: SimpleNamespace(expected=total) for name, total in zip(("cases", "tracks"), self.totals, strict=True)}
+        names = stand_in_namespace(source or self.source, self.FUNCTIONS, BY_NAME=counted, PINNED_COUNTS={"all": self.totals[0]})
         found = {name: printed_result(names[name], session, spec) for name in ("load_clinical", "load_track_list")}
         found["write_split"] = printed_result(names["write_split"], session, spec, False)
         again = printed_result(names["write_split"], session, spec, True)

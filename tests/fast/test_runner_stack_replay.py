@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib
 import json
 import tempfile
 import unittest
@@ -30,6 +29,7 @@ from unittest import mock
 
 from scripts.process import CompletedProcess, TimeoutExpired
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "stack_replay.py"
@@ -63,7 +63,7 @@ class StandInStack:
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class ObservationFiles(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.stack_replay")
+        self.module: ModuleType = import_runner("stack_replay")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.stack = StandInStack(Path(scratch.name))
@@ -128,7 +128,7 @@ class Docker:
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class TeardownChecks(unittest.TestCase):
     def setUp(self) -> None:
-        self.module: ModuleType = importlib.import_module("tests.e2e.stack_replay")
+        self.module: ModuleType = import_runner("stack_replay")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.scratch = Path(scratch.name)
@@ -278,7 +278,7 @@ class RunsThatStopBeforeTheBuild(unittest.TestCase):
     def run_main(
         self, *, free: int, build_code: int = 0, build_raises: BaseException | None = None, fetch_raises: BaseException | None = None
     ) -> tuple[Record, list[list[str]]]:
-        module = importlib.import_module("tests.e2e.stack_replay")
+        module = import_runner("stack_replay")
         commands: list[list[str]] = []
         seen: list[Record] = []
         real_finish = module.finish

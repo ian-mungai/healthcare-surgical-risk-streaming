@@ -19,7 +19,6 @@ Failure modes covered here:
 from __future__ import annotations
 
 import hashlib
-import importlib
 import inspect
 import json
 import tempfile
@@ -31,6 +30,7 @@ from unittest import mock
 
 from scripts.process import CompletedProcess
 from tests.e2e.run_record import ROOT, Record
+from tests.fast.runner_import import import_runner
 
 RUNNERS = (ROOT / "tests" / "e2e" / "stream_host.py", ROOT / "tests" / "e2e" / "stream_features.py")
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -47,7 +47,7 @@ def done(code: int = 0, text: str = "", error: str = "") -> CompletedProcess[str
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
 class SourceCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.host: ModuleType = importlib.import_module("tests.e2e.stream_host")
+        self.host: ModuleType = import_runner("stream_host")
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)

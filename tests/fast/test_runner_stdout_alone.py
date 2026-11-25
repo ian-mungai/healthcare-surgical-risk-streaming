@@ -15,7 +15,6 @@ Failure modes covered here:
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import unittest
 from collections.abc import Callable
@@ -25,15 +24,14 @@ from typing import Any
 from unittest import mock
 
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 WARNING = "Warning: Permanently added '100.64.0.9' (ED25519) to the list of known hosts.\n"
 
 
 def runner(name: str) -> ModuleType:
-    if not (E2E / f"{name}.py").is_file():
-        raise unittest.SkipTest("the untracked runners are not on this machine")
-    return importlib.import_module(f"tests.e2e.{name}")
+    return import_runner(name)
 
 
 class Noisy:

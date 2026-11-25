@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import importlib.util
 import io
 import os
 import sys
@@ -57,6 +56,7 @@ from scripts.stack.limits import load_limits
 from tests.e2e.run_record import Record
 from tests.fast import host_mode
 from tests.fast.host_mode import HOST_LIMITS, LOCAL_LIMITS
+from tests.fast.runner_import import safe_execute
 from tests.fast.test_runner_gold_sealed import runner
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
@@ -101,13 +101,8 @@ def clean_environment(**given: str) -> dict[str, str]:
 def load_copy(name: str, **given: str) -> ModuleType:
     """A private copy of the runner, read with the given settings (the module reads its flag when it is imported)."""
     runner(name)
-    spec = importlib.util.spec_from_file_location(f"host_copy_{name}", E2E / f"{name}.py")
-    if spec is None or spec.loader is None:
-        raise unittest.SkipTest("the runner cannot be loaded")
-    module = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(os.environ, clean_environment(**given), clear=True), mock.patch.dict(sys.modules, {spec.name: module}):
-        spec.loader.exec_module(module)
-    return module
+    with mock.patch.dict(os.environ, clean_environment(**given), clear=True), mock.patch.dict(sys.modules):
+        return safe_execute(E2E / f"{name}.py", f"host_copy_{name}")
 
 
 def observed(record: Record, case: str) -> str:

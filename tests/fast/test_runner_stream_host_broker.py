@@ -16,7 +16,6 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import importlib
 import os
 import signal
 import tempfile
@@ -29,6 +28,7 @@ from unittest import mock
 
 from scripts.process import CompletedProcess
 from tests.e2e.run_record import Record
+from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNERS = (ROOT / "tests" / "e2e" / "stream_host.py", ROOT / "tests" / "e2e" / "stream_features.py")
@@ -101,8 +101,8 @@ class FakeStack:
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
 class RestartCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.features: ModuleType = importlib.import_module("tests.e2e.stream_features")
-        self.host: ModuleType = importlib.import_module("tests.e2e.stream_host")
+        self.features: ModuleType = import_runner("stream_features")
+        self.host: ModuleType = import_runner("stream_host")
         self.clock = Clock()
         for module in (self.features, self.host):
             patched = mock.patch.object(module, "time", mock.Mock(monotonic=self.clock.monotonic, sleep=self.clock.sleep))

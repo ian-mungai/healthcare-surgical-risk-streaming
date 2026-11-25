@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import io
 import json
 import tempfile
@@ -26,12 +27,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from spark import split_table
+from spark.profile.counts import BY_NAME
 from tests.e2e.run_record import Record
 from tests.fast.sealed_record import FLAG_NAME
+from tests.fast.test_heldout_figures import CASE_FIGURE, FIGURE, figure_derivable, figure_pattern, numbers_of
 from tests.fast.test_runner_gold_sealed import runner
 
 BRANCH_HASH, BASE_HASH = "b" * 64, "a" * 64
 SECRET = 31337
+PATIENT_COUNT_NAMES = ("patients", "development_patients_training", "development_patients_validation")
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 
 
@@ -307,10 +312,9 @@ class ProfileCases(unittest.TestCase):
             "arterial": {},
             "grid": {},
             "unscored": [{**zero, **rule, "scope": "development", "unscored_share": None}],
-            "counts": [
-                {"name": count.name, "expected": float(count.expected), **({"value": 7.0} if count.scope != "full cohort" else {})}
-                for count in module.PRESPECIFIED
-            ],
+            "count_names_equal": True,
+            "development_values_equal": True,
+            "expected_equal": True,
             "sealed_values_empty": True,
             "count_flags": ["None"],
             "rule": [{**asdict(module.planned_rule(5)), "written_at": "2026-11-24"}],
@@ -335,15 +339,87 @@ class ProfileCases(unittest.TestCase):
 
         def stand(mode: str, branch: str, **values: Any) -> tuple[int, dict[str, Any], str, float]:
             asked.append(values)
-            return 0, {**self.healthy_dump(), "counts": [{"name": "x", "value": 1}]}, "", 0.1
+            return 0, self.healthy_dump(), "", 0.1
 
         self.flow.stand = stand
         built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
-        self.flow.independent(built, [908], {"development_cases": 7.0}, "", "control", pinned=False, arterial=False)
+        pinned = {name: float(self.module.BY_NAME[name].expected) for name in ("development_cases", *PATIENT_COUNT_NAMES[1:])}
+        self.flow.independent(built, [908], pinned, "", "control", pinned=False, arterial=False)
         wanted = sorted(count.name for count in self.module.PRESPECIFIED if count.scope == "full cohort")
         self.assertEqual([wanted], [values["sealed"] for values in asked])
         self.assertGreater(len(wanted), 0)
         self.assertNotIn("development_cases", wanted)
+
+    def requests_written(self) -> list[dict[str, Any]]:
+        """The complete request that ``write_spec`` receives for each call of a stand-in: the loads of the three tables, the split and the independent read in
+        both forms (pinned and unpinned), through the runner's own ``stand`` and ``spec``."""
+        written: list[dict[str, Any]] = []
+        self.stack.write_spec = written.append
+        self.stack.stand_in = lambda mode, branch: (0, self.healthy_dump(), "", 0.1)
+        built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
+        pinned = {name: float(self.module.BY_NAME[name].expected) for name in ("development_cases", *PATIENT_COUNT_NAMES[1:])}
+        for mode in ("load_clinical", "load_track_list", "write_split"):
+            self.flow.stand(mode, "p6_prof_trunk_x1")
+        for pinned_run in (True, False):
+            self.flow.independent(built, [908], pinned, "", "control", pinned=pinned_run, arterial=False)
+        return written
+
+    def test_the_independent_read_sends_the_container_no_total_of_patients_or_cases_and_nothing_that_a_test_count_follows_from(self) -> None:
+        asked: list[dict[str, Any]] = []
+        self.stack.write_spec = lambda *_: None
+
+        def stand(mode: str, branch: str, **values: Any) -> tuple[int, dict[str, Any], str, float]:
+            asked.append(values)
+            return 0, self.healthy_dump(), "", 0.1
+
+        self.flow.stand = stand
+        built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
+        pinned = {name: float(self.module.BY_NAME[name].expected) for name in ("development_cases", *PATIENT_COUNT_NAMES[1:])}
+        self.flow.independent(built, [908], pinned, "", "control", pinned=True, arterial=False)
+        sent = asked[0]
+        self.assertEqual(sorted(count.name for count in self.module.PRESPECIFIED), sent["names"])
+        self.assertEqual(
+            ["development_cases"], sorted(sent["want_values"]), "the development patient counts are the rule's pinned counts, read in the container"
+        )
+        self.assertTrue((set(PATIENT_COUNT_NAMES) | {"cases"}).isdisjoint(sent["count_expected"]), "an expected total of patients or of cases is sent")
+
+    def test_no_complete_request_holds_a_total_of_patients_or_cases_or_a_number_that_a_test_set_count_follows_from(self) -> None:
+        written = self.requests_written()
+        self.assertGreaterEqual(len(written), 5, "the loads, the split and the independent reads each wrote a request")
+        module = self.module
+        constants = {
+            "cases": list(module.CASES),
+            "files": self.flow.files,
+            "pins": module.release_pins(),
+            "sha256": self.flow.files[module.PLANT_CASE]["sha256"],
+            "causes": list(module.INVALID_CAUSES),
+            "nan": list(module.NAN_BLOCK),
+            "gap": list(module.GAP_BLOCK),
+        }
+        totals = {sum(split_table.PINNED_COUNTS.values()), int(BY_NAME["patients"].expected), int(BY_NAME["cases"].expected)}
+        # Every assertion here is a Boolean with a fixed message and the sub-test is named by the index only: a rejected request prints none of its contents.
+        for index, request in enumerate(written):
+            with self.subTest(request=index):
+                counted = {key: value for key, value in request.items() if key not in constants and key != "dev_cases"}
+                self.assertTrue(
+                    set(request) <= set(constants) | {"dev_cases", "names", "sealed", "want_values", "count_expected"}, "a key of the request is new: judge it"
+                )
+                self.assertTrue(
+                    {key: value for key, value in constants.items() if key in request} == {key: request[key] for key in constants if key in request},
+                    "a constant of the request is not the runner's constant",
+                )
+                self.assertTrue(set(request["dev_cases"]) <= set(module.CASES), "a case that the runner does not hold is named as a development case")
+                self.assertTrue(totals.isdisjoint(numbers_of(request)), "the request holds the total of the patients or of the cases of the cohort")
+                self.assertFalse(figure_derivable(counted, FIGURE), "the test-set patient count follows from the counts of the request")
+                self.assertFalse(figure_derivable(counted, CASE_FIGURE), "the held-out case count follows from the counts of the request")
+
+    def test_the_held_out_counts_would_follow_from_the_old_request(self) -> None:
+        """The control of the test above: the request as it was (the totals in ``expected``, the development counts in ``want_values``) gives both figures."""
+        counts = split_table.PINNED_COUNTS
+        cases = {"expected": {"cases": int(BY_NAME["cases"].expected)}, "want_values": {"development_cases": float(BY_NAME["development_cases"].expected)}}
+        patients = {"expected": {"patients": sum(counts.values())}, "want_values": {"training": counts["training"], "validation": counts["validation"]}}
+        self.assertTrue(figure_derivable(cases, CASE_FIGURE))
+        self.assertTrue(figure_derivable(patients, FIGURE))
 
     def test_the_independent_read_returns_true_when_every_comparison_passes_and_records_flags_only(self) -> None:
         self.assertIs(True, self.independent(self.healthy_dump()))
@@ -364,10 +440,14 @@ class ProfileCases(unittest.TestCase):
             "an unscored share with no cutoff": (1, mutated(unscored=[{**dump["unscored"][0], "unscored_share": 0.5}])),
             "another rule": (1, mutated(unscored=[{**dump["unscored"][0], "waveform_limit": 1}])),
             "an arterial second in a development case": (1, mutated(arterial={"908": [[1, True]]})),
-            "a count with another value": (
-                3,
-                mutated(counts=[{**item, "value": 8.0} if item["name"] == "development_cases" else item for item in dump["counts"]]),
-            ),
+            "a development count with another value": (3, mutated(development_values_equal=False)),
+            "names of counts that are not the prespecified ones": (3, mutated(count_names_equal=False)),
+            "an expected value that is not the prespecified one": (3, mutated(expected_equal=False)),
+            "a development flag that is a text": (3, mutated(development_values_equal="True")),
+            "no flag of the development values": (3, {key: value for key, value in self.healthy_dump().items() if key != "development_values_equal"}),
+            "a flag of the names that is a number": (3, mutated(count_names_equal=1)),
+            "no flag of the expected values": (3, {key: value for key, value in self.healthy_dump().items() if key != "expected_equal"}),
+            "a row of the counts table in the reply": (3, mutated(counts=[{"name": "patients", "expected": 1.0}])),
             "a sealed count that held a value": (3, mutated(sealed_values_empty=False)),
             "no flag of the sealed counts": (3, {key: value for key, value in self.healthy_dump().items() if key != "sealed_values_empty"}),
             "a flag of the sealed counts that is a text": (3, mutated(sealed_values_empty="True")),
@@ -560,6 +640,57 @@ class GoldCases(unittest.TestCase):
         text = json.dumps(asdict(record), default=str)
         self.assertNotIn(str(SECRET), text)
         self.assertIn("stopped by OSError", text)
+
+
+class RequestTestOutputIsSafe(unittest.TestCase):
+    """The request test rejects a request that holds a count, and its output names no count (the reviewer's probe: a count planted under ``pins.clinical`` was
+    printed in the dictionary diff of the failing assertion). Each plant is run through the real test with its own requests."""
+
+    TEST = "test_no_complete_request_holds_a_total_of_patients_or_cases_or_a_number_that_a_test_set_count_follows_from"
+
+    @staticmethod
+    def planted(requests: list[dict[str, Any]], count: int) -> dict[str, list[dict[str, Any]]]:
+        """Each plant is a copy of the requests in which the first request that holds the key carries the count in one place."""
+
+        def with_edit(edit: Any) -> list[dict[str, Any]]:
+            made = copy.deepcopy(requests)
+            edit(next(request for request in made if "pins" in request))
+            return made
+
+        return {
+            "a size under pins.clinical": with_edit(lambda request: request["pins"]["clinical"].update(size=count)),
+            "a new key under pins.clinical": with_edit(lambda request: request["pins"]["clinical"].update(rows=count)),
+            "a text under pins.clinical": with_edit(lambda request: request["pins"]["clinical"].update(sha256=f"{count:,} patients")),
+            "a new key under pins": with_edit(lambda request: request["pins"].update(test={"patients": count})),
+            "a new key of the request": with_edit(lambda request: request.update(held_out=count)),
+            "a new key of the request named by the count": with_edit(lambda request: request.update({f"set_{count}": 1})),
+            "a case that the runner does not hold": with_edit(lambda request: request.update(dev_cases=[count])),
+            "a changed file entry": with_edit(
+                lambda request: request["files"].update({count: {"sha256": "c" * 64}}) if "files" in request else request.update(x=1)
+            ),
+        }
+
+    def run_plant(self, requests: list[dict[str, Any]]) -> tuple[str, bool]:
+        case = ProfileCases(self.TEST)
+        case.setUp()
+        case.requests_written = lambda: requests  # type: ignore[method-assign]
+        stream = io.StringIO()
+        result = unittest.TextTestRunner(stream=stream, verbosity=0).run(case)
+        if result.skipped:
+            self.skipTest("the signal profile runner is not on this machine")
+        return stream.getvalue(), result.wasSuccessful()
+
+    def test_a_request_that_holds_a_count_fails_the_test_and_the_output_names_no_count(self) -> None:
+        case = ProfileCases(self.TEST)
+        case.setUp()
+        requests = case.requests_written()
+        for figure_name, count in (("the test count", FIGURE), ("the held-out case count", CASE_FIGURE)):
+            for label, plant in self.planted(requests, count).items():
+                with self.subTest(figure=figure_name, plant=label):
+                    output, passed = self.run_plant(plant)
+                    self.assertFalse(passed, "the request test passed on a request that holds a count")
+                    for each in (FIGURE, CASE_FIGURE):
+                        self.assertFalse(figure_pattern(each).search(output) is not None, "the output of the request test holds a count")
 
 
 class FlagNames(unittest.TestCase):

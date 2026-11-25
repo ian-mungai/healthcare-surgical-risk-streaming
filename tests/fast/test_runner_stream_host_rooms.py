@@ -33,6 +33,7 @@ from unittest import mock
 
 from scripts.process import CompletedProcess
 from tests.e2e.run_record import ROOT
+from tests.fast.runner_import import import_runner
 
 BOUNDS = ROOT / "tests" / "e2e" / "stream_stack" / "read_bounds.py"
 
@@ -47,8 +48,8 @@ def done(code: int = 0, text: str = "", error: str = "") -> CompletedProcess[str
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
 class RoomsCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.host: ModuleType = importlib.import_module("tests.e2e.stream_host")
-        self.features: ModuleType = importlib.import_module("tests.e2e.stream_features")
+        self.host: ModuleType = import_runner("stream_host")
+        self.features: ModuleType = import_runner("stream_features")
         self.calls: list[tuple[str, ...]] = []
 
 

@@ -29,6 +29,7 @@ from unittest import mock
 
 from scripts.stack.limits import load_limits
 from tests.e2e.run_record import ROOT, Record
+from tests.fast.runner_import import import_runner
 
 RUNNERS = (ROOT / "tests" / "e2e" / "stream_host.py", ROOT / "tests" / "e2e" / "stream_features.py")
 
@@ -77,7 +78,7 @@ class FakeNessie:
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
 class FinishCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.host: ModuleType = importlib.import_module("tests.e2e.stream_host")
+        self.host: ModuleType = import_runner("stream_host")
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)

@@ -591,6 +591,13 @@ class SinkLeaks(unittest.TestCase):
         ("expected_not_fixed", 'record.expect("c", "s", expected=what, observed="x", passed=ok is True)'),
         ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN} and {rows}", sealed_observed({"a": True}), ok is True)'),
         ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN[0]}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"the set holds {TOTAL}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"{IMAGE}{PREFIX}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", "a" if ok else f"{TOTAL}", sealed_observed({"a": True}), ok is True)'),
+        ("log_not_sealed", 'log.append(f"the set holds {TOTAL}")'),
+        ("limits_not_fixed", 'record.limits.append(f"within {PIN_SIZE} seconds")'),
+        ("cleanup_not_fixed", 'cleanup.append(f"left {PIN_SIZE}")'),
         ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN!r:>{width}}", sealed_observed({"a": True}), ok is True)'),
         ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), ok)'),
         ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), accepted.ok)'),
@@ -678,7 +685,7 @@ class SinkLeaks(unittest.TestCase):
         'print("fixed text")',
         'texts = [" ".join((item.case, item.step, item.observed)) for item in record.observations]',
         'record.expect("c", "s", "the file has the size of the pin", sealed_observed({"x": ok}), ok is True)',
-        'record.expect("c", "s", f"the file has the pinned size {PIN_SIZE} and owner {NESSIE_USER}", sealed_observed({"x": ok}), ok is True)',
+        'record.expect("c", "s", f"the file has the pinned size {IMAGE} and owner {NESSIE_USER}", sealed_observed({"x": ok}), ok is True)',
         'record.expect("c", "s", "a" if full else "b", sealed_observed({"x": ok}), ok is True)',
         'record.expect("c", "s", sealed_observed({"x": True}), sealed_observed({"x": ok}), ok is True)',
         'record.expect("c", "s", "e", sealed_observed({"x": ok}), code == 0 and bool(merged) and all(done.values()) and failure is None)',
@@ -762,7 +769,9 @@ class SinkLeaks(unittest.TestCase):
         return sink_leaks(self.FORWARD.replace("@CALLS@", "".join(f"        {call}\n" for call in calls)))
 
     def test_an_expectation_that_is_a_parameter_is_checked_where_the_function_is_called(self) -> None:
-        self.assertEqual([], self.forward('self.refused("c", "the job exits 1", result, True)', 'self.refused("c", f"the job exits {JOB_CODE}", result, True)'))
+        self.assertEqual(
+            [], self.forward('self.refused("c", "the job exits 1", result, True)', 'self.refused("c", f"the job exits {JOB_SECONDS}", result, True)')
+        )
         self.assertEqual([("expected_not_fixed", 6)], self.forward('self.refused("c", f"rows {len(rows)}", result, True)'))
         self.assertEqual([("expected_not_fixed", 6)], self.forward('self.refused("c", expected=f"rows {len(rows)}", observed=result, ok=True)'))
         self.assertEqual([("expected_not_fixed", 6)], self.forward('self.refused("c", wanted, result, True)'))
