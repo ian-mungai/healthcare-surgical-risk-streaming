@@ -176,6 +176,55 @@ class ReaderTest(unittest.TestCase):
         found = closure(root, ["tests/run.py"]).missing
         self.assertEqual(["tests/run.py: tests.gone has no file", "tests/run.py: a relative import leaves the repository"], found)
 
+    def test_a_name_that_a_package_or_module_does_not_export_and_no_submodule_holds_is_reported(self) -> None:
+        files = {**self.BASE, "tests/tool.py": "def go():\n    pass\n", "tests/sibling.py": "", "scripts/tool.py": ""}
+        for text, expected in (
+            ("from . import sibling\n", []),
+            ("from . import absent\n", ["tests/run.py: tests has no name absent and no submodule of that name"]),
+            ("from .tool import go\n", []),
+            ("from .tool import nope\n", ["tests/run.py: tests.tool has no name nope and no submodule of that name"]),
+            ("from scripts import gone, tool\n", ["tests/run.py: scripts has no name gone and no submodule of that name"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(expected, closure(self.tree({**files, "tests/run.py": text}), ["tests/run.py"]).missing)
+
+    def test_a_name_that_a_package_init_defines_imports_or_takes_by_a_star_import_is_resolved_and_a_submodule_is_followed(self) -> None:
+        init = "".join(
+            f"{line}\n"
+            for line in (
+                "from .inner import shown as renamed",
+                "import json as js",
+                "if True:",
+                "    VALUE = 1",
+                "try:",
+                "    pass",
+                "except ImportError:",
+                "    def late():",
+                "        pass",
+            )
+        )
+        files = {
+            "scripts/__init__.py": init,
+            "scripts/inner.py": "shown = 1\n",
+            "scripts/wide.py": "from scripts.inner import *\n",
+            "scripts/dynamic.py": "def __getattr__(name):\n    return 1\n",
+            "tests/__init__.py": "",
+            "tests/run.py": "from scripts import renamed, js, VALUE, late, inner\nfrom scripts.wide import shown\nfrom scripts.dynamic import anything\n",
+        }
+        self.assertEqual([], closure(self.tree(files), ["tests/run.py"]).missing)
+
+    def test_a_file_that_is_not_valid_python_is_reported_with_fixed_text_and_stops_nothing_else(self) -> None:
+        files = {
+            **self.BASE,
+            "tests/run.py": "from scripts import bad, good\n",
+            "scripts/bad.py": "def (:\n    secret_value = 1\n",
+            "scripts/good.py": "import vitaldb\n",
+        }
+        found = closure(self.tree(files), ["tests/run.py"])
+        self.assertEqual(["scripts/bad.py: the file is not valid Python, so its imports cannot be read"], found.unreadable)
+        self.assertEqual({"vitaldb": {"scripts/good.py"}}, {name: set(places) for name, places in found.third_party.items()})
+        self.assertNotIn("secret_value", " ".join(found.unreadable))
+
     def test_a_file_that_the_source_does_not_hold_is_reported_and_an_overlay_replaces_the_text_that_the_base_holds(self) -> None:
         base = self.tree({**self.BASE, "tests/run.py": "import json\n"})
         overlay = OverlaySource(base, {"tests/run.py": "import vitaldb\n", "tests/new.py": "import boto3\n"})

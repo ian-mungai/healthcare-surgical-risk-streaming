@@ -3,10 +3,10 @@
 Run from the repository root under the project profile in ``.env``, through ``make``:
 
 ``make host-runners-place RUNNERS="tests/e2e/silver_signals.py tests/e2e/stream_host.py"`` sends each named file over SSH into
-``/opt/platform/runner/<commit>/<the same path>`` and prints its SHA-256 as the host computed it. The names reach the program as data (the variable
-``RUNNERS``, split on white space in Python), so no shell expands a name. The run's record ``runs/<run id>/runner_files.json`` is the host's own record
-after the call. The deploy (``make host-up``) makes the folder from ``git archive`` of the commit, which holds no Git-ignored file; this places the
-runners that it cannot.
+``/opt/platform/runner/<commit>/<the same path>`` and prints its SHA-256 as the host computed it. The names reach the program as data: the raw text of
+the variable ``RUNNERS``, which Make does not expand, arrives in ``HOST_RUNNER_NAMES`` and is split on white space in Python, so neither Make nor a shell
+expands a name. The run's record ``runs/<run id>/runner_files.json`` is the host's own record after the call. The deploy (``make host-up``) makes the folder
+from ``git archive`` of the commit, which holds no Git-ignored file; this places the runners that it cannot.
 
 The hashes of every runner placed in the folder are also written on the host, in ``placed_runners.json`` in the folder's root (``{"commit": ..., "files":
 {path: sha256}}``, read-only to its owner), so that a runner on the host can check its own file. A runner that an earlier call placed is hashed on the
@@ -33,6 +33,7 @@ import re
 import shlex
 import stat
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,11 +54,36 @@ from scripts.stack.yaml_text import load_yaml
 # The runner folder and marker of the Ansible role runner_checkout (ansible/group_vars/all.yml); a fast test holds them equal.
 RUNNER_DIRECTORY = "/opt/platform/runner"
 MARKER = ".runner_checkout.json"
+# The fields of the marker that the role writes (``runner_checkout_expected`` in ansible/group_vars/all.yml; a fast test holds them equal).
+MARKER_FIELDS = ("commit", "python", "python_archive_sha256", "requirements")
+# The program that the host's Python runs on the marker: valid JSON, one object, exactly the fields of MARKER_FIELDS (none repeated) and this commit.
+MARKER_CHECK = "\n".join(
+    (
+        "import json, re, sys",
+        "def only(pairs):",
+        "    names = [name for name, _ in pairs]",
+        "    if len(set(names)) != len(names):",
+        "        raise ValueError(names)",
+        "    return dict(pairs)",
+        "try:",
+        "    with open(sys.argv[1], encoding='utf-8') as handle:",
+        "        document = json.load(handle, object_pairs_hook=only)",
+        "except (OSError, ValueError):",
+        "    sys.exit(1)",
+        f"fields = {MARKER_FIELDS!r}",
+        "good = isinstance(document, dict) and sorted(document) == sorted(fields) and document['commit'] == sys.argv[2]",
+        "good = good and isinstance(document['python'], str) and isinstance(document['requirements'], list)",
+        "good = good and isinstance(document['python_archive_sha256'], str) and re.fullmatch('[0-9a-f]{64}', document['python_archive_sha256']) is not None",
+        "sys.exit(0 if good else 1)",
+        "",
+    )
+)
 MANIFEST_NAME = "runner_manifest.json"
 PLACED_RECORD = "placed_runners.json"
 RECORD_FILE = "runner_files.json"
 GROUP_VARIABLES = "ansible/group_vars/all.yml"
-RUNNERS_VARIABLE = "RUNNERS"
+# The names that the Makefile passes: the raw text of its variable RUNNERS.
+NAMES_VARIABLE = "HOST_RUNNER_NAMES"
 RUNNER_FORM = re.compile(r"tests/e2e/[a-z][a-z0-9_]*\.py")
 COMMIT_FORM = re.compile(r"[0-9a-f]{40}")
 DIGEST_FORM = re.compile(r"[0-9a-f]{64}")
@@ -68,6 +94,9 @@ GIT_SECONDS = 30
 SCAN_SECONDS = 60
 # The pinned credential scanner that the commit hook runs (.pre-commit-config.yaml, installed by scripts/quality/install_tools.py).
 GITLEAKS = ROOT / ".tools" / "bin" / "gitleaks"
+# The one configuration of the scan: the scanner's built-in rules and nothing from the caller's surroundings.
+GITLEAKS_CONFIGURATION = 'title = "runner placement scan"\n\n[extend]\nuseDefault = true\n'
+SCAN_PATH = "/usr/bin:/bin"
 NO_FOLDER_CODE = 3
 NO_FOLDER_WORD = "no_runner_folder"
 LINKED_CODE = 5
@@ -128,14 +157,23 @@ def read_plain_file(path: Path, before: os.stat_result) -> bytes:
 
 
 def scan_credentials(data: bytes) -> None:
-    """Run the pinned credential scanner over the exact bytes that go to the host. A finding, a missing scanner and a scanner that fails are refused with fixed
-    text: the scanner's own output is never shown."""
+    """Run the pinned credential scanner over the exact bytes that go to the host. A finding, a missing scanner, a scanner that cannot be started and a
+    scanner that fails are refused with fixed text: the scanner's own output is never shown. The scanner gets nothing from the caller's surroundings: its own
+    configuration (the built-in rules, in ``GITLEAKS_CONFIG_TOML``, which comes before a ``.gitleaks.toml`` in the working folder), a working folder of its
+    own that holds no other file, an environment of only a search path, that folder and the configuration, and no way to skip a finding by a comment in the
+    file (``--ignore-gitleaks-allow``), so a variable such as ``GITLEAKS_CONFIG``, a ``.gitleaks.toml`` or ``.gitleaksignore`` in the working folder and a
+    ``gitleaks:allow`` comment change nothing (the precedence of its configuration is in ``gitleaks stdin --help``)."""
     if not GITLEAKS.is_file():
         raise FixedHostError("the pinned credential scanner is not installed (.tools/bin/gitleaks): run make setup")
     try:
-        result = run_command(str(GITLEAKS), ["stdin", "--redact", "--no-banner", "--log-level", "error"], input_text=data.decode(), timeout=SCAN_SECONDS)
+        with tempfile.TemporaryDirectory(prefix="gitleaks_") as folder:
+            arguments = ["stdin", "--gitleaks-ignore-path", folder, "--ignore-gitleaks-allow", "--redact", "--no-banner", "--log-level", "error"]
+            environment = {"PATH": SCAN_PATH, "HOME": folder, "GITLEAKS_CONFIG_TOML": GITLEAKS_CONFIGURATION}
+            result = run_command(str(GITLEAKS), arguments, input_text=data.decode(), timeout=SCAN_SECONDS, cwd=Path(folder), env=environment)
     except TimeoutExpired:
         raise FixedHostError("the credential scan did not finish within its deadline of 60 seconds") from None
+    except OSError:
+        raise FixedHostError("the credential scanner cannot be started: run make setup to install the pinned one again") from None
     if result.returncode == 1:
         raise FixedHostError("the credential scanner found a possible secret in the file just named: take it out of the runner")
     if result.returncode != 0:
@@ -144,9 +182,9 @@ def scan_credentials(data: bytes) -> None:
 
 def runner_text(relative: str, commit: str, root: Path = ROOT, env: Mapping[str, str] | None = None) -> str:
     """The text of one runner file, after every check: its path form, a plain file with one name in the folder, that Git ignores it and the commit does not hold
-    it, its size and form, the privacy scan and the credential scan, both over the bytes that go. Nothing is printed before the path has passed its form, the
-    name is on the line "checked <path>" that comes last, and a refusal is fixed text (the path, the content and the matched value are never in it; the
-    privacy scan's finding is a line of its own on standard output, with the kind and the line number only)."""
+    it, its size and form, the privacy scan and the credential scan, both over the bytes that go. It prints nothing but the privacy scan's finding (a line of
+    its own on standard output, with the kind and the line number only), and a refusal is fixed text (the path, the content and the matched value are never in
+    it). ``place`` prints "checked <path>" after the imports of every file have passed too."""
     require_commit(commit)
     if RUNNER_FORM.fullmatch(relative) is None:
         raise FixedHostError("a path is not one Python runner: it must be one lower-case .py file directly under tests/e2e/")
@@ -182,7 +220,6 @@ def runner_text(relative: str, commit: str, root: Path = ROOT, env: Mapping[str,
                 "the file just named holds personal or environment-specific data (the line above says the kind and the line): take it out of the runner"
             )
     scan_credentials(data)
-    sys.stdout.write(f"checked {relative}\n")
     return text
 
 
@@ -227,6 +264,7 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
     found = closure(OverlaySource(source, texts), entries)
     problems = [
         *found.missing,
+        *found.unreadable,
         *(
             f"{name}: loads a module at run time that the import check cannot read"
             for name in sorted(d for d in found.dynamic if d.startswith("tests/e2e/") and d not in LOADED_BY_PATH)
@@ -236,20 +274,23 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
     if problems:
         sys.stdout.writelines(f"{line}\n" for line in problems)
         raise FixedHostError(
-            "a runner takes a module or a package that the runner checkout would not hold (the lines above name each): add it to the lock file and deploy again"
+            "a runner takes a module or a package that the runner checkout would not hold, or a file that is not valid Python (the lines above name each): "
+            "add the package to the lock file and deploy again, or fix the file"
         )
 
 
 def runner_folder_guard(commit: str, directory: str = RUNNER_DIRECTORY) -> str:
     """The start of every remote command: stop with a fixed word when the runner folder or the commit's folder is a link or is no folder, or when the commit's
-    folder has no finished marker that names this commit, then work in the folder."""
+    folder has no finished marker that names this commit (the marker is parsed as the JSON that the role writes: no text that merely holds the commit passes),
+    then work in the folder."""
     folder = f"{directory}/{commit}"
     marker = f"{folder}/{MARKER}"
     return (
         "set -eu; "
         f'for d in {shlex.quote(directory)} {shlex.quote(folder)}; do if test -L "$d"; then echo {LINKED_WORD}; exit {LINKED_CODE}; fi; done; '
         f"if ! test -d {shlex.quote(folder)}; then echo {NO_FOLDER_WORD}; exit {NO_FOLDER_CODE}; fi; "
-        f"if test -L {shlex.quote(marker)} || ! test -f {shlex.quote(marker)} || ! grep -qF -- {shlex.quote(f'"commit": "{commit}"')} {shlex.quote(marker)}; "
+        f"if test -L {shlex.quote(marker)} || ! test -f {shlex.quote(marker)} "
+        f"|| ! python3 -I -c {shlex.quote(MARKER_CHECK)} {shlex.quote(marker)} {shlex.quote(commit)}; "
         f"then echo {NO_FOLDER_WORD}; exit {NO_FOLDER_CODE}; fi; "
         f"cd -- {shlex.quote(folder)}; "
     )
@@ -359,14 +400,16 @@ def place(
     ssh_options: Sequence[str] | None = None,
 ) -> Placement:
     """Send each named file and return its SHA-256 as the host computed it, with the host's record that was then written. Every file is checked, and the imports
-    of all of them, before the first is sent. The host's earlier record is read and each runner that it keeps from an earlier call is hashed on the host before
-    the first is sent too: a kept runner whose file differs from the record is refused, and the written record holds only hashes that the host computed."""
+    of all of them, before the first is sent, and the paths are printed once all of those checks have passed. The host's earlier record is read and each
+    runner that it keeps from an earlier call is hashed on the host before the first is sent too: a kept runner whose file differs from the record is refused,
+    and the written record holds only hashes that the host computed."""
     if not relatives:
         raise FixedHostError("the call names no runner file")
     if len(set(relatives)) != len(relatives):
         raise FixedHostError("a runner file is named twice")
     texts = {relative: runner_text(relative, commit, root, env) for relative in relatives}
     check_imports(texts, commit, root, env)
+    sys.stdout.writelines(f"checked {relative}\n" for relative in texts)
     options = list(ssh_options) if ssh_options is not None else host.ssh_arguments(run_id)
     earlier = placed_before(ssh_call(run, options, address, read_record_command(commit), None, "reading the host's record of placed runners"), commit)
     kept = [name for name in sorted(earlier) if name not in texts]
@@ -431,11 +474,12 @@ def host_runners_place(relatives: Sequence[str], binding: Path) -> int:
 
 
 def runner_names(arguments: argparse.Namespace, environment: Mapping[str, str]) -> list[str]:
-    """The named runner files: the arguments, or the words of the variable RUNNERS split on white space only, so that no shell expands a name."""
+    """The named runner files: the arguments, or the words of the variable HOST_RUNNER_NAMES (the raw text of the Makefile's RUNNERS) split on white space
+    only, so that no shell expands a name."""
     if arguments.names_from_environment:
         if arguments.runners:
-            raise FixedHostError("name the runner files in the arguments or in RUNNERS, not both")
-        return environment.get(RUNNERS_VARIABLE, "").split()
+            raise FixedHostError("name the runner files in the arguments or in RUNNERS (HOST_RUNNER_NAMES), not both")
+        return environment.get(NAMES_VARIABLE, "").split()
     return list(arguments.runners)
 
 
@@ -446,7 +490,7 @@ def main() -> int:
     parser.add_argument(
         "--names-from-environment",
         action="store_true",
-        help=f"read the names from the variable {RUNNERS_VARIABLE}, split on white space, with no shell expansion",
+        help=f"read the names from the variable {NAMES_VARIABLE}, split on white space, with no shell expansion",
     )
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()

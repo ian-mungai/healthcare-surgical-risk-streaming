@@ -17,7 +17,7 @@ import importlib.metadata
 import re
 import sys
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -62,6 +62,7 @@ class Closure:
     third_party: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     dynamic: set[str] = field(default_factory=set)
     missing: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
 
 
 def module_file(source: Source, module: str) -> str | None:
@@ -116,6 +117,65 @@ def uses_dynamic_import(tree: ast.AST) -> bool:
     return False
 
 
+def parsed(text: str, file: str) -> ast.AST | None:
+    """The syntax tree of a file, or None when the text is not valid Python (the error text is never kept: it holds a line of the file)."""
+    try:
+        return ast.parse(text, file)
+    except SyntaxError, ValueError, RecursionError, MemoryError:
+        return None
+
+
+def top_level_statements(statements: Sequence[ast.AST]) -> Iterator[ast.AST]:
+    """Each statement that runs when a module is imported: the file's own statements and those nested in an ``if``, ``try``, ``with`` or loop, but not the
+    body of a function or a class."""
+    for node in statements:
+        yield node
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            for part in ("body", "orelse", "finalbody", "handlers"):
+                yield from top_level_statements(getattr(node, part, []))
+
+
+def stored_names(target: ast.AST | None) -> set[str]:
+    return {node.id for node in ast.walk(target) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)} if target is not None else set()
+
+
+def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset()) -> tuple[set[str], bool]:
+    """The names that a module's file defines or imports at its top level, and whether other names may exist that this read cannot list: a star import of a
+    module that is not the repository's own or that has no readable file, and a module ``__getattr__``."""
+    file = module_file(source, module)
+    text = source.read(file) if file is not None else None
+    tree = parsed(text, file or module) if text is not None else None
+    if file is None or tree is None or module in seen:
+        return set(), True
+    names: set[str] = set()
+    open_ended = False
+    for node in top_level_statements(tree.body if isinstance(tree, ast.Module) else []):
+        if isinstance(node, ast.Import):
+            names |= {alias.asname or alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+                    continue
+                target = absolute_module(file, node.level, node.module) if node.level else node.module
+                if target and target.split(".")[0] in FIRST_PARTY:
+                    more, wide = exported_names(source, target, seen | {module})
+                    names |= more
+                    open_ended = open_ended or wide
+                else:
+                    open_ended = True
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+            open_ended = open_ended or node.name == "__getattr__"
+        elif isinstance(node, ast.Assign):
+            names |= set().union(*(stored_names(target) for target in node.targets))
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.For | ast.AsyncFor):
+            names |= stored_names(node.target)
+        elif isinstance(node, ast.With | ast.AsyncWith):
+            names |= set().union(*(stored_names(item.optional_vars) for item in node.items))
+    return names, open_ended
+
+
 def closure(source: Source, entries: Sequence[str]) -> Closure:
     result = Closure()
     pending = list(entries)
@@ -128,7 +188,10 @@ def closure(source: Source, entries: Sequence[str]) -> Closure:
             result.missing.append(f"{file}: the file is not there")
             continue
         result.files.add(file)
-        tree = ast.parse(text, file)
+        tree = parsed(text, file)
+        if tree is None:
+            result.unreadable.append(f"{file}: the file is not valid Python, so its imports cannot be read")
+            continue
         if uses_dynamic_import(tree):
             result.dynamic.add(file)
         for module, names in imported_names(tree, file):
@@ -140,8 +203,16 @@ def closure(source: Source, entries: Sequence[str]) -> Closure:
                 targets = module_files(source, module) if module else []
                 if not targets and module:
                     result.missing.append(f"{file}: {module} has no file")
+                exports = exported_names(source, module) if targets else None
                 for name in names:
-                    targets += module_files(source, f"{module}.{name}" if module else name)
+                    sub = module_files(source, f"{module}.{name}" if module else name)
+                    targets += sub
+                    if name == "*" or sub:
+                        continue
+                    if module == "":
+                        result.missing.append(f"{file}: {name} has no file")
+                    elif exports is not None and name not in exports[0] and not exports[1]:
+                        result.missing.append(f"{file}: {module} has no name {name} and no submodule of that name")
                 pending += targets
             elif top not in sys.stdlib_module_names:
                 result.third_party[top].add(file)

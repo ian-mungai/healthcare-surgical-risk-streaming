@@ -139,9 +139,9 @@ class RepositoryCase(TemporaryRepository):
 
 
 class RefusalTest(RepositoryCase):
-    def test_an_ignored_runner_under_tests_e2e_is_read_and_its_path_is_printed_only_after_every_check_passed(self) -> None:
+    def test_an_ignored_runner_under_tests_e2e_is_read_and_the_read_itself_prints_no_path(self) -> None:
         self.assertEqual(RUNNER_TEXT, self.read(FIRST))
-        self.assertEqual(f"checked {FIRST}\n", self.shown.getvalue())
+        self.assertEqual("", self.shown.getvalue(), "the path is printed by the placement, after the imports passed too")
 
     def test_a_path_that_is_not_one_python_file_directly_under_tests_e2e_is_refused_and_is_never_printed(self) -> None:
         for relative in (
@@ -270,6 +270,49 @@ class CredentialScanTest(RepositoryCase):
             self.read(FIRST)
         self.assertEqual("", self.shown.getvalue())
 
+    def test_the_real_scanner_still_finds_the_credential_when_configuration_comes_from_the_environment_the_folder_or_the_file_itself(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="scanner_cwd_")))
+        quiet = 'title = "quiet"\n[allowlist]\nregexes = [".*"]\n'
+        (scratch / "quiet.toml").write_text(quiet)
+        (scratch / ".gitleaks.toml").write_text(quiet)
+        self.write("keyed", f"TOKEN = '{token()}'\n")
+        marked = self.write("marked", f"TOKEN = '{token()}'  # gitleaks:allow\n")
+        self.assertTrue(marked.is_file())
+        previous = Path.cwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(scratch)
+        for name, variables in (
+            ("config path", {"GITLEAKS_CONFIG": str(scratch / "quiet.toml")}),
+            ("config text", {"GITLEAKS_CONFIG_TOML": quiet}),
+            ("config in the working folder", {}),
+        ):
+            with (
+                self.subTest(case=name),
+                mock.patch.dict(os.environ, variables),
+                self.assertRaisesRegex(HostError, "credential scanner found a possible secret"),
+            ):
+                self.read("tests/e2e/keyed.py")
+        with self.subTest(case="allow comment"), self.assertRaisesRegex(HostError, "credential scanner found a possible secret"):
+            self.read("tests/e2e/marked.py")
+
+    def test_a_scanner_that_cannot_be_started_is_refused_with_the_fixed_text_and_the_path_is_not_shown(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="scanner_")))
+        closed = scratch / "closed_scanner"
+        closed.write_text("#!/bin/sh\nexit 0\n")
+        closed.chmod(0o600)
+        garbage = scratch / "garbage_scanner"
+        garbage.write_bytes(b"\x00\x01 not a program\n")
+        garbage.chmod(0o700)
+        for scanner in (closed, garbage):
+            with (
+                self.subTest(scanner=scanner.name),
+                mock.patch.object(runner_place, "GITLEAKS", scanner),
+                self.assertRaisesRegex(HostError, "the credential scanner cannot be started") as caught,
+            ):
+                self.read(FIRST)
+            self.assertNotIn(str(scratch), str(caught.exception))
+        self.assertEqual("", self.shown.getvalue())
+
     def test_the_deadline_that_the_refusal_names_is_the_deadline_of_the_scan(self) -> None:
         self.assertEqual(60, runner_place.SCAN_SECONDS)
 
@@ -329,6 +372,35 @@ class ImportCheckTest(RepositoryCase):
         self.assertIn("loads a module at run time", self.refused(["tests/e2e/loads.py"]))
         with mock.patch.dict(runner_imports.LOADED_BY_PATH, {"tests/e2e/loads.py": ("tests/e2e/helper.py",)}):
             self.place(Host(), ["tests/e2e/loads.py"])
+
+    def test_a_rejected_import_prints_no_checked_path_and_a_placement_that_passes_prints_each_path_after_every_check(self) -> None:
+        self.write("takes_boto", "import boto3\n")
+        shown = self.refused([FIRST, "tests/e2e/takes_boto.py"])
+        self.assertNotIn("checked", shown)
+        self.shown.truncate(0)
+        self.shown.seek(0)
+        self.place(Host(), [FIRST, SECOND])
+        self.assertEqual(f"checked {FIRST}\nchecked {SECOND}\n", self.shown.getvalue())
+
+    def test_a_runner_or_a_module_that_is_not_valid_python_is_refused_with_fixed_text_and_the_line_is_never_shown(self) -> None:
+        self.write("broken", "def (:\n    private_value = 1\n")
+        (self.repo / "tests" / "e2e" / "helper.py").write_text("class :\n")
+        self.git("add", "tests/e2e/helper.py")
+        self.git("commit", "--quiet", "-m", "chore: broken helper")
+        self.commit = self.git("rev-parse", "HEAD").stdout.strip()
+        self.write("takes_helper", "from . import helper\n")
+        for name in ("broken", "takes_helper"):
+            with self.subTest(name=name):
+                host = Host()
+                with self.assertRaisesRegex(HostError, "the runner checkout would not hold") as caught:
+                    self.place(host, [f"tests/e2e/{name}.py"])
+                self.assertEqual([], host.calls)
+                shown = self.shown.getvalue()
+                self.assertIn("the file is not valid Python, so its imports cannot be read", shown)
+                self.assertNotIn("private_value", shown + str(caught.exception))
+                self.assertNotIn("checked", shown)
+                self.shown.truncate(0)
+                self.shown.seek(0)
 
     def test_a_commit_that_does_not_name_its_lock_files_or_does_not_hold_one_is_refused(self) -> None:
         for name, text in (("ansible/group_vars/all.yml", "other: 1\n"), ("ansible/group_vars/all.yml", "runner_checkout_requirements: ['../x']\n")):
@@ -513,6 +585,9 @@ class PlacedRecordTest(RepositoryCase):
         variables = group_variables()
         self.assertTrue(str(variables["runner_checkout_manifest"]).endswith(f"/{runner_place.MANIFEST_NAME}"))
         self.assertTrue(str(variables["runner_checkout_placed_runners"]).endswith(f"/{runner_place.PLACED_RECORD}"))
+        expected = variables["runner_checkout_expected"]
+        self.assertIsInstance(expected, dict)
+        self.assertEqual(sorted(expected), sorted(runner_place.MARKER_FIELDS), "the guard reads exactly the fields that the role writes in the marker")
 
 
 class RecordTest(unittest.TestCase):
@@ -555,8 +630,18 @@ class RemoteCommandTest(unittest.TestCase):
     def build(self) -> None:
         """A finished folder of the commit with its marker, and a folder outside it that nothing may write to."""
         (self.folder / "tests" / "e2e").mkdir(parents=True)
-        self.marker.write_text(json.dumps({"commit": self.COMMIT, "python": "3.14.10"}, sort_keys=True))
+        self.marker.write_text(self.marker_text())
         self.outside.mkdir()
+
+    def marker_text(self, **changes: object) -> str:
+        """The marker as the role writes it (``runner_checkout_marker_text``): sorted JSON with one line end."""
+        fields: dict[str, object] = {
+            "commit": self.COMMIT,
+            "python": "3.14.10",
+            "python_archive_sha256": "a" * 64,
+            "requirements": ["requirements.txt"],
+        }
+        return json.dumps(fields | changes, sort_keys=True) + "\n"
 
     def reset(self) -> None:
         for path in (self.directory, self.base / "moved", self.outside):
@@ -648,12 +733,12 @@ class RemoteCommandTest(unittest.TestCase):
 
     def test_a_missing_marker_a_marker_of_another_commit_and_a_marker_that_is_a_link_stop_the_command(self) -> None:
         def make_link() -> None:
-            (self.outside / "marker").write_text(json.dumps({"commit": self.COMMIT}))
+            (self.outside / "marker").write_text(self.marker_text())
             self.marker.unlink()
             self.marker.symlink_to(self.outside / "marker")
 
         def other_commit() -> None:
-            self.marker.write_text(json.dumps({"commit": "d" * 40}))
+            self.marker.write_text(self.marker_text(commit="d" * 40))
 
         cases = {"missing": self.marker.unlink, "another commit": other_commit, "a link": make_link}
         for name, make in cases.items():
@@ -664,6 +749,31 @@ class RemoteCommandTest(unittest.TestCase):
                 self.assertEqual(runner_place.NO_FOLDER_CODE, result.returncode)
                 self.assertEqual(runner_place.NO_FOLDER_WORD, result.stdout.strip())
                 self.assertFalse((self.folder / FIRST).exists())
+
+    def test_a_marker_that_is_not_the_roles_json_with_exactly_this_commit_stops_the_command_even_when_the_text_holds_the_commit(self) -> None:
+        commit_field = f'"commit": "{self.COMMIT}"'
+        texts = {
+            "the commit text in other text": f"not json {commit_field} not json\n",
+            "the commit text in a comment line": f"# {commit_field}\n",
+            "the commit only": '{"commit": "' + self.COMMIT + '"}\n',
+            "an extra field": self.marker_text(extra=1)[:-2] + "}\n",
+            "a commit that has more text": self.marker_text(commit=self.COMMIT + " "),
+            "a commit in a list": self.marker_text(commit=[self.COMMIT]),
+            "a repeated commit field": '{"commit": "' + "d" * 40 + '", ' + self.marker_text()[1:],
+            "a document that is no object": json.dumps([self.COMMIT]) + "\n",
+            "an archive digest that is no digest": self.marker_text(python_archive_sha256="x"),
+            "requirements that are no list": self.marker_text(requirements="requirements.txt"),
+            "an empty file": "",
+        }
+        for name, text in texts.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.marker.write_text(text)
+                result = self.send()
+                self.assertEqual((runner_place.NO_FOLDER_CODE, runner_place.NO_FOLDER_WORD), (result.returncode, result.stdout.strip()))
+                self.assertFalse((self.folder / FIRST).exists())
+        self.reset()
+        self.assertEqual(0, self.send().returncode, "the marker as the role writes it is accepted")
 
     def test_the_destination_folder_is_made_when_it_is_missing_and_a_file_in_its_place_stops_the_command(self) -> None:
         (self.folder / "tests" / "e2e").rmdir()
@@ -719,33 +829,54 @@ class MakeTargetTest(unittest.TestCase):
         recipe = [line for line in target.splitlines() if "-m scripts.infra" in line]
         self.assertEqual(1, len(recipe))
         self.assertNotIn("RUNNERS", recipe[0], "the names are never put on a shell line")
-        self.assertRegex(makefile, r"(?m)^export RUNNERS$")
+        self.assertRegex(makefile, rf"(?m)^export {runner_place.NAMES_VARIABLE}$")
+        self.assertRegex(makefile, rf"(?m)^{runner_place.NAMES_VARIABLE} := \$\(value RUNNERS\)$")
+        self.assertNotRegex(makefile, r"(?m)^export RUNNERS$", "RUNNERS is never exported expanded")
 
-    def test_a_name_with_a_glob_a_substitution_or_a_quote_reaches_the_program_unchanged(self) -> None:
-        names = "tests/e2e/a.py *.py $HOME `id` \"q\" 'x' ; touch pwned"
+    def make_names(self, names: str, *more: str) -> tuple[int, str, str]:
+        """Run the real ``make`` target with ``printenv`` in place of the program: what it prints is the value that the program would read."""
         with tempfile.TemporaryDirectory(prefix="make_names_") as scratch:
             result = run_command(
                 "make",
-                ["-C", str(ROOT), "-s", "host-runners-place", "PYTHON=printenv RUNNERS #", f"RUNNERS={names.replace('$', '$$')}"],
+                ["-C", str(ROOT), "-s", "host-runners-place", f"PYTHON=printenv {runner_place.NAMES_VARIABLE} #", f"RUNNERS={names}", *more],
                 cwd=Path(scratch),
                 timeout=30,
             )
             self.assertEqual([], list(Path(scratch).iterdir()))
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual(names, result.stdout.rstrip("\n").split("\n")[-1])
+        return result.returncode, result.stdout, result.stderr
+
+    def test_a_name_with_a_glob_a_variable_a_substitution_or_a_quote_reaches_the_program_exactly_as_it_was_typed(self) -> None:
+        for names in (
+            "tests/e2e/a.py *.py $HOME `id` \"q\" 'x' ; touch pwned",
+            "tests/e2e/$(VAR).py",
+            "tests/e2e/${VAR}.py $(shell echo expanded) $$ $$$$ %% #",
+            "tests/e2e/a.py\\ tests/e2e/b.py",
+        ):
+            with self.subTest(names=names):
+                code, out, err = self.make_names(names, "VAR=other")
+                self.assertEqual(0, code, err)
+                self.assertEqual(names, out.rstrip("\n").split("\n")[-1])
         self.assertFalse((ROOT / "pwned").exists())
+
+    def test_no_name_stops_the_target_and_a_name_that_is_a_variable_alone_is_still_a_name(self) -> None:
+        code, _, err = self.make_names("")
+        self.assertNotEqual(0, code)
+        self.assertIn("name the runner files", err)
+        code, out, _ = self.make_names("$(VAR)", "VAR=")
+        self.assertEqual((0, "$(VAR)"), (code, out.strip()), "the name is not empty: Make does not expand it")
 
     def test_the_names_are_split_on_white_space_in_python_and_every_name_must_pass_the_path_form(self) -> None:
         arguments = argparse.Namespace(names_from_environment=True, runners=[])
-        names = runner_place.runner_names(arguments, {"RUNNERS": "tests/e2e/a.py  tests/e2e/*.py\t$(x)\n"})
+        variable = runner_place.NAMES_VARIABLE
+        names = runner_place.runner_names(arguments, {variable: "tests/e2e/a.py  tests/e2e/*.py\t$(x)\n"})
         self.assertEqual(["tests/e2e/a.py", "tests/e2e/*.py", "$(x)"], names)
         self.assertEqual([], runner_place.runner_names(arguments, {}))
         for name in names[1:]:
             with self.subTest(name=name), self.assertRaisesRegex(HostError, "not one Python runner"):
                 runner_place.runner_text(name, "a" * 40)
         with self.assertRaisesRegex(HostError, "not both"):
-            runner_place.runner_names(argparse.Namespace(names_from_environment=True, runners=["x"]), {"RUNNERS": "y"})
-        self.assertEqual(["x"], runner_place.runner_names(argparse.Namespace(names_from_environment=False, runners=["x"]), {"RUNNERS": "y"}))
+            runner_place.runner_names(argparse.Namespace(names_from_environment=True, runners=["x"]), {variable: "y"})
+        self.assertEqual(["x"], runner_place.runner_names(argparse.Namespace(names_from_environment=False, runners=["x"]), {variable: "y"}))
 
 
 if __name__ == "__main__":
