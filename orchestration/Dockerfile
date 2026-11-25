@@ -2,7 +2,19 @@
 # Four more named build contexts hold what the code location needs: `stack_scripts` is the repository's scripts folder, `stack_compose` is its compose folder,
 # `stack_spark` is its spark folder and `stack_fixtures` is the folder of the tracked VitalDB pin. Build with: docker build --build-context stack_scripts=<scripts>
 # --build-context stack_compose=<compose> --build-context stack_spark=<spark> --build-context stack_fixtures=<tests/fixtures/vitaldb> orchestration
-FROM python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+# The Compose plugin, built from the source of the release with fixed Go modules: the plugin that Docker publishes (docker/compose-bin v5.8.0, the newest release on
+# Nov 25 2026) links modules with published fixes. The Go image compiles for linux/amd64 on the builder's own platform. The source archive is checked against its
+# SHA-256, and each module that go get raises is checked against Go's checksum database. Drop this stage when a Compose release holds these versions.
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.24@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS compose_build
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local
+ADD --checksum=sha256:1836019594ad054f8459cea7efc1d52eae7d05c64217c4efffe02d0d2930c44b https://github.com/docker/compose/archive/refs/tags/v5.8.0.tar.gz /tmp/compose.tar.gz
+WORKDIR /src
+RUN tar -xzf /tmp/compose.tar.gz --strip-components=1 \
+    && go get golang.org/x/net@v0.62.0 golang.org/x/crypto@v0.59.0 github.com/klauspost/compress@v1.20.2 \
+        go.opentelemetry.io/otel@v1.47.0 go.opentelemetry.io/otel/sdk@v1.47.0 go.opentelemetry.io/otel/trace@v1.47.0 \
+    && go build -trimpath -ldflags "-w -X github.com/docker/compose/v5/internal.Version=v5.8.0" -o /out/docker-compose ./cmd
+
+FROM python:3.14.10-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -12,17 +24,21 @@ ENV PYTHONUNBUFFERED=1 \
     DAGSTER_HOME=/opt/dagster/instance \
     STACK_COMPOSE_DIRECTORY=/opt/dagster/stack/compose
 
+# Debian's security and point-release updates that the base image does not hold yet.
+RUN apt-get update && apt-get upgrade --yes --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin dagster \
     && mkdir -p /opt/dagster/app /opt/dagster/instance/storage /opt/dagster/data /opt/dagster/runs /opt/dagster/staging \
     && chown -R dagster:dagster /opt/dagster
 
 COPY requirements.txt /opt/dagster/requirements.txt
-RUN pip install --require-hashes --only-binary :all: --no-deps --requirement /opt/dagster/requirements.txt
+# No container runs pip, and the packages that it bundles carry findings: pip goes after the install, with the wheel that would install it again.
+RUN pip install --require-hashes --only-binary :all: --no-deps --requirement /opt/dagster/requirements.txt \
+    && python -m pip uninstall --yes pip && rm /usr/local/lib/python3.14/ensurepip/_bundled/pip-*.whl
 
-# The Docker command line and its Compose plugin, pinned by version and by the digest of the official image that holds them.
+# The Docker command line, pinned by version and by the digest of the official image that holds it, and the Compose plugin that the first stage built.
 COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d /usr/local/bin/docker /usr/local/bin/docker
-COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d \
-    /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+COPY --from=compose_build /out/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 # The AWS command line, which the S3 store of the record load runs as the program aws: the bundle of the official image, pinned by version and by the digest of its
 # multi-platform index (linux/amd64 manifest sha256:7a878f76b10d19718cc25851a92a8eef6e0d5105569071e51b0480694776a8c9), linked into the path.

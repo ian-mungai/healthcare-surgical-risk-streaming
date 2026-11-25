@@ -49,7 +49,7 @@ make check-ansible    # check the Ansible playbook syntax
 
 Each end-to-end run writes `record.json`, `log.txt` and `retention.json` in a new folder under `runs/`, which Git ignores. Hosted CI keeps the record and retention label of each guard shard and of the deadline case as an artifact for 30 days.
 
-`make images-push` builds each project image from the tracked files of HEAD, pushes it when `compose/image_pins.yml` lacks its tag and pins the digest that the push reports. The pin file is the authority and the command never reads the registry. A push that succeeded but whose pin was not saved is pushed again on the next run and may overwrite that unpinned tag. Nothing pins it, so no host pulls it. The host pulls only the pinned digests.
+`make images-push` builds each project image from the tracked files of HEAD, pushes it when `compose/image_pins.yml` lacks its tag and pins the digest that the push reports. The pin file is the authority and the command never reads the registry. A push that succeeded but whose pin was not saved is pushed again on the next run and may overwrite that unpinned tag. Nothing pins it, so no host pulls it. The host pulls only the pinned digests. Before the first push, the command scans every image that it built with Docker Scout, which uses the same Docker sign-in. A fixable finding in any of them pushes nothing, unless `image_scan/accepted_findings.yml` names its ID and package version with the reason that no release fixes it and the date. A failed scan or an incomplete report pushes nothing either. An image that is already pinned is not scanned again.
 
 Each host command runs under the project's AWS profile named in `.env`.
 

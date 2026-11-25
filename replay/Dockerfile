@@ -2,7 +2,7 @@
 # Build context: the repository root, with replay/Dockerfile.dockerignore: `docker build --file replay/Dockerfile .`
 # The image holds the checksum check's gate from scripts/ingestion, which the replay calls before it reads a case file, the modules the gate imports, the shared case-file package and
 # the tracked release pin that the gate reads through ROOT, at the same paths below /opt/replay/app as in the repository.
-FROM python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+FROM python:3.14.10-slim-trixie@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -10,12 +10,17 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/opt/replay/app
 
+# Debian's security and point-release updates that the base image does not hold yet.
+RUN apt-get update && apt-get upgrade --yes --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --uid 10003 --user-group --no-create-home --shell /usr/sbin/nologin replay \
     && mkdir -p /opt/replay/app /opt/replay/state /opt/replay/run \
     && chown -R replay:replay /opt/replay
 
 COPY replay/requirements.txt /opt/replay/requirements.txt
-RUN pip install --require-hashes --only-binary :all: --no-deps --requirement /opt/replay/requirements.txt
+# No container runs pip, and the packages that it bundles carry findings: pip goes after the install, with the wheel that would install it again.
+RUN pip install --require-hashes --only-binary :all: --no-deps --requirement /opt/replay/requirements.txt \
+    && python -m pip uninstall --yes pip && rm /usr/local/lib/python3.14/ensurepip/_bundled/pip-*.whl
 
 COPY features/__init__.py features/sampling.py /opt/replay/app/features/
 COPY casefile /opt/replay/app/casefile
