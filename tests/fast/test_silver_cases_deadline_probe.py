@@ -127,7 +127,7 @@ class StackFlag(unittest.TestCase):
     error of ``docker compose run`` is never read."""
 
     def job(
-        self, flag_text: str | bytes | None, *, extra: dict[str, str] | None = None, error: str = "", flag_folder: bool = True
+        self, flag_text: str | bytes | None, *, extra: dict[str, str] | None = None, error: str = "", flag_folder: bool = True, code: int = 124
     ) -> tuple[tuple[int, dict[str, Any], Any, float], list[str], list[list[str]], list[str]]:
         module = runner("silver_cases")
         folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="stack_flag_")))
@@ -147,7 +147,7 @@ class StackFlag(unittest.TestCase):
                     target.write_text(flag_text)
                 for name, text in (extra or {}).items():
                     (target.parent / name).write_text(text)
-            return 124, "", error
+            return code, "", error
 
         stack.run = run
         stack.watch = lambda done, stalled: None
@@ -233,6 +233,23 @@ class StackFlag(unittest.TestCase):
         answer = stack.job(["-c", "pass"], None, None, {}, 300, SEALED)
         self.assertEqual((124, {}, ""), answer[:3])
         self.assertFalse([word for word in commands[0] if word.endswith(":/probe")])
+
+    def test_a_probe_that_exits_1_or_0_with_a_valid_flag_and_no_result_file_gives_the_flag_so_the_case_can_record_the_failure(self) -> None:
+        """The probe program ends with the child's exit code, and 1 when the child outlasted its limit. The job under test wrote no result file in that case."""
+        for code, flag in ((1, {"stderr_is_stop_line": False, "exit": 1}), (0, {"stderr_is_stop_line": True, "exit": 0})):
+            with self.subTest(f"exit {code}"):
+                answer, _, commands, _ = self.job(json.dumps(flag), code=code)
+                self.assertEqual((code, {}, flag), answer[:3])
+                self.assertEqual(1, len(commands))
+
+    def test_a_probe_that_exits_1_with_no_flag_file_gives_no_flag_and_does_not_stop_the_run(self) -> None:
+        answer, _, _, _ = self.job(None, code=1)
+        self.assertEqual((1, {}, None), answer[:3])
+
+    def test_a_job_with_no_flag_folder_that_exits_1_and_leaves_no_result_file_still_fails_the_run(self) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            self.job(None, code=1, flag_folder=False)
+        self.assertIn("the job left no result file", str(caught.exception))
 
     def test_a_flag_that_is_refused_is_not_retried_and_does_not_fail_the_run(self) -> None:
         answer, _, commands, _ = self.job("not json")

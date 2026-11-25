@@ -19,12 +19,15 @@ Failure modes covered here:
   no prefix, a Python exception-group traceback and a stop line of another job beside the stop line all passed a check on the job's prefix and tracebacks.
 - A text of the child's standard error left the container (on the program's own streams or in the flag).
 - The program ended with no flag file, with a flag that was not the closed document, or with an exit code other than the child's, and the runner could not tell.
+- The program started the child with ``subprocess.run`` and let it inherit the program's standard input. It starts the child through the project's launcher
+  (``scripts.process.run_command``, which the image holds), with standard input closed, and keeps every line ending of the stream (a carriage return stays).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import textwrap
@@ -40,17 +43,21 @@ ENVIRONMENT = {"WAREHOUSE_LOCATION": "file:///warehouse/", "AWS_PROFILE": "no-su
 LIMIT_SECONDS = 30
 
 
-def on_host(program: str, folder: Path, environment: dict[str, str], seconds: float, *, cwd: Path = ROOT) -> CompletedProcess[str]:
+def on_host(
+    program: str, folder: Path, environment: dict[str, str], seconds: float, *, cwd: Path = ROOT, input_text: str | None = None
+) -> CompletedProcess[str]:
     """The program of the probe, run as ``python -c`` from ``cwd`` (the repository root) with the job's result file in ``folder`` and its flag file in
     ``folder / "probe"`` (the container mounts ``/result`` and ``/probe``)."""
     (folder / "probe").mkdir(exist_ok=True)
     program = program.replace("/result/result.json", str(folder / "result.json")).replace("/probe/result.json", str(folder / "probe" / "result.json"))
     env = {"PATH": os.environ.get("PATH", ""), **ENVIRONMENT, **environment}
-    return run_command(sys.executable, ["-c", program], timeout=seconds, cwd=cwd, env=env)
+    return run_command(sys.executable, ["-c", program], timeout=seconds, cwd=cwd, env=env, input_text=input_text)
 
 
 PLANTED_JOB = """
 import os, sys, time
+if os.environ.get("PLANT_STDIN"):
+    os.environ["PLANT_STDERR"] = "silver_cases: timeout\\n" if sys.stdin.read() == "" else "silver_cases: stdin was open\\n"
 sys.stderr.buffer.write(os.environ["PLANT_STDERR"].encode())
 sys.stderr.flush()
 time.sleep(float(os.environ.get("PLANT_SLEEP", "0")))
@@ -68,7 +75,11 @@ EXCEPTION_GROUP = (
 
 
 def planted_tree(folder: Path) -> Path:
-    """A folder with a ``spark.jobs.silver_cases`` module that writes what the environment says (``PLANT_STDERR``) and exits with ``PLANT_EXIT``."""
+    """A folder with a ``spark.jobs.silver_cases`` module that writes what the environment says (``PLANT_STDERR``) and exits with ``PLANT_EXIT``, and with the
+    launcher that the image holds at the same path (``scripts/process.py``), as the program imports it."""
+    (folder / "scripts").mkdir(parents=True, exist_ok=True)
+    for name in ("__init__.py", "process.py"):
+        shutil.copy(ROOT / "scripts" / name, folder / "scripts" / name)
     for package in ("spark", "spark/jobs"):
         (folder / package).mkdir(parents=True, exist_ok=True)
         (folder / package / "__init__.py").write_text("")
@@ -108,12 +119,20 @@ class StalledCatalog(unittest.TestCase):
 class PlantedJobs(unittest.TestCase):
     """The program on jobs that write what the test says: only the exact stop line, and nothing else, is flagged."""
 
-    def run_planted(self, stderr: str, code: int, *, sleep: float = 0, limit: str | None = None) -> tuple[CompletedProcess[str], dict[str, object] | None]:
+    def run_planted(
+        self, stderr: str, code: int, *, sleep: float = 0, limit: str | None = None, stdin_text: str | None = None
+    ) -> tuple[CompletedProcess[str], dict[str, object] | None]:
         module = runner("silver_cases")
         folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="planted_job_")))
         tree = planted_tree(folder / "tree")
-        environment = {"PLANT_STDERR": stderr, "PLANT_EXIT": str(code), "PLANT_SLEEP": str(sleep), **({"PROBE_SECONDS": limit} if limit else {})}
-        done = on_host(module.STALL, folder, environment, LIMIT_SECONDS, cwd=tree)
+        environment = {
+            "PLANT_STDERR": stderr,
+            "PLANT_EXIT": str(code),
+            "PLANT_SLEEP": str(sleep),
+            **({"PLANT_STDIN": "1"} if stdin_text is not None else {}),
+            **({"PROBE_SECONDS": limit} if limit else {}),
+        }
+        done = on_host(module.STALL, folder, environment, LIMIT_SECONDS, cwd=tree, input_text=stdin_text)
         flag = folder / "probe" / "result.json"
         return done, (json.loads(flag.read_text()) if flag.exists() else None)
 
@@ -145,6 +164,18 @@ class PlantedJobs(unittest.TestCase):
                 done, flag = self.run_planted(stderr, 124)
                 self.assertEqual({"stderr_is_stop_line": False, "exit": 124}, flag)
                 self.assertEqual(124, done.returncode)
+
+    def test_the_child_gets_a_closed_standard_input_whatever_the_program_was_given(self) -> None:
+        """The program's own standard input here is a pipe that holds text. A child that inherited it would read that text, and flag false."""
+        done, flag = self.run_planted(STOP, 124, stdin_text="text on the program's standard input")
+        self.assertEqual({"stderr_is_stop_line": True, "exit": 124}, flag)
+        self.assertEqual(124, done.returncode)
+
+    def test_the_program_starts_the_child_with_the_projects_launcher_and_not_with_subprocess(self) -> None:
+        module = runner("silver_cases")
+        self.assertIn("from scripts.process import TimeoutExpired, run_command", module.STALL)
+        self.assertIn("keep_newlines=True", module.STALL)
+        self.assertNotIn("subprocess", module.STALL)
 
     def test_the_exit_code_is_the_childs_and_the_program_ends_with_it(self) -> None:
         for code in (0, 1, 2, 124):
