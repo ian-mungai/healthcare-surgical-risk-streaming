@@ -1,7 +1,7 @@
 # The image of every Spark job: Python 3.14, Java 21, Spark 4.1.4 on Scala 2.13, Iceberg's Spark runtime (it holds the native Nessie catalog) and
 # Iceberg's AWS bundle (the S3 file system), Spark's Kafka source and sink with the Kafka client, and the Python packages of the Bronze decoder and the streaming job
 # (spark/requirements.txt, with hashes, wheels only). Every download is checked against its SHA-256 at build, and a job fetches nothing when it starts.
-# Build: docker build --platform linux/amd64 --file spark/Dockerfile --tag surgical-risk-spark:4.1.4 .
+# Build and push: make images-push (scripts/images/publish.py stages the folder from HEAD, builds this file for linux/amd64 and pins the pushed digest).
 # SPARK_MIRROR names another host for the same Spark file. The checksum still decides whether the build accepts it.
 ARG PYTHON_IMAGE=python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 ARG JRE_IMAGE=eclipse-temurin:21.0.13_9-jre-noble@sha256:b4f9d2a0bc273417cf5219b7b832bbf0493ed500b7b57d5001d9f83374659060
