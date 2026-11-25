@@ -1,9 +1,11 @@
 """The launcher reads AIStor's licence from this computer's OpenBao and places it on the host, and never prints or logs it.
 
 The owner keeps the licence at ``secret/aistor_licence`` (field ``value``) in the local OpenBao, like every secret that a third party issues. The
-launcher reads it with the owner's token from the Keychain, over plain HTTP on the loopback interface, and sends it to the host on standard input of
-one SSH command. An absent licence (the server's 404) is no error: the deploy skips AIStor with a notice. Any other failure stops the deploy by a
-fixed message. These cases use a marker for the licence and look for it in every argument, environment, output and message.
+launcher reads it with a token of its own from the Keychain (``openbao-aistor-licence-token``, whose OpenBao policy allows ``read`` on that one path and
+nothing else, never the owner's full token), over plain HTTP on the loopback interface, and sends it to the host on standard input of one SSH command. An
+absent licence (the server's 404) and a computer without that Keychain item or without the ``security`` command are no error: the deploy skips AIStor with a
+notice. Any other failure stops the deploy by a fixed message. These cases use a marker for the licence and look for it in every argument, environment,
+output and message.
 """
 
 from __future__ import annotations
@@ -81,6 +83,7 @@ class ReadTest(unittest.TestCase):
     def refused(self) -> str:
         with self.assertRaises(aistor_licence.LicenceError) as caught:
             aistor_licence.read_licence()
+        self.caught = caught.exception
         return str(caught.exception)
 
     def test_the_licence_is_read_from_the_local_openbao_at_its_own_path_with_the_owners_token_in_the_header_only(self) -> None:
@@ -89,14 +92,38 @@ class ReadTest(unittest.TestCase):
         program, arguments = self.keychain[0]
         self.assertEqual("security", program)
         self.assertEqual(["find-generic-password", "-a"], arguments[:2])
-        self.assertEqual(["-s", "openbao-owner-token", "-w"], arguments[3:])
+        self.assertEqual(["-s", "openbao-aistor-licence-token", "-w"], arguments[3:])
         self.assertNotIn(LICENCE, self.output.getvalue())
         self.assertNotIn(SESSION, self.output.getvalue())
 
-    def test_the_path_is_the_one_the_owner_saved_and_the_token_is_the_owners_not_the_agents(self) -> None:
+    def test_the_path_is_the_one_the_owner_saved_and_the_token_is_the_launchers_own_and_neither_the_owners_nor_the_agents(self) -> None:
         self.assertEqual("secret/data/aistor_licence", aistor_licence.LOCAL_PATH)
-        self.assertEqual("openbao-owner-token", aistor_licence.KEYCHAIN_ITEM)
+        self.assertEqual("openbao-aistor-licence-token", aistor_licence.KEYCHAIN_ITEM)
         self.assertNotIn("agent", aistor_licence.KEYCHAIN_ITEM)
+
+    def test_the_launcher_never_asks_the_keychain_for_the_owners_full_token_not_even_when_its_own_item_is_missing(self) -> None:
+        source = (ROOT / "scripts" / "infra" / "aistor_licence.py").read_text()
+        self.assertNotIn("openbao-owner-token", source, "the launcher's code names only the licence token's item")
+        for case in (self.token, CompletedProcess(["security"], 44, "", ""), FileNotFoundError("security")):
+            self.token = case  # type: ignore[assignment]
+            self.keychain.clear()
+            with contextlib.suppress(aistor_licence.LicenceError):
+                aistor_licence.read_licence()
+            self.assertEqual(["openbao-aistor-licence-token"], [arguments[arguments.index("-s") + 1] for _, arguments in self.keychain])
+
+    def test_the_keychain_item_that_is_not_there_or_a_computer_without_the_security_command_is_no_licence_source_and_names_the_owners_setup_step(self) -> None:
+        for case in (CompletedProcess(["security"], 44, "", f"the item {SESSION} could not be found"), FileNotFoundError("security")):
+            with self.subTest(case=str(case)[:30]):
+                self.token = case  # type: ignore[assignment]
+                with self.assertRaises(aistor_licence.NoLicenceSource) as caught:
+                    aistor_licence.read_licence()
+                message = str(caught.exception)
+                self.assertIn("openbao-aistor-licence-token", message)
+                self.assertIn("README.md", message)
+                self.assertIn("aistor-licence-read", message)
+                self.assertNotIn(SESSION, message)
+                self.assertIsInstance(caught.exception, aistor_licence.LicenceError)
+        self.assertEqual([], FakeConnection.requests)
 
     def test_an_absent_licence_is_the_servers_404_and_is_not_an_error(self) -> None:
         FakeConnection.answer = (404, b'{"errors":[]}')
@@ -120,13 +147,12 @@ class ReadTest(unittest.TestCase):
                 self.assertNotIn(SESSION, message)
                 self.assertNotIn(LICENCE, message)
 
-    def test_a_missing_or_unusable_keychain_item_is_a_fixed_message_and_nothing_is_asked_of_the_server(self) -> None:
+    def test_an_unusable_keychain_item_is_a_failure_with_a_fixed_message_and_nothing_is_asked_of_the_server(self) -> None:
         cases = (
-            CompletedProcess(["security"], 44, "", f"the item {SESSION} could not be found"),
+            CompletedProcess(["security"], 36, "", f"the keychain {SESSION} is locked"),
             CompletedProcess(["security"], 0, "", ""),
             CompletedProcess(["security"], 0, "bad token\nwith a break", ""),
             TimeoutExpired(["security"], 30),
-            FileNotFoundError("security"),
         )
         for case in cases:
             with self.subTest(case=str(case)[:30]):
@@ -134,6 +160,7 @@ class ReadTest(unittest.TestCase):
                 message = self.refused()
                 self.assertIn("Keychain", message)
                 self.assertNotIn(SESSION, message)
+                self.assertNotIsInstance(self.caught, aistor_licence.NoLicenceSource)
         self.assertEqual([], FakeConnection.requests)
 
     def test_the_stored_value_must_be_text_of_the_form_of_a_licence_and_is_never_echoed(self) -> None:
@@ -160,6 +187,34 @@ class ReadTest(unittest.TestCase):
         aistor_licence.read_licence()
         self.assertEqual("", self.output.getvalue())
         self.assertNotIn("print(", (ROOT / "scripts" / "infra" / "aistor_licence.py").read_text())
+
+
+class OwnerSetupStepTest(unittest.TestCase):
+    """The README holds the exact commands of the owner's one-time step, and they match what the launcher reads."""
+
+    def readme(self) -> str:
+        return (ROOT / "README.md").read_text()
+
+    def test_the_step_creates_the_one_path_policy_a_periodic_token_with_only_that_policy_and_the_keychain_item_the_launcher_reads(self) -> None:
+        text = self.readme()
+        self.assertIn("bao policy write aistor-licence-read -", text)
+        self.assertIn(f'path "{aistor_licence.LOCAL_PATH}" {{ capabilities = ["read"] }}', text)
+        self.assertRegex(text, r"bao token create -field=token -policy=aistor-licence-read -no-default-policy -period=\d+h")
+        self.assertIn(f'security add-generic-password -a "$USER" -s {aistor_licence.KEYCHAIN_ITEM} -U -w', text)
+        for name in ("aistor-licence-read", aistor_licence.KEYCHAIN_ITEM):
+            self.assertIn(name, aistor_licence.SETUP_MESSAGE)
+
+    def test_the_token_is_never_printed_and_never_an_argument_of_a_command(self) -> None:
+        text = self.readme()
+        step = text[text.index("export BAO_ADDR") : text.index("pbcopy < /dev/null")]
+        self.assertNotRegex(step, r"add-generic-password[^\n]*-w\s+[\"'$A-Za-z0-9]", "the password is typed at security's own prompt")
+        self.assertNotRegex(step, r"BAO_TOKEN=\S", "the administration token is read without an echo")
+        self.assertIn('read -rs "BAO_TOKEN?', step)
+        self.assertNotIn('echo "$', step)
+        self.assertRegex(step, r"bao token create [^\n]*\| pbcopy")
+
+    def test_the_readme_says_that_the_launcher_never_uses_the_owners_full_token(self) -> None:
+        self.assertIn("never with the owner's full token (`openbao-owner-token`)", self.readme())
 
 
 class PlaceTest(unittest.TestCase):
