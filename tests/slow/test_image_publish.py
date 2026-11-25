@@ -1,7 +1,8 @@
 """The publish command builds each image from the tracked files of HEAD, pushes it when the pin file lacks its tag and pins the digest that the push reported.
 
 Docker is a stand-in program that logs its arguments, so no image is built and no registry is reached. The repository is a temporary one. The stand-in knows
-two commands, ``buildx build`` and ``push``. Any other command (a read of the registry) is logged and fails, and the cases prove that none is ever run.
+three commands, ``buildx build``, ``scout cves`` and ``push``. Its scan writes the report that a case planted for the image, or a report with no finding.
+Any other command (a read of the registry) is logged and fails, and the cases prove that none is ever run.
 """
 
 from __future__ import annotations
@@ -44,6 +45,16 @@ if args[:2] == ["buildx", "build"]:
     paths = [args[-1]] + [a.split("=", 2)[2] for a in args if a.startswith("--build-context=")]
     with (here / "contexts.log").open("a") as out:
         out.write(json.dumps({{"paths": {{p: files(p) for p in paths}}, "args": args}}) + "\\n")
+    sys.exit(0)
+if args[:2] == ["scout", "cves"]:
+    image = args[-1].rsplit(":", 1)[1].split("-")[0]
+    if (here / ("scan_fails_" + image)).exists():
+        sys.stderr.write("{CANARY_TEXT} scan failed\\n")
+        sys.exit(int((here / ("scan_fails_" + image)).read_text()))
+    if not (here / ("no_report_" + image)).exists():
+        planted = here / ("report_" + image)
+        clean = {{"version": "2.1.0", "runs": [{{"tool": {{"driver": {{"name": "docker scout"}}}}, "results": []}}]}}
+        Path(args[args.index("--output") + 1]).write_text(planted.read_text() if planted.exists() else json.dumps(clean))
     sys.exit(0)
 if args[:1] == ["push"]:
     tag = args[-1]
@@ -105,6 +116,8 @@ class Case(unittest.TestCase):
             ".gitignore": ".env\nhandoff.md\n",
         }.items():
             self.write(relative, text)
+        self.accepted_file = base / "accepted_findings.yml"
+        self.accepted_file.write_text("findings: []\n")
         self.git("init", "--quiet", "--initial-branch", "main")
         self.git("config", "user.name", "Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
@@ -128,7 +141,14 @@ class Case(unittest.TestCase):
         self.git("commit", "--quiet", "--message", "fix: change")
 
     def settings(self, **more: object) -> Settings:
-        values: dict[str, object] = {"root": self.repo, "docker": str(self.docker), "repository": REPOSITORY, "pin_file": self.pin_file, "images": IMAGES}
+        values: dict[str, object] = {
+            "root": self.repo,
+            "docker": str(self.docker),
+            "repository": REPOSITORY,
+            "pin_file": self.pin_file,
+            "images": IMAGES,
+            "accepted_file": self.accepted_file,
+        }
         return Settings(**{**values, **more})  # type: ignore[arg-type]
 
     def run_publish(self, **more: object) -> list[str]:
@@ -254,8 +274,10 @@ class PushTest(Case):
         found = pins.load(self.pin_file)
         for name in ("app", "tool"):
             self.assertEqual(f"{REPOSITORY}@{digest_of(found[name]['tag'])}", found[name]["digest"])
-        allowed = re.compile(rf"buildx build |{re.escape(PUSH)}")
-        self.assertEqual([], [line for line in self.calls() if not allowed.match(line)], "the registry is never read: only a build and a push run")
+        allowed = re.compile(rf"buildx build |scout cves |{re.escape(PUSH)}")
+        self.assertEqual(
+            [], [line for line in self.calls() if not allowed.match(line)], "the registry is never read: only a build, a scan of the local image and a push run"
+        )
         self.assertEqual(
             [PUSH + found["app"]["tag"], PUSH + found["tool"]["tag"]], self.pushes(), "each push asks for the one linux/amd64 manifest, not an index"
         )
@@ -408,6 +430,82 @@ class PushTest(Case):
         self.assertIn("--platform linux/amd64 --load", [line for line in self.calls() if line.startswith("buildx build")][0])
         self.assertEqual(PUSH, self.pushes()[0][: len(PUSH)])
         self.assertEqual("linux/amd64", publish.PLATFORM)
+
+
+FINDING_PACKAGE = "pkg:maven/io.netty/netty-handler@4.2.7"
+
+
+class ScanGateTest(Case):
+    def plant(self, image: str, cve: str) -> None:
+        text = f"Vulnerability    :{cve}  \nPackage          :{FINDING_PACKAGE}  \nFixed version    :9  \n"
+        run = {"tool": {"driver": {"name": "docker scout"}}, "results": [{"ruleId": cve, "message": {"text": text}}]}
+        (self.bin / f"report_{image}").write_text(json.dumps({"version": "2.1.0", "runs": [run]}))
+
+    def refusal(self) -> PublishError:
+        with self.assertRaises(PublishError) as raised:
+            self.run_publish()
+        return raised.exception
+
+    def assert_nothing_pushed_or_pinned(self) -> None:
+        self.assertEqual([], self.pushes())
+        self.assertEqual("images: {}\n", self.pin_file.read_text())
+
+    def test_every_built_image_is_scanned_before_the_first_push_and_each_scan_is_of_the_local_tag(self) -> None:
+        self.run_publish()
+        found = pins.load(self.pin_file)
+        kinds = [line.split()[0] for line in self.calls()]
+        self.assertEqual(["buildx", "scout", "buildx", "scout", "push", "push"], kinds)
+        scans = [line for line in self.calls() if line.startswith("scout ")]
+        self.assertEqual([f"local://{found[name]['tag']}" for name in ("app", "tool")], [line.split()[-1] for line in scans])
+        self.assertTrue(all(line.startswith("scout cves --platform linux/amd64 --only-fixed --format sarif --output ") for line in scans))
+
+    def test_a_finding_in_the_last_image_stops_the_push_of_every_image_and_each_finding_of_each_image_is_named(self) -> None:
+        for planted in (["tool"], ["app", "tool"]):
+            with self.subTest(images=planted):
+                for image in planted:
+                    self.plant(image, "CVE-2026-1111")
+                error = self.refusal()
+                self.assertEqual(tuple(f"{image}: CVE-2026-1111 {FINDING_PACKAGE}" for image in planted), error.findings)
+                self.assertIn("nothing was pushed", str(error))
+                self.assert_nothing_pushed_or_pinned()
+
+    def test_a_finding_that_the_accepted_list_names_with_that_package_version_passes_and_another_one_does_not(self) -> None:
+        self.plant("tool", "CVE-2026-1111")
+        entry = f'findings:\n  - cve: CVE-2026-1111\n    package: {FINDING_PACKAGE}\n    reason: No release holds the fix.\n    date: "2026-11-25"\n'
+        self.accepted_file.write_text(entry.replace("4.2.7", "4.2.6"))
+        self.refusal()
+        self.assert_nothing_pushed_or_pinned()
+        self.accepted_file.write_text(entry)
+        self.assertEqual(["app: pushed and pinned", "tool: pushed and pinned"], self.run_publish())
+
+    def test_a_scan_that_fails_or_writes_no_report_or_an_incomplete_one_pushes_nothing_and_shows_no_output_of_docker(self) -> None:
+        cases = (
+            ("scan_fails_tool", "3", "tool: the scan failed with the exit status 3"),
+            ("no_report_tool", "", "tool: the scan wrote no readable report"),
+            ("report_tool", '{"version": "2.1.0"}', "tool: the scan report is not one complete SARIF run"),
+        )
+        for marker, content, message in cases:
+            with self.subTest(case=marker):
+                (self.bin / marker).write_text(content)
+                text = str(self.refusal())
+                self.assertIn(message, text)
+                self.assertNotIn(CANARY_TEXT, text)
+                self.assert_nothing_pushed_or_pinned()
+                (self.bin / marker).unlink()
+
+    def test_an_unreadable_accepted_list_stops_the_command_before_any_docker_call(self) -> None:
+        self.accepted_file.write_text("findings:\n")
+        self.refusal()
+        self.assertEqual([], self.calls())
+
+    def test_the_command_prints_each_refused_finding_on_standard_error(self) -> None:
+        self.plant("app", "CVE-2026-1111")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(1, publish.main([], self.settings()))
+        self.assertEqual("", out.getvalue())
+        self.assertIn(f"publish: app: CVE-2026-1111 {FINDING_PACKAGE}\n", err.getvalue())
+        self.assertNotIn(CANARY_TEXT, err.getvalue())
 
 
 class MissingToolTest(Case):

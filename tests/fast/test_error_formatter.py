@@ -93,6 +93,7 @@ LAUNCHER_MARKED = {
 MARKED = {
     "scripts.images.pins.PinError",
     "scripts.images.publish.PublishError",
+    "scripts.images.scan.ScanError",
     "infra.iam.scripts.manage_policies.KeyAdviceError",
     "scripts.stack.tags.RecordNotPublished",
     "spark.streaming.checkpoint.CheckpointFormatError",

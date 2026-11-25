@@ -94,7 +94,7 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "replay/events/event_list.py": (),
     "replay/events/formats.py": (
-        "Format", "schema_of", "schema_text", "subject",
+        "Format", "is_input_topic", "schema_of", "schema_text", "subject",
     ),
     "replay/events/identity.py": (
         "IdentityError", "Occurrence", "check_run_id", "component", "event_id_text", "id", "marker_event_id", "occurrence_for", "partition_of",
@@ -147,6 +147,7 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "replay/service/kafka_io.py": (
         "DeliveryError", "KafkaSink", "KafkaStartError", "__init__", "delivered", "flush", "partition_count", "producer_settings", "read_all", "send",
+        "topic_of",
     ),
     "replay/service/output_guard.py": (
         "inside_by_identity", "inside_by_path", "refuse_inside_store", "same_folder",
@@ -193,6 +194,18 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "scripts/evidence/verify.py": (
         "export_problem", "invalidate_receipt", "main", "sign", "verify_export",
     ),
+    "scripts/images/__init__.py": (),
+    "scripts/images/pins.py": (
+        "PinError", "load", "load_images", "main", "render_environment", "validate", "variable_name", "write",
+    ),
+    "scripts/images/publish.py": (
+        "PublishError", "Settings", "__init__", "build_and_scan", "build_arguments", "build_image", "default_settings", "docker", "git",
+        "git_environment", "image_tag", "main", "pin_path", "prepare_image", "publish", "push_image", "pushed_digest", "refused_findings",
+        "require_clean", "stage",
+    ),
+    "scripts/images/scan.py": (
+        "Finding", "ScanError", "checked", "load_accepted", "read_report", "reported", "scan_arguments", "unaccepted",
+    ),
     "scripts/infra/__init__.py": (),
     "scripts/infra/created.py": (
         "created_entries", "device_entries", "entry", "managed_resources", "merge_created", "module_resources", "run_inventory",
@@ -201,8 +214,9 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "FixedHostError", "HostError", "NoPeerError", "Peer", "ansible_recap", "check_sudo_policy", "deploy_variables", "device_gone", "exported_key",
         "gone", "heavy_memory_variables", "host_check", "host_peer", "host_start", "host_stop", "host_up", "instance_id", "instance_state",
         "keep_host_keys_of", "main", "peer_online", "place_project_key", "planned_heavy_figure", "platform_commit", "record_tailscale_device",
-        "release_tailscale_device", "require_connected", "require_current_inputs", "require_instance", "run_ansible", "saved_plan", "select_peer",
-        "ssh_arguments", "ssh_output", "tailscale_device_id", "tailscale_status", "wait_for", "wait_until_reachable", "workload_variables",
+        "registry_user", "release_tailscale_device", "require_connected", "require_current_inputs", "require_instance", "run_ansible", "saved_plan",
+        "select_peer", "ssh_arguments", "ssh_output", "tailscale_device_id", "tailscale_status", "wait_for", "wait_until_reachable",
+        "workload_variables",
     ),
     "scripts/infra/inventory.py": (
         "main", "write_inventory",
