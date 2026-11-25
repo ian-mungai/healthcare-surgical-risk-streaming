@@ -237,8 +237,8 @@ class StackLines(unittest.TestCase):
                     [SimpleNamespace(returncode=0, stdout="SECRET_4417 4417\n", stderr="")] * 3 + [SimpleNamespace(returncode=5, stdout="", stderr="")] * 9
                 )
                 log: list[str] = []
-                with mock.patch.object(module, "run_command", side_effect=answers):
-                    module.remove_project("proj_x1", log)
+                with tempfile.TemporaryDirectory(prefix="sealed_runner_") as folder, mock.patch.object(module, "run_command", side_effect=answers):
+                    module.remove_project(module.Stack(Path(folder), "proj_x1", Path(folder), SimpleNamespace(commands=[]), log), log)
                 self.assertTrue(log, name)
                 for item in log:
                     self.assertNotIn("4417", str(item))
