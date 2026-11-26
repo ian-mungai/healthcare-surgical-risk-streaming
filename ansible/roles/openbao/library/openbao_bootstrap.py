@@ -549,7 +549,8 @@ def main() -> None:
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
         module.exit_json(**reconcile(params, check_only=module.check_mode))
     except (BootstrapError, SecretFileError) as error:
-        module.fail_json(msg=str(error))
+        # ``refusal`` marks a message that this module worded, so a caller that hides the task may print it and nothing else of a failure.
+        module.fail_json(msg=str(error), refusal=str(error))
 
 
 if __name__ == "__main__":

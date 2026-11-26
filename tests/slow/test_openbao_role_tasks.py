@@ -118,7 +118,7 @@ class BootstrapTaskTest(unittest.TestCase):
         )
         self.tools = self.folder / "tools.txt"
         self.tools.write_text("nessie\n")
-        (self.secrets / "postgres" / "nessie.password").write_text("password of nessie")
+        (self.secrets / "postgres" / "nessie.password").write_text("nessie-database-value-marker")
         # The admin policy as the first start of the tracked configuration writes it.
         policy = HCL.split("write_admin_policy", 1)[1].split("EOT", 2)[1]
         self.server = StandIn({ADMIN_ROLE: Role("admin-login-marker", "admin-token", (), (), ("bootstrap_admin",))})
@@ -157,6 +157,40 @@ class BootstrapTaskTest(unittest.TestCase):
         )
         self.assertNotIn("external", self.server.policies["service_nessie"], "a service that consumes nothing external gets no external path")
         self.assertTrue((self.secrets / "openbao" / "external_intake.secret_id").is_file())
+
+    # The values of this setup that no output may carry. The runner (tests/e2e/stack_openbao.py) reads the actions and the refusals from the same output.
+    SECRETS = ("admin-login-marker", "admin-token", "nessie-database-value-marker")
+
+    def assert_no_secret(self, output: str) -> None:
+        for value in (*self.SECRETS, *(path.read_text().strip() for path in (self.secrets / "openbao").glob("*.secret_id"))):
+            self.assertNotIn(value, output)
+
+    def test_a_visible_task_names_each_action_of_the_hidden_step_and_a_second_run_shows_an_empty_list(self) -> None:
+        first_code, first = self.play()
+        second_code, second = self.play()
+        self.assertEqual((0, 0), (first_code, second_code), first + second)
+        self.assertIn("write policy service_nessie", first)
+        self.assertIn("issue a secret ID for nessie", first)
+        self.assertNotIn('"actions": []', first)
+        self.assertIn('"actions": []', second)
+        self.assert_no_secret(first)
+        self.assert_no_secret(second)
+
+    def test_a_refusal_of_the_hidden_step_stops_the_run_with_its_fixed_text(self) -> None:
+        self.tools.write_text("nessie\nghost_tool\n")
+        code, output = self.play()
+        self.assertNotEqual(0, code, output)
+        self.assertIn("PostgreSQL tool 'ghost_tool' has no entry in the service list", output)
+        self.assert_no_secret(output)
+
+    def test_a_failure_that_the_step_did_not_word_is_not_printed(self) -> None:
+        """A crash of the hidden module can carry any text, a secret too, so only the module's own refusals are shown."""
+        self.tools.unlink()
+        code, output = self.play()
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the OpenBao step failed for a reason that is not printed", output)
+        self.assertNotIn("tools.txt", output)
+        self.assert_no_secret(output)
 
 
 if __name__ == "__main__":

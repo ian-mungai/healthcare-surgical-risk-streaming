@@ -1,6 +1,8 @@
 # Run once OpenBao is healthy. Reads openbao_services_file, openbao_tools_file, openbao_external_secrets_file, openbao_address, openbao_user, secret_files_root_owner,
 # the token lifetimes and openbao_client_service (the service whose role reads the one path of the AIStor project user's sign-in). The task is hidden: it handles
-# secret IDs and passwords.
+# secret IDs and passwords. The two tasks after it print what is safe to print, which an operator and the host check (tests/e2e/stack_openbao.py) read: the actions
+# that it took (an empty list on a run that changed nothing) and the unlisted roles, or the step's own refusal, which names a request by its method, its path and its
+# status and never holds a secret. Any other failure of the hidden task is not printed.
 # Prints no secret.
 - name: Make OpenBao match the service list
   openbao_bootstrap:
@@ -18,7 +20,20 @@
     token_max_ttl_seconds: "{{ openbao_token_max_ttl_seconds | int }}"
   timeout: "{{ (openbao_ready_deadline_seconds | int) + 120 }}"
   register: openbao_reconciled
+  failed_when: false
   no_log: true
+
+- name: Report what the OpenBao step did
+  ansible.builtin.debug:
+    msg:
+      actions: "{{ openbao_reconciled.actions }}"
+      unlisted: "{{ openbao_reconciled.unlisted }}"
+  when: openbao_reconciled.actions is defined
+
+- name: Stop with the OpenBao step's refusal
+  ansible.builtin.fail:
+    msg: "{{ openbao_reconciled.refusal | default('the OpenBao step failed for a reason that is not printed, because the task is hidden') }}"
+  when: openbao_reconciled.actions is not defined
 
 - name: Remember the secret files and their owners
   ansible.builtin.set_fact:

@@ -556,6 +556,17 @@ class OpenBaoStepTest(unittest.TestCase):
             self.assertNotIn(gone, params, "the AIStor step keeps the sign-in, after it has signed in, and not this step")
         self.assertIs(True, task["no_log"])
 
+    def test_the_status_of_the_hidden_step_is_reported_by_tasks_that_are_not_hidden_and_read_only_safe_fields(self) -> None:
+        tasks = tasks_of_openbao("bootstrap.yml")
+        hidden = next(index for index, task in enumerate(tasks) if "openbao_bootstrap" in task)
+        report, stop = tasks[hidden + 1], tasks[hidden + 2]
+        self.assertEqual("ansible.builtin.debug", next(key for key in report if key.startswith("ansible.")))
+        self.assertEqual("ansible.builtin.fail", next(key for key in stop if key.startswith("ansible.")))
+        for task in (report, stop):
+            self.assertNotIn("no_log", task)
+        read = set(re.findall(r"openbao_reconciled\.(\w+)", str(report) + str(stop)))
+        self.assertEqual({"actions", "unlisted", "refusal"}, read)
+
     def test_the_defaults_point_at_the_compose_stack_variables_and_the_service_is_a_listed_one(self) -> None:
         defaults: Any = load_yaml((ROOT / "ansible/roles/openbao/defaults/main.yml").read_text())
         self.assertEqual("{{ compose_stack_aistor_service }}", defaults["openbao_client_service"])
