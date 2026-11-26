@@ -1,10 +1,11 @@
-"""The scan gate of the publisher: Docker Scout's report of an image's fixable findings, held against the committed list of accepted findings.
+"""The scan gate of the publisher: the findings of each image, held against the committed list of accepted findings, and the reader of Docker Scout's report.
 
-The publisher scans each image that it built before it pushes any image. Docker Scout needs a Docker sign-in, which the computer that publishes already has
-for its push. A finding is the vulnerability's ID, the package URL with its version, without qualifiers, and the artifacts that hold the package: the paths
-that the report's locations name, where a library inside a jar is located at the jar. An accepted entry names one image, one artifact, the ID and the package
-URL. A finding passes only when every one of its artifacts has an entry for the scanned image, so an entry never carries over to another image, artifact or
-version of the package.
+The publisher scans each image that it built with two scanners, Docker Scout (this module) and Trivy (``scripts.images.trivy_scan``), before it pushes any
+image, and a finding of either one that the list does not accept pushes nothing. Docker Scout needs a Docker sign-in, which the computer that publishes
+already has for its push. It reports every fixable finding of any severity. A finding is the vulnerability's ID, the package URL with its version, without
+qualifiers, and the artifacts that hold the package: for Docker Scout the paths that the report's locations name, where a library inside a jar is located at
+the jar. An accepted entry names one image, one artifact, the ID and the package URL. A finding passes only when every one of its artifacts has an entry for
+the scanned image, so an entry never carries over to another image, artifact or version of the package. An entry matches a finding of either scanner.
 
 ``image_scan/accepted_findings.yml`` holds the active list, ``findings``, and may hold a list named ``pending`` of entries that wait for the owner's
 decision. The gate never reads ``pending``. The file is outside every image's sources, so a change in it changes no image tag.
@@ -116,10 +117,14 @@ def refused_constant(name: str) -> object:
     raise ScanError("the scan report holds a number that is not standard JSON")
 
 
-def require_success(run: dict[str, Any], exit_status: object) -> None:
-    """The scan completed: its exit status is the number 0, and a run that holds invocations says so in every one of them, of which there is at least one."""
+def require_exit_zero(exit_status: object) -> None:
     if type(exit_status) is not int or exit_status != 0:
         raise ScanError("the scan did not end with the exit status 0")
+
+
+def require_success(run: dict[str, Any], exit_status: object) -> None:
+    """The scan completed: its exit status is the number 0, and a run that holds invocations says so in every one of them, of which there is at least one."""
+    require_exit_zero(exit_status)
     if "invocations" not in run:
         return
     invocations = run["invocations"]

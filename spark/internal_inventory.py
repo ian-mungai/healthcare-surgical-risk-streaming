@@ -200,12 +200,17 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "scripts/images/publish.py": (
         "PublishError", "Settings", "__init__", "build_and_scan", "build_arguments", "build_image", "default_settings", "docker", "git",
-        "git_environment", "image_tag", "main", "pin_path", "prepare_image", "publish", "push_image", "pushed_digest", "refused_findings",
-        "require_clean", "stage",
+        "git_environment", "image_tag", "main", "new_tag", "pin_path", "publish", "push_image", "pushed_digest", "require_clean", "scout_findings",
+        "stage", "trivy_findings",
     ),
     "scripts/images/scan.py": (
         "Accepted", "Finding", "ScanError", "accepted_entry", "checked", "checked_artifact", "load_accepted", "located", "read_report",
-        "refused_constant", "reported", "require_success", "scan_arguments", "shown", "unaccepted", "unique_keys",
+        "refused_constant", "reported", "require_exit_zero", "require_success", "scan_arguments", "shown", "unaccepted", "unique_keys",
+    ),
+    "scripts/images/trivy_scan.py": (
+        "Databases", "absolute", "checked_result", "clean_environment", "download", "downloaded_folder", "fetch_databases", "folder_prefix", "holds",
+        "load_databases", "main", "os_family", "own_files", "package_url", "read_report", "reported", "require_databases", "run_trivy",
+        "scan_arguments", "workspace",
     ),
     "scripts/infra/__init__.py": (),
     "scripts/infra/aistor_licence.py": (

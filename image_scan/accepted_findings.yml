@@ -1,10 +1,11 @@
 # The fixable findings that the publisher's scan gate (scripts/images/publish.py) accepts. The list named findings is the active one, the only one the gate reads.
 # Each entry names the image, the artifact that holds the package (the path that the scan report gives, where a library inside a jar is located at the jar), the
-# vulnerability's ID, the package URL with its version, the reason that no release can fix it in this image and the date. A finding passes only when each of its
-# artifacts has an entry for its image. Add an entry only for such a finding, and remove it when a release holds the fix.
+# vulnerability's ID, the package URL with its version, the reason that no release can fix it in this image and the date. A finding of Docker Scout or of Trivy
+# passes only when each of its artifacts has an entry for its image (scripts/images/trivy_scan.py says how a Trivy finding names its artifact and package).
+# Add an entry only for such a finding, and remove it when a release holds the fix.
 findings: []
 # PENDING the owner's decision: the gate never reads this list, so none of these entries lets a push through. Move an entry to findings only when the owner accepts it.
-# Each date is the day the entry was written, not a day of acceptance. Docker Scout calls each of these fixable because the library has a fixed release; no newer
+# Each date is the day the entry was written, not a day of acceptance. A scanner calls each of these fixable because the library has a fixed release; no newer
 # release of a jar that holds one of these copies has the fix.
 pending:
   - image: spark
@@ -181,6 +182,12 @@ pending:
     package: pkg:maven/com.google.guava/guava@33.4.8-jre
     reason: "Shaded inside hadoop-client-runtime-3.5.0.jar and spark-network-common_2.13-4.1.4.jar. No Hadoop or Spark release holds 33.7.2 (Hadoop 3.5.0 has 33.4.8, Spark 4.3.0 has 33.6.0). The image's own Guava jar is 33.7.2. Fixed version of the library: 33.7.2."
     date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-102554
+    package: pkg:maven/com.google.guava/guava@33.7.1-jre
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1 (Maven Central, read Nov 26 2026). Only Trivy reports this copy; Docker Scout does not. Fixed version of the library: 33.7.2."
+    date: "2026-11-26"
   - image: spark
     artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
     cve: CVE-2026-45205
