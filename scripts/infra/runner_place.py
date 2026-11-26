@@ -13,12 +13,17 @@ The hashes of every runner placed in the folder are also written on the host, in
 host before the record is written, and the record holds only hashes that the host computed. The deploy's source manifest ``runner_manifest.json`` lists
 the files of ``git archive`` only and is never touched here: no command names it and no path of its name passes the path form.
 
-Only one kind of file goes: a Python file directly under ``tests/e2e/`` that Git ignores, that the deployed commit does not hold, that is a plain file with
-one name (no link, no hard link), is text of at most 1 MiB, and that the privacy scan and the pinned credential scanner (gitleaks) both pass over the bytes
-that are sent. The imports of every file, followed through the commit's own files, must be packages that the commit's lock files pin. Nothing else is
-uploaded. The host's folder, and the runner folder above it, must be real folders (no link) and the commit's folder must hold the finished marker of the
-commit; each file is received into a file that ``mktemp`` makes in the destination folder and is then moved over its final name. A new deploy of another
-commit removes the folder and so every placed runner: place them again after it. A second deploy of the same commit keeps them.
+Only these files go: a Python file directly under ``tests/e2e/``, and a Python or ``.yml`` file directly under ``tests/e2e/stream_stack/`` (the probes
+that the streaming run mounts in its containers, and its Compose overlay; only a ``.yml`` name may hold dots), that Git ignores, that the deployed commit
+does not hold, that is a plain file with one name (no link, no hard link), is text of at most 1 MiB, and that the privacy scan and the pinned credential
+scanner (gitleaks) both pass over the bytes that are sent. The imports of every Python file, followed through the commit's own files, must resolve. For a
+file directly under ``tests/e2e/`` every package must be one that the commit's lock files pin. A probe runs in the replay or the Spark image, with its folder
+on the import path: the packages that it reaches through the repository's modules come from the image and are not asked of those lock files (they are the
+host environment's), another probe of the same call resolves by its name, and a package that a probe names itself must still be pinned. A ``.yml`` file is
+not read as Python. Nothing else is uploaded. The host's folder, and the runner folder above it, must be real folders (no link) and the commit's folder must
+hold the finished marker of the commit; every folder from there to the file is made when it is missing and refused when it is a link; each file is received
+into a file that ``mktemp`` makes in the destination folder and is then moved over its final name. A new deploy of another commit removes the folder and so
+every placed runner: place them again after it. A second deploy of the same commit keeps them.
 
 Every wait has a deadline and fails with a message that names what did not happen.
 """
@@ -36,7 +41,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from scripts.infra import host, state_bootstrap
@@ -93,7 +98,11 @@ RECORD_FILE = "runner_files.json"
 GROUP_VARIABLES = "ansible/group_vars/all.yml"
 # The names that the Makefile passes: the raw text of its variable RUNNERS.
 NAMES_VARIABLE = "HOST_RUNNER_NAMES"
-RUNNER_FORM = re.compile(r"tests/e2e/[a-z][a-z0-9_]*\.py")
+# The folder of the streaming run's probes and their Compose overlay. The containers mount it and import its probes by their bare names.
+PROBE_FOLDER = "tests/e2e/stream_stack/"
+# The one form of a path that is sent and recorded, with nothing deeper: a .py file directly under tests/e2e/, or a .py or .yml file directly under
+# PROBE_FOLDER (compose.host.yml has a dot in its name; a dotted .py name could not be imported). The host's reader of placed_runners.json holds the same form.
+RUNNER_FORM = re.compile(r"tests/e2e/(?:[a-z][a-z0-9_]*\.py|stream_stack/(?:[a-z][a-z0-9_]*\.py|[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*\.yml))")
 COMMIT_FORM = re.compile(r"[0-9a-f]{40}")
 DIGEST_FORM = re.compile(r"[0-9a-f]{64}")
 MAX_BYTES = 1024 * 1024
@@ -195,7 +204,10 @@ def runner_text(relative: str, commit: str, root: Path = ROOT, env: Mapping[str,
     it). ``place`` prints "checked <path>" after the imports of every file have passed too."""
     require_commit(commit)
     if RUNNER_FORM.fullmatch(relative) is None:
-        raise FixedHostError("a path is not one Python runner: it must be one lower-case .py file directly under tests/e2e/")
+        raise FixedHostError(
+            "a path is not one runner file: it must be one lower-case .py file directly under tests/e2e/, "
+            "or one lower-case .py or .yml file directly under tests/e2e/stream_stack/"
+        )
     path = root / relative
     try:
         before = path.lstat()
@@ -260,7 +272,12 @@ def lock_files(source: CommitSource) -> list[str]:
 def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env: Mapping[str, str] | None = None) -> None:
     """Refuse a runner whose imports, followed through the commit's own files, take a package that the commit's lock files do not pin. The runners are read
     as sent (the exact text), every other file as the deploy archived it. A module that a runner loads at run time by its path is read through LOADED_BY_PATH,
-    and a file under tests/e2e/ that loads one and is not there is refused, because its imports cannot be read."""
+    and a file under tests/e2e/ that loads one and is not there is refused, because its imports cannot be read.
+
+    The probes (the .py files of PROBE_FOLDER) are followed on their own. Their imports must resolve in the same way, but only the packages that a probe names
+    itself are asked of the lock files: the repository's modules that it imports run with the image's packages. Another probe of this call resolves by its bare
+    name, for the probes only. What a file for the host reaches is checked in full, also when a probe of the same call reaches it too. A .yml file is not
+    Python and has no imports."""
     source = CommitSource(commit, root, env)
     locks = []
     for name in lock_files(source):
@@ -268,22 +285,32 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
         if lock is None:
             raise FixedHostError("the commit does not hold a lock file that the runner checkout installs")
         locks.append(lock)
-    entries = [*texts, *(module for relative in texts for module in LOADED_BY_PATH.get(relative, ()))]
-    found = closure(OverlaySource(source, texts), entries)
+    programs = [relative for relative in texts if relative.endswith(".py")]
+    probes = {relative for relative in programs if relative.startswith(PROBE_FOLDER)}
+    hosted = [relative for relative in programs if relative not in probes]
+    overlay = OverlaySource(source, texts)
+    on_host = closure(overlay, [*hosted, *(module for relative in hosted for module in LOADED_BY_PATH.get(relative, ()))])
+    in_images = closure(overlay, sorted(probes))
+    siblings = {PurePosixPath(relative).stem for relative in probes}
+    taken = {name: set(files) for name, files in on_host.third_party.items()}
+    for name, files in in_images.third_party.items():
+        if name not in siblings and files & probes:
+            taken.setdefault(name, set()).update(files & probes)
+    dynamic = on_host.dynamic | in_images.dynamic
     problems = [
-        *found.missing,
-        *found.unreadable,
+        *dict.fromkeys([*on_host.missing, *in_images.missing]),
+        *dict.fromkeys([*on_host.unreadable, *in_images.unreadable]),
         *(
             f"{name}: loads a module at run time that the import check cannot read"
-            for name in sorted(d for d in found.dynamic if d.startswith("tests/e2e/") and d not in LOADED_BY_PATH)
+            for name in sorted(d for d in dynamic if d.startswith("tests/e2e/") and d not in LOADED_BY_PATH)
         ),
-        *unlocked(found.third_party, locked_distributions(locks)),
+        *unlocked(taken, locked_distributions(locks)),
     ]
     if problems:
         sys.stdout.writelines(f"{line}\n" for line in problems)
         raise FixedHostError(
             "a runner takes a module or a package that the runner checkout would not hold, or a file that is not valid Python (the lines above name each): "
-            "add the package to the lock file and deploy again, or fix the file"
+            "add the package to the lock file and deploy again, name a probe that another probe imports in the same call, or fix the file"
         )
 
 
@@ -306,8 +333,8 @@ def runner_folder_guard(commit: str, directory: str = RUNNER_DIRECTORY) -> str:
 
 def remote_command(commit: str, relative: str, directory: str = RUNNER_DIRECTORY) -> str:
     """The one command that receives a file on its standard input: in the commit's finished folder only, into a file that ``mktemp`` makes in the destination
-    folder with an unpredictable name and an exclusive create, then moved over the final name. A destination folder that is a link, or a final name that is a
-    folder, stops the command."""
+    folder with an unpredictable name and an exclusive create, then moved over the final name. Each folder on the way, from the first to the destination, is
+    made by the SSH user for itself only when it is missing; one that is a link or is no folder, or a final name that is a folder, stops the command."""
     parent, name = relative.rsplit("/", 1)[0], shlex.quote(relative)
     steps = " ".join(
         f"p={shlex.quote('/'.join(relative.split('/')[: number + 1]))}; "
@@ -494,7 +521,9 @@ def runner_names(arguments: argparse.Namespace, environment: Mapping[str, str]) 
 def main() -> int:
     """Place the named runner files and return a non-zero code on a refusal, an expired deadline or a failure."""
     parser = QuietParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("runners", nargs="*", help="each runner file, relative to the repository's root: one .py file directly under tests/e2e/")
+    parser.add_argument(
+        "runners", nargs="*", help="each runner file, relative to the root: a .py file in tests/e2e/, or a .py or .yml file in its stream_stack/"
+    )
     parser.add_argument(
         "--names-from-environment",
         action="store_true",
