@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import math
 import re
 import sys
@@ -150,11 +151,11 @@ def require_free(docker: Docker, timeout: float = READ_SECONDS) -> None:
         raise SlotBusy(f"the one Spark slot is held by the container {SLOT_NAME}, ID {held.id} ({held.state}): one Spark job runs at a time")
 
 
-def clear_owned(docker: Docker, owner: str) -> str | None:
+def clear_owned(docker: Docker, owner: str, seen: list[str] | None = None) -> str | None:
     """Stop and remove the container of this launch, by ID, and read the engine again. Another launch's container is left as it is.
 
     Return ``None`` when no container of this launch is left, else the report of the one that is, or may be, with its ID and state: the slot is not free.
-    The report holds fixed words, the slot's name and the engine's ID and state only.
+    The report holds fixed words, the slot's name and the engine's ID and state only. The ID of a container of this launch that a read finds goes into ``seen``.
     """
     try:
         found = slot_container(docker)
@@ -165,6 +166,8 @@ def clear_owned(docker: Docker, owner: str) -> str | None:
         )
     if found is None or found.owner != owner:
         return None
+    if seen is not None:
+        seen.append(found.id)
     stop = (["container", "stop", "--time", str(STOP_SECONDS), found.id], STOP_SECONDS + READ_SECONDS)
     remove = (["container", "rm", "--force", "--volumes", found.id], READ_SECONDS)
     for words, limit in (stop, remove) if found.state in LIVE_STATES else (remove,):
@@ -187,27 +190,27 @@ def clear_owned(docker: Docker, owner: str) -> str | None:
 
 
 def remove_owned(docker: Docker, owner: str) -> None:
-    """``clear_owned``, or the ``SlotError`` that holds its report."""
-    report = clear_owned(docker, owner)
+    """``settle_owned``, or the ``SlotError`` that holds its report."""
+    report = settle_owned(docker, owner)
     if report is not None:
         raise SlotError(report)
 
 
-def end_owned(docker: Docker, owner: str) -> None:
+def end_owned(docker: Docker, owner: str, seen: list[str] | None = None) -> None:
     """``settle_owned`` for an ending that already has a result or an error: its report goes to standard error and hides neither."""
-    report = settle_owned(docker, owner)
+    report = settle_owned(docker, owner, seen)
     if report is not None:
         sys.stderr.write(f"spark_slot: {report}\n")
 
 
-def settle_owned(docker: Docker, owner: str) -> str | None:
+def settle_owned(docker: Docker, owner: str, seen: list[str] | None = None) -> str | None:
     """``clear_owned`` for the end of a launch. A cleanup that is cut short is run once more, so one interrupt during it skips no removal; the interrupt is
     raised after the report is written. A failure of the cleanup itself is a report and never an exception."""
     interrupt: BaseException | None = None
     report: str | None = f"the cleanup did not finish: the one Spark slot ({SLOT_NAME}) may still be held; check it with docker container ls --all"
     for _ in range(2):
         try:
-            report = clear_owned(docker, owner)
+            report = clear_owned(docker, owner, seen)
             break
         except BaseException as error:
             if not isinstance(error, Exception):
@@ -239,12 +242,17 @@ def run_owned(
     """The one launch and cleanup path of every launcher: run ``start``, and whatever ends it, end the container of this launch.
 
     Return the result and whether the engine refused the create (no job ran). A deadline is raised only when the container is gone, else a ``SlotError``
-    names it. An interrupt or any other failure is raised as it is, after a surviving container is reported.
+    names it. An interrupt or any other failure is raised as it is, after a surviving container is reported. When the owner check of a refusal cannot run (the
+    wait is used up or the read fails), the result is the job's own if the cleanup finds this launch's container, else the check's error is raised.
     """
+    unchecked: SlotError | None = None
     try:
         result = start()
-        if lost_the_name(docker, result, owner, read_seconds):
-            return result, True
+        try:
+            if lost_the_name(docker, result, owner, read_seconds):
+                return result, True
+        except SlotError as error:
+            unchecked = error
     except TimeoutExpired:
         report = settle_owned(docker, owner)
         if report is not None:
@@ -253,7 +261,10 @@ def run_owned(
     except BaseException:
         end_owned(docker, owner)
         raise
-    end_owned(docker, owner)
+    seen: list[str] = []
+    end_owned(docker, owner, seen)
+    if unchecked is not None and not seen:
+        raise unchecked
     return result, False
 
 
@@ -279,8 +290,8 @@ def run_in_slot(
 
     ``build`` returns the ``docker`` arguments of the launch from the slot's options (``slot_options``), which it puts before the service name. ``running``
     reads the live services within the seconds that it is given. A positive wait is a deadline for every read before a start: each read gets the time that is
-    left, none starts at or after the end of the wait, a free reading at or after it admits nothing, and each sleep is cut to the time that is left. With no
-    wait the first reading decides.
+    left, none starts at or after the end of the wait, a free reading at or after it admits nothing, and each sleep is cut to the time that is left. A launch's
+    arguments are built before the last clock check: no launch is dispatched at or after the end of the wait. With no wait the first reading decides.
 
     A refused create is tried again only within the wait that is left. A job whose container was created is run once. ``run_owned`` ends the container: when
     it passes ``deadline_seconds``, its client is killed by ``run_command`` and it is stopped and removed before ``TimeoutExpired`` is raised, or a
@@ -304,9 +315,10 @@ def run_in_slot(
     while True:
         holders = spark_holders(running(read_seconds())) or holder_text(call, read_seconds())
         if not holders:
+            arguments = build(slot_options(owner))
             if wait > 0 and clock() - started >= wait:
                 raise SlotBusy(f"the wait of {wait:g} seconds ended before the slot was read as free")
-            result, refused = run_owned(call, owner, lambda: call(build(slot_options(owner)), deadline_seconds), read_seconds)
+            result, refused = run_owned(call, owner, functools.partial(call, arguments, deadline_seconds), read_seconds)
             if not refused:
                 return result
             holders = (f"the container {SLOT_NAME}",)

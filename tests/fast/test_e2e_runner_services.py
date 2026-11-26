@@ -273,6 +273,37 @@ class CatalogProofLaunchTest(unittest.TestCase):
                         self.stack().job(["--branch", "b"])
                 self.assertEqual({}, engine.boxes)
 
+    def test_an_interrupt_in_the_second_cleanup_over_ssh_removes_the_container_or_names_it_with_its_state(self) -> None:
+        """The probe: the launch times out, the first cleanup listing fails, and one SIGINT lands in the stop of the second cleanup."""
+        for removal_fails in (False, True):
+            engine = Engine(on_start=lambda _engine, _box: (_ for _ in ()).throw(TimeoutExpired("docker", 5)), removal_fails=removal_fails)
+            failed: list[bool] = []
+            pressed: list[bool] = []
+
+            def flaky(
+                arguments: Sequence[str],
+                timeout: float,
+                engine: Engine = engine,
+                real: Callable[[Sequence[str], float], CompletedProcess[str]] = engine.docker,
+                failed: list[bool] = failed,
+                pressed: list[bool] = pressed,
+            ) -> CompletedProcess[str]:
+                if list(arguments[:2]) == ["container", "ls"] and engine.launches() and not failed:
+                    failed.append(True)
+                    return CompletedProcess(list(arguments), 255, "", "HostError")
+                if list(arguments[:2]) == ["container", "stop"] and not pressed:
+                    pressed.append(True)
+                    raise KeyboardInterrupt
+                return real(arguments, timeout)
+
+            self.engine = engine
+            with self.subTest(removal_fails=removal_fails):
+                with mock.patch.object(engine, "docker", flaky), contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(KeyboardInterrupt):
+                    self.stack(over_ssh=True).job(["--branch", "b"])
+                self.assertEqual(([True], [True], 1), (failed, pressed, len(engine.launches())))
+                self.assertEqual(1 if removal_fails else 0, len(engine.boxes))
+                self.assertEqual(removal_fails, f"container {1:064x} (exited)" in error.getvalue())
+
     def test_a_container_that_cannot_be_removed_after_the_deadline_is_a_slot_error(self) -> None:
         self.engine.on_start = lambda _engine, _box: (_ for _ in ()).throw(TimeoutExpired("docker", 5))
         self.engine.removal_fails = True

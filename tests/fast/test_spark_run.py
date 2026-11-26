@@ -9,6 +9,7 @@ exists. The tests run with ``tests/fast/spark_engine.py``, a stand-in for the Do
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import unittest
 from collections.abc import Callable
@@ -20,7 +21,7 @@ from scripts.stack import groups, spark_run
 from scripts.stack import spark_slot as slot
 from scripts.stack.job_workloads import JOB_WORKLOADS, SERVICE_WORKLOADS, profile_of_job, service_of
 from scripts.stack.limits import LIMITS_FILE, load_limits
-from tests.fast.spark_engine import OWNER_LABEL, SLOT_NAME, Box, Engine, finishes
+from tests.fast.spark_engine import CONFLICT, OWNER_LABEL, SLOT_NAME, Box, Engine, finishes
 from tests.fast.test_spark_slot import killed
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,20 @@ class SparkRunTest(unittest.TestCase):
         self.engine.on_start = finishes(3, "", "the job failed\n")
         self.assertEqual(3, self.go(["table_maintenance"]))
         self.assertEqual("the job failed\n", self.error.getvalue())
+
+    def test_a_job_that_exits_1_with_the_refusal_words_after_the_wait_keeps_its_own_output_and_is_not_reported_as_refused(self) -> None:
+        exact = f"{CONFLICT.format(name=SLOT_NAME, other='f' * 64)}\n"
+        now = [0.0]
+
+        def container(engine: Engine, box: Box) -> CompletedProcess[str]:
+            now[0] = 5.0
+            return CompletedProcess([], 1, "", exact)
+
+        self.engine.on_start = container
+        with mock.patch.object(spark_run, "run_in_slot", functools.partial(slot.run_in_slot, clock=lambda: now[0])):
+            self.assertEqual(1, self.go(["--wait-seconds", "1", "table_maintenance"]))
+        self.assertEqual(exact, self.error.getvalue())
+        self.assertEqual(({}, 1), (self.engine.boxes, len(self.engine.launches())))
 
     def test_a_job_that_is_unknown_or_has_no_service_or_is_missing_is_refused_with_status_2_and_no_docker_call(self) -> None:
         for argv in (["no_such_job"], ["stream_features"], []):

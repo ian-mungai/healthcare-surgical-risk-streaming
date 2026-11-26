@@ -320,6 +320,77 @@ class SlotTest(unittest.TestCase):
             self.assertEqual(expected, reads[: len(expected)])
             self.assertEqual(1, len(self.engine.launches()))
 
+    def job_that_prints_the_refusal(self, taken: float) -> Callable[[Engine, Box], CompletedProcess[str]]:
+        """A created job that runs for ``taken`` seconds, then exits 1 with no output and the whole refusal on standard error."""
+
+        def job(engine: Engine, box: Box) -> CompletedProcess[str]:
+            self.now += taken
+            return CompletedProcess([], 1, "", f"{CONFLICT.format(name=SLOT_NAME, other='f' * 64)}\n")
+
+        return job
+
+    def reread_fails(self, later_reads_fail: bool = False) -> Callable[[Sequence[str], float], CompletedProcess[str]]:
+        """An engine whose first listing after the launch fails, or every listing after it."""
+        failed: list[bool] = []
+
+        def docker(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            if arguments[:2] == ["container", "ls"] and self.engine.launches() and (later_reads_fail or not failed):
+                failed.append(True)
+                return CompletedProcess(list(arguments), 1, "", "")
+            return self.engine.docker(arguments, timeout)
+
+        return docker
+
+    def test_a_created_job_that_prints_the_refusal_keeps_its_own_result_when_the_owner_check_cannot_run(self) -> None:
+        """The probe: the wait is used up, or the owner check fails, so only the cleanup's own read can find the job's container."""
+        for label, taken, broken, removal_fails in (
+            ("the wait is used up", 1.0, False, False),
+            ("the owner check fails", 0.0, True, False),
+            ("the wait is used up and the removal fails", 1.0, False, True),
+        ):
+            self.now, self.engine = 0.0, Engine(on_start=self.job_that_prints_the_refusal(taken), removal_fails=removal_fails)
+            docker = self.reread_fails() if broken else self.engine.docker
+            with self.subTest(label), contextlib.redirect_stderr(io.StringIO()) as error:
+                result = run_in_slot(self.build, running=lambda _: [], deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=docker)
+                self.assertEqual((1, f"{CONFLICT.format(name=SLOT_NAME, other='f' * 64)}\n"), (result.returncode, result.stderr))
+                self.assertEqual(1, len(self.engine.launches()))
+                self.assertEqual(1 if removal_fails else 0, len(self.engine.boxes))
+                self.assertEqual(removal_fails, f"container {1:064x} (exited)" in error.getvalue())
+
+    def test_a_failed_owner_check_stays_an_error_when_the_cleanup_confirms_no_container_of_this_launch(self) -> None:
+        """Another launch holds the name when the wait is used up, or no later read works: nothing shows that this launch's job ran."""
+
+        def taken_by_a_winner(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            if arguments[0] != "compose":
+                return self.engine.docker(arguments, timeout)
+            self.engine.hold(owner="the_winner")
+            self.now += 1
+            return self.engine.docker(arguments, timeout)
+
+        with self.assertRaisesRegex(SlotBusy, "wait of 1 seconds ended"):
+            run_in_slot(self.build, running=lambda _: [], deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=taken_by_a_winner)
+        self.assertEqual(["the_winner"], [box.labels[OWNER_LABEL] for box in self.engine.boxes.values()])
+        self.now, self.engine = 0.0, Engine(on_start=self.job_that_prints_the_refusal(0.0))
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaisesRegex(SlotError, "cannot be read"):
+            run_in_slot(self.build, running=lambda _: [], deadline_seconds=100, docker=self.reread_fails(later_reads_fail=True))
+        self.assertIn("may still hold the slot", error.getvalue())
+
+    def test_no_launch_is_dispatched_at_or_after_the_deadline_when_the_arguments_use_up_the_wait(self) -> None:
+        """The probe: building the arguments came after the last clock check, so a launch started at exactly the deadline."""
+        for taken in (1.0, 1.5):
+            self.now, self.engine = 0.0, Engine()
+
+            def build(options: Sequence[str], taken: float = taken) -> list[str]:
+                self.now += taken
+                return self.build(options)
+
+            with self.subTest(taken=taken):
+                with self.assertRaisesRegex(SlotBusy, "wait of 1 seconds ended"):
+                    run_in_slot(
+                        build, running=lambda _: [], deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=self.engine.docker
+                    )
+                self.assertEqual([], self.engine.launches())
+
     def test_a_finished_job_has_its_container_removed_by_id_whatever_its_exit_status(self) -> None:
         for code in (0, 1, 42):
             self.engine = Engine(on_start=finishes(code))
@@ -370,6 +441,21 @@ class SlotTest(unittest.TestCase):
             with self.subTest(start=start.__name__), self.assertRaises(KeyboardInterrupt):
                 run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=docker)
             self.assertEqual({}, self.engine.boxes)
+
+    def test_an_interrupt_in_the_removal_of_an_owned_container_does_not_skip_it(self) -> None:
+        """``remove_owned`` is the second cleanup of a run over SSH that ended with no result of its own."""
+        self.engine.hold(owner="mine")
+        pressed: list[bool] = []
+
+        def docker(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            if arguments[:2] == ["container", "stop"] and not pressed:
+                pressed.append(True)
+                raise KeyboardInterrupt
+            return self.engine.docker(arguments, timeout)
+
+        with self.assertRaises(KeyboardInterrupt):
+            slot.remove_owned(docker, "mine")
+        self.assertEqual({}, self.engine.boxes)
 
     def test_a_free_slot_is_required_and_the_refusal_names_the_holding_container_and_its_state(self) -> None:
         slot.require_free(self.engine.docker)
