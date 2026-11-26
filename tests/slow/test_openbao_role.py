@@ -6,6 +6,7 @@ is refused by name. A test user cannot give a file to another user, so the owner
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import unittest
@@ -51,6 +52,14 @@ class SecretFilesCheckTest(unittest.TestCase):
     def test_a_private_file_of_its_owner_in_a_private_folder_passes(self) -> None:
         code, output = verdict()
         self.assertEqual(0, code, output)
+
+    def test_a_verbose_run_shows_no_checksum_and_no_content_type_of_a_secret_id_file(self) -> None:
+        code, output = verdict()
+        self.assertEqual(0, code, output)
+        self.assertIn('"exists": true', output, "the verbose run prints what each stat read")
+        self.assertNotIn(hashlib.sha1(b"a-long-random-value", usedforsecurity=False).hexdigest(), output)
+        self.assertNotIn('"checksum"', output)
+        self.assertNotIn('"mimetype"', output)
 
     def test_a_file_that_anyone_but_its_owner_can_read_or_that_its_owner_can_write_is_refused_by_name_and_its_content_is_not_shown(self) -> None:
         for mode in (0o600, 0o640, 0o644, 0o440, 0o404, 0o444, 0o500, 0o000):

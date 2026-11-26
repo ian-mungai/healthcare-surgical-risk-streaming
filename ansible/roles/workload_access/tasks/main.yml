@@ -93,9 +93,12 @@
     cmd: systemctl start workload-credentials.service
   changed_when: false
 
+# No checksum or content type of a credential file is made: a checksum is a value of the secret, and a verbose run prints the result of a stat.
 - name: Read each workload's credential file
   ansible.builtin.stat:
     path: "/run/workload_access/{{ item.name }}/credentials.json"
+    get_checksum: false
+    get_mime: false
   register: workload_access_files
   loop: "{{ workload_access_workloads }}"
   loop_control:

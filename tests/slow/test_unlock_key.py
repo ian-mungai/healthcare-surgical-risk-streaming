@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import grp
+import hashlib
 import os
 import pwd
 import re
@@ -120,6 +121,9 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertNotIn(MARKER, output)
         self.assertNotIn(base64.b64encode(GOOD_CONTENT.encode()).decode(), output)
+        self.assertIn('"exists": true', output, "the verbose run prints what the stat read")
+        self.assertNotIn(hashlib.sha1(GOOD_CONTENT.encode(), usedforsecurity=False).hexdigest(), output)
+        self.assertNotIn('"mimetype"', output)
 
     def test_a_file_that_anyone_but_its_owner_can_read_or_that_its_owner_can_write_is_refused(self) -> None:
         for mode in (0o600, 0o644, 0o640, 0o440, 0o404, 0o444, 0o500):

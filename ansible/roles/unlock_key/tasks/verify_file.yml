@@ -1,7 +1,10 @@
-# Reads unlock_key_file and openbao_user. The owner is compared by number. The content is read for its shape only and never shown.
+# Reads unlock_key_file and openbao_user. The owner is compared by number. The content is read for its shape only and never shown, and the stat makes no checksum
+# or content type: a checksum is a value of the secret, and a verbose run prints the result of a stat.
 - name: Read the unlock key file's status
   ansible.builtin.stat:
     path: "{{ unlock_key_file }}"
+    get_checksum: false
+    get_mime: false
   register: unlock_key_status
 
 - name: Read the unlock key file's content

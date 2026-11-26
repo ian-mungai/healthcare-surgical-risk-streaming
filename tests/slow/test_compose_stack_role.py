@@ -281,6 +281,8 @@ class PasswordFilesTest(unittest.TestCase):
         for text in files.values():
             self.assertGreaterEqual(len(text), 40)
             self.assertNotIn(text, output)
+            self.assertNotIn(hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest(), output, "the verbose run prints no checksum of a password file")
+        self.assertNotIn('"mimetype"', output)
 
     def test_a_second_run_changes_nothing_and_keeps_every_password(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -374,6 +376,9 @@ class GrafanaPasswordTest(unittest.TestCase):
     def test_the_check_passes_a_private_file_of_the_grafana_user_and_refuses_every_other_file_by_name(self) -> None:
         code, output = self.check()
         self.assertEqual(0, code, output)
+        self.assertIn('"exists": true', output, "the verbose run prints what the stat read")
+        self.assertNotIn(hashlib.sha1(b"a-long-random-value", usedforsecurity=False).hexdigest(), output)
+        self.assertNotIn('"mimetype"', output)
         for label, kwargs in (
             ("mode 0600", {"mode": 0o600}),
             ("mode 0640", {"mode": 0o640}),
