@@ -241,7 +241,7 @@ class OrchestrationStartTest(unittest.TestCase):
     def test_the_host_playbook_does_not_start_them_and_the_connection_playbook_does_after_the_raw_connection(self) -> None:
         host_document: Any = load_yaml((ROOT / "ansible" / "host.yml").read_text())
         host = host_document[0]
-        self.assertEqual("compose_stack", host["roles"][-1])
+        self.assertEqual(["compose_stack", "runner_checkout"], host["roles"][-2:])
         stack_document: Any = load_yaml((ROOT / "ansible" / "stack.yml").read_text())
         stack = stack_document[0]
         stack_roles = [task["ansible.builtin.include_role"]["name"] for task in stack["tasks"]]

@@ -148,7 +148,7 @@ class RoleContractTest(unittest.TestCase):
 
     def test_the_guard_runs_before_the_roles_that_start_workloads(self) -> None:
         roles = role_order("host.yml")
-        self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access", "unlock_key", "compose_stack"], roles)
+        self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access", "unlock_key", "compose_stack", "runner_checkout"], roles)
 
     def test_the_stack_playbook_that_follows_the_host_playbook_and_the_intake_starts_the_rest_of_the_workloads_after_the_guard(self) -> None:
         self.assertEqual(["compose_stack", "airbyte"], [name for name, _ in included_roles("stack.yml")])

@@ -54,6 +54,11 @@ ANSIBLE_PRIVATE_FILE_REASON = (
     "Ansible module code that runs on the managed host, where scripts/ingestion/output_file.py is not shipped; it makes the file with an exclusive create "
     "in mode 0400 and renames or links it into place, as replace_owned_file and write_new_file do"
 )
+ANSIBLE_MANIFEST_REASON = (
+    "Ansible module code that runs on the managed host, where scripts/ingestion/output_file.py is not shipped: it writes the source manifest to a private "
+    "temporary file (mkstemp creates it exclusively, mode 0600) in the checkout's folder and moves it over runner_manifest.json with "
+    "AnsibleModule.atomic_move, then sets its owner and mode"
+)
 ANSIBLE_CREDENTIALS_REASON = (
     "A script that Ansible copies to the managed host, where scripts/ingestion/output_file.py is not shipped: it creates the partial file exclusively "
     "with its final mode (os.open with O_EXCL, 0o640), writes it through that descriptor and renames it over the credentials file"
@@ -71,6 +76,8 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
     ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.fdopen"): (1, ANSIBLE_PRIVATE_FILE_REASON),
     ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.replace"): (1, ANSIBLE_PRIVATE_FILE_REASON),
     ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.link"): (1, ANSIBLE_PRIVATE_FILE_REASON),
+    ("ansible/roles/runner_checkout/library/runner_manifest.py", "write_manifest", "tempfile.mkstemp"): (1, ANSIBLE_MANIFEST_REASON),
+    ("ansible/roles/runner_checkout/library/runner_manifest.py", "write_manifest", "os.fdopen"): (1, ANSIBLE_MANIFEST_REASON),
     ("ansible/roles/workload_access/files/workload_credentials.py", "write_credentials", "os.open"): (1, ANSIBLE_CREDENTIALS_REASON),
     ("ansible/roles/workload_access/files/workload_credentials.py", "write_credentials", "os.fdopen"): (1, ANSIBLE_CREDENTIALS_REASON),
     ("ansible/roles/workload_access/files/workload_credentials.py", "write_credentials", "partial.replace"): (1, ANSIBLE_CREDENTIALS_REASON),
@@ -232,6 +239,10 @@ OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
     ("scripts/ingestion/table_checks.py", "write_result", "run_folder"): (1, "The run folder of the load; the name is the fixed RESULT_FILE"),
     ("scripts/infra/inventory.py", "write_inventory", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed inventory.json"),
     ("scripts/infra/host.py", "record_tailscale_device", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed DEVICE_FILE"),
+    ("scripts/infra/runner_place.py", "record_files", "folder"): (
+        1,
+        "RUNS / run ID, made by host_runners_place before the call; the name is the fixed RECORD_FILE",
+    ),
     ("scripts/infra/host.py", "keep_host_keys_of", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed known_hosts_instance"),
     ("scripts/infra/state_bootstrap.py", "RunBinding.write", "state_root"): (
         1,

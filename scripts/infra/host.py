@@ -10,6 +10,7 @@ deployment, places the project profile's key, runs the connection step and write
 checks, so a second run changes nothing.
 ``make host-stop`` stops the instance, keeps its disk and prints what still bills.
 ``make host-start`` starts it and waits until it answers over Tailscale.
+``make host-runners-place RUNNERS="..."`` (``scripts/infra/runner_place.py``) places named Git-ignored runner files in the runner folder that the deploy made.
 ``host check --host-name <NAME> --instance-id <ID>`` is the deploy workflow's check: the peer with that name and tag must answer over
 SSH as the instance with that ID.
 
@@ -58,7 +59,7 @@ SSH_ATTEMPT_SECONDS = 30
 # files and fails when this figure is lower. The stack deployment (ansible/stack.yml, after the launcher's intake of the external secrets), the AIStor step
 # (ansible/storage.yml: the licence check, the start of AIStor and its project user) and the connection step (ansible/connection.yml: the Airbyte connection
 # step and the start of the orchestration services) each have their own budget from the same sum.
-HOST_SETUP_TIMEOUT_SECONDS = 6900
+HOST_SETUP_TIMEOUT_SECONDS = 10800
 STACK_TIMEOUT_SECONDS = 18900
 CONNECTION_TIMEOUT_SECONDS = 5100
 STORAGE_TIMEOUT_SECONDS = 3300
@@ -455,11 +456,13 @@ def registry_user(configuration: dict[str, str]) -> str:
 
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
-    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, the bucket that Airbyte's
-    connection copies into, the bucket that the AIStor project user's policy reaches and the Docker Hub account that the host pulls the project's images as.
-    No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host without Ansible."""
+    """The Ansible variables of the stack's host settings: the deployed commit (the stack's and the name of the runner folder), the warehouse location of the
+    configured bucket, the bucket that Airbyte's connection copies into, the bucket that the AIStor project user's policy reaches and the Docker Hub account
+    that the host pulls the project's images as. No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host
+    without Ansible."""
     return {
         "compose_stack_platform_commit": commit,
+        "runner_checkout_commit": commit,
         "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
         "airbyte_landing_bucket": configuration["S3_BUCKET"],
         "aistor_bucket": configuration["S3_BUCKET"],

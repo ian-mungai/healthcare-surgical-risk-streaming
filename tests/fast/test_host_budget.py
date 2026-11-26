@@ -316,6 +316,43 @@ class HostSetupBudgetTest(unittest.TestCase):
                 self.assertIn("timeout", item.task, "a cold install downloads packages, and only the lock wait has a deadline without it")
                 self.assertGreater(task_seconds(item), int(item.task[APT]["lock_timeout"]))
 
+    def test_the_runner_checkout_role_counts_each_of_its_deadlines_once_and_the_budget_covers_them(self) -> None:
+        found = playbook_occurrences("host.yml")
+        names = group_variables()
+        grace = int(names["runner_checkout_stop_grace_seconds"])
+
+        def seconds(name: str) -> int:
+            return int(names[f"runner_checkout_{name}_deadline_seconds"])
+
+        def under_timeout(*deadlines: str) -> int:
+            """Commands that run under timeout: the task's deadline is the command's deadline and the grace that lets timeout stop the command first."""
+            return sum(seconds(name) + grace for name in deadlines)
+
+        python = seconds("download") + under_timeout("unpack", "check", "remove", "remove", "check")
+        controller = under_timeout("remove", "archive") + seconds("manifest")
+        decision = seconds("manifest") + seconds("environment_check")
+        retries = 1 + int(names["runner_checkout_stop_check_retries"])
+        stop_check = retries * (seconds("stop_check") + grace) + (retries - 1) * int(names["runner_checkout_stop_check_delay_seconds"])
+        python += stop_check
+        build = (
+            under_timeout("remove", "remove")
+            + seconds("unpack")
+            + under_timeout("unpack", "environment", "check", "install", "remove")
+            + 2 * stop_check
+            + under_timeout("remove")
+        )
+        closing = under_timeout("close", "close") + seconds("manifest") + seconds("scan")
+        self.assertEqual(
+            python + controller + decision + build + closing,
+            parts()["runner_checkout"],
+            "the interpreter's download, unpack, checks, the stop check before the old folders go and the removals (those, a failed install's folder); "
+            "the controller's archive, its read and its scratch removal; the manifest and environment checks; the removals, the copy, the unpack, "
+            "the environment, its check, the install, the archive's removals and the build's two stop checks (before a removal, and after a failed build); "
+            "the closing, the manifest and the listing",
+        )
+        timed = [item for item in found if item.role == "runner_checkout" and task_seconds(item)]
+        self.assertEqual(27, len(timed))
+
     def test_the_rollback_and_the_uninstall_count_once_and_the_install_counts_beside_the_recovery(self) -> None:
         found = deployment()
         deadline = int(group_variables()["airbyte_release_deadline_seconds"])

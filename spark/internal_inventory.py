@@ -225,6 +225,15 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "scripts/infra/inventory.py": (
         "main", "write_inventory",
     ),
+    "scripts/infra/runner_imports.py": (
+        "Closure", "DiskSource", "OverlaySource", "Source", "absolute_module", "closure", "exported_names", "imported_names", "locked_distributions",
+        "module_file", "module_files", "normalized", "parsed", "read", "stored_names", "top_level_statements", "unlocked", "uses_dynamic_import",
+    ),
+    "scripts/infra/runner_place.py": (
+        "CommitSource", "Placement", "__init__", "check_imports", "git_succeeds", "hashed_lines", "host_runners_place", "lock_files", "main",
+        "not_plain", "place", "placed_before", "read", "read_plain_file", "read_record_command", "record_files", "remote_command", "require_commit",
+        "runner_folder_guard", "runner_names", "runner_text", "scan_credentials", "ssh_call", "verify_retained_command", "write_record_command",
+    ),
     "scripts/infra/state_bootstrap.py": (
         "RunBinding", "adoption_problem", "binding_path", "bucket_exists", "bucket_problem", "create", "empty", "main", "new_binding", "owned",
         "problems", "read_settings", "repair", "required_tags", "run_suffix", "short_lived_bucket_name", "state_keys", "verify", "write",

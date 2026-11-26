@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 override TERRAFORM := .tools/bin/terraform
 
-.PHONY: images-push setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start storage-up inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
+.PHONY: images-push setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start host-runners-place storage-up inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -68,6 +68,15 @@ host-stop:
 
 host-start:
 	$(PYTHON) -m scripts.infra.host start
+
+# The text of RUNNERS reaches the program raw, in HOST_RUNNER_NAMES, and is split there on white space and checked there: Make expands no $ in it ($(value RUNNERS)
+# is the text as typed, and a := variable is not expanded again), and no shell globs, splits or expands a name. RUNNERS itself is not exported, because Make would expand it.
+HOST_RUNNER_NAMES := $(value RUNNERS)
+export HOST_RUNNER_NAMES
+unexport RUNNERS
+host-runners-place:
+	$(if $(value RUNNERS),,$(error name the runner files: make host-runners-place RUNNERS="tests/e2e/silver_signals.py ..."))
+	$(PYTHON) -m scripts.infra.runner_place --names-from-environment
 
 inventory:
 	$(PYTHON) -m scripts.infra.inventory

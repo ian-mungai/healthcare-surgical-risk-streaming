@@ -246,3 +246,174 @@ airbyte_public_url: ""
 airbyte_release_deadline_seconds: 1200
 airbyte_ready_deadline_seconds: 300
 airbyte_health_deadline_seconds: 120
+
+# The runner checkout: the deployed commit's code and a pinned Python environment for the native host-mode runners, in one folder that only the deploy user and its group
+# read (mode 0750, no secret in it). The folder is /opt/platform/runner/<commit>. It holds the commit's tracked files from git archive (no Git history), a .venv built from the
+# hash-pinned requirements and, once the launcher places them, the Git-ignored runner files. The next deploy of another commit removes the old folder; a second deploy of the
+# same commit changes nothing and keeps the placed runners. A stopped host keeps the folder with its disk; destroying the host removes the disk and the folder with it.
+# The commit is the one the stack is deployed from (the launcher gives it as runner_checkout_commit).
+runner_checkout_directory: /opt/platform/runner
+runner_checkout_owner: ubuntu
+runner_checkout_group: ubuntu
+# The folder and the runner folder for the owner and its group only; every entry below them keeps its owner's bits and loses every bit of others.
+runner_checkout_mode: "0750"
+runner_checkout_file_mode: "u=rwX,g=rX,o="
+# The interpreter. Ubuntu 24.04 ships Python 3.12 and the project is pinned to Python 3.14 (the pyproject, the Dockerfiles' python:3.14.10 and the Ruff and MyPy targets), so the
+# host gets the python-build-standalone build for x86-64 glibc, in a folder named for its version beside the other tools. The archive's SHA-256 is the one in the release's own
+# SHA256SUMS (read Nov 25 2026, and equal to the hash of the downloaded file). Change the pin only with its hash, after reading the release notes.
+runner_checkout_python_version: 3.14.10
+runner_checkout_python_build: "20261110"
+runner_checkout_python_archive_sha256: c2ff2e97422f5d3896a16e0317fd212ba977bbf2688d93a6f7a03d817506bd30
+runner_checkout_python_directory: /opt/platform/python
+runner_checkout_python_download_directory: /usr/local/src
+runner_checkout_python_url: >-
+  https://github.com/astral-sh/python-build-standalone/releases/download/{{ runner_checkout_python_build }}/cpython-{{ runner_checkout_python_version }}%2B{{ runner_checkout_python_build }}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+runner_checkout_python_archive: "{{ runner_checkout_python_download_directory }}/cpython-{{ runner_checkout_python_version }}-{{ runner_checkout_python_build }}-x86_64-linux-gnu.tar.gz"
+# The published name of the interpreter: a link that the role makes to a folder of its own beside it and replaces in one atomic rename, so that an interrupted or failed
+# install leaves the interpreter that was there.
+runner_checkout_python_home: "{{ runner_checkout_python_directory }}/{{ runner_checkout_python_version }}"
+# A folder that the role made for an interpreter is known by two things together: a name that only the role gives (the version, "-runner_checkout-" and the eight characters
+# that tempfile adds) and a marker in it (runner_checkout_python_marker's name: a plain file of one line, the SHA-256 of an archive), written before anything is unpacked
+# into it. After a new interpreter is published, runner_checkout_python_prune_script removes the other folders of this version that have both, so that an install that never
+# finished goes too. It removes nothing else: a folder with another name, with no marker or with a marker of another form, and a link, stay.
+runner_checkout_python_folder_prefix: "{{ runner_checkout_python_version }}-runner_checkout-"
+runner_checkout_python_folder_form: "^{{ runner_checkout_python_folder_prefix | regex_escape }}[a-z0-9_]{8}$"
+runner_checkout_python_prune_script: |
+  import os, re, shutil, stat, sys
+  directory, form, marker, keep = sys.argv[1:]
+  for entry in os.scandir(directory):
+      if entry.name == keep or re.fullmatch(form, entry.name) is None or not entry.is_dir(follow_symlinks=False):
+          continue
+      try:
+          descriptor = os.open(os.path.join(entry.path, marker), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+      except OSError:
+          continue
+      try:
+          content = os.read(descriptor, 66) if stat.S_ISREG(os.fstat(descriptor).st_mode) else b""
+      finally:
+          os.close(descriptor)
+      if re.fullmatch(rb"[0-9a-f]{64}\n", content):
+          shutil.rmtree(entry.path)
+runner_checkout_python: "{{ runner_checkout_python_home }}/bin/python{{ runner_checkout_python_version.split('.')[:2] | join('.') }}"
+# The files, relative to the folder, that the environment's packages come from: every one is installed with --require-hashes, so every requirement in it must carry a hash.
+# The host process of the runners imports only PyYAML and ansible-core, both in the root lock (tests/fast/test_runner_requirements.py reads every import); the locks of spark/,
+# replay/ and orchestration/ are for the containers' code and are not installed here.
+runner_checkout_requirements:
+  - requirements.txt
+runner_checkout_folder: "{{ runner_checkout_directory }}/{{ runner_checkout_commit }}"
+# The archive on its way to the host, beside the folder, removed once it is unpacked (and by the next deploy if a failure left it).
+runner_checkout_archive_file: "{{ runner_checkout_folder }}.tar"
+# The marker that is written last. Its text is the JSON of what the folder was built from, so another commit's folder, another interpreter pin or other requirements files
+# make the folder unfinished. The launcher's placement reads the same name.
+runner_checkout_marker: "{{ runner_checkout_folder }}/.runner_checkout.json"
+runner_checkout_expected:
+  commit: "{{ runner_checkout_commit }}"
+  python: "{{ runner_checkout_python_version }}"
+  python_archive_sha256: "{{ runner_checkout_python_archive_sha256 }}"
+  requirements: "{{ runner_checkout_requirements }}"
+runner_checkout_marker_text: "{{ runner_checkout_expected | to_json(sort_keys=True) }}\n"
+# The source manifest, written in the folder's root before the marker: {"commit": "<40 hex>", "files": {"<path relative to the folder>": "<SHA-256>"}} for every file that
+# git archive placed (not .venv, the marker, the manifest or a runner that the launcher places later). Only its owner reads it (0400). The streaming host runner checks its
+# provenance with it, and a deploy of a finished folder checks the files against it and builds the folder again when one changed, is gone or the manifest is not there.
+runner_checkout_manifest: "{{ runner_checkout_folder }}/runner_manifest.json"
+runner_checkout_manifest_mode: "0400"
+# The hashes of the runner files that the launcher places (make host-runners-place), written on the host by the launcher so that a runner can check its own file. It is
+# not in the manifest, which is written before any placement, and the deploy never touches it: a finished folder keeps it, a new folder starts without it.
+runner_checkout_placed_runners: "{{ runner_checkout_folder }}/placed_runners.json"
+# The marker in the interpreter's folder (read through the published link) that names the SHA-256 of the archive it was unpacked from: an installed interpreter is reused only
+# when it names the pinned archive, and it is published (one atomic replacement of the link) only after it ran in a folder of its own and said its version, so another archive of
+# the same version replaces it and a failed install changes nothing. The marker is written into each new folder before the unpack; its name also tells the prune a folder of the role.
+runner_checkout_python_marker: "{{ runner_checkout_python_home }}/.archive_sha256"
+# Each deadline is in seconds. The install deadline covers every package of the lock file. Every command of the role runs under timeout with a kill-after of
+# runner_checkout_kill_after_seconds, so that it is stopped, with every process it started, where it runs, and the task's own deadline is the command's deadline plus
+# runner_checkout_stop_grace_seconds, so that timeout always ends the command first. The removals (rm -rf), the permission changes (chown and chmod -R), the listings and
+# the checks have a deadline of their own. The environment check starts two programs, each with the check deadline, so its task deadline is longer than two of them.
+runner_checkout_download_deadline_seconds: 120
+runner_checkout_unpack_deadline_seconds: 120
+runner_checkout_archive_deadline_seconds: 120
+runner_checkout_environment_deadline_seconds: 120
+runner_checkout_install_deadline_seconds: 900
+runner_checkout_check_deadline_seconds: 60
+runner_checkout_manifest_deadline_seconds: 120
+runner_checkout_environment_check_deadline_seconds: 180
+runner_checkout_remove_deadline_seconds: 60
+runner_checkout_close_deadline_seconds: 120
+runner_checkout_scan_deadline_seconds: 60
+runner_checkout_kill_after_seconds: 5
+runner_checkout_stop_grace_seconds: 15
+# The processes of a build. Each command that can leave a process behind (the unpack, the environment and the install) starts through a program that makes its process group
+# and writes the group's number as one line in the record, runner_checkout_build_record (beside the runner folder, so that no prune takes it). Before a build removes anything,
+# after a failed build before any cleanup, and before older interpreter folders are removed, runner_checkout_process_script looks at every group of the record (os.killpg with
+# signal 0: no such process means that the group is gone, and no permission means that it lives; the shell's kill is not used, because dash reads "--" there as a process
+# number), at every process whose working folder or executable is the runner folder or below it (the links cwd and exe of each process in runner_checkout_proc_directory) and
+# at every process whose command line names the runner folder. It removes the record when none is left, and it exits 2 when it cannot look. A group number that the system gave
+# to another process after a restart looks live: the deploy then names the record, and its owner removes it once it is clear that nothing of the build works.
+runner_checkout_build_record: "{{ runner_checkout_directory }}.build_processes"
+runner_checkout_track:
+  - python3
+  - -I
+  - -c
+  - |
+    import os, sys
+    try:
+        os.setpgid(0, 0)
+    except PermissionError:
+        pass
+    descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.write(descriptor, (str(os.getpgrp()) + "\n").encode())
+    os.close(descriptor)
+    os.execvp(sys.argv[2], sys.argv[2:])
+  - "{{ runner_checkout_build_record }}"
+runner_checkout_proc_directory: /proc
+runner_checkout_process_script: |
+  import os, subprocess, sys
+  record, directory, processes, pattern = sys.argv[1:]
+
+  def a_group_lives():
+      try:
+          with open(record, encoding="ascii", errors="replace") as handle:
+              lines = handle.read().split()
+      except FileNotFoundError:
+          return False
+      for line in lines:
+          if line.isdigit() and int(line) > 1:
+              try:
+                  os.killpg(int(line), 0)
+              except ProcessLookupError:
+                  continue
+              except PermissionError:
+                  pass
+              return True
+      return False
+
+  def a_process_is_in_the_folder():
+      folder = os.path.realpath(directory)
+      for number in os.listdir(processes):
+          for name in ("cwd", "exe") if number.isdigit() else ():
+              try:
+                  target = os.readlink(os.path.join(processes, number, name)).removesuffix(" (deleted)")
+              except (FileNotFoundError, ProcessLookupError):
+                  continue
+              if target == folder or target.startswith(folder + "/"):
+                  return True
+      return False
+
+  def a_command_line_names_the_folder():
+      code = subprocess.run(["pgrep", "-f", "--", pattern], stdout=subprocess.DEVNULL, check=False).returncode
+      if code not in (0, 1):
+          raise OSError(code)
+      return code == 0
+
+  try:
+      if a_group_lives() or a_process_is_in_the_folder() or a_command_line_names_the_folder():
+          sys.exit(1)
+      if os.path.exists(record):
+          os.unlink(record)
+  except (OSError, ValueError, OverflowError) as error:
+      sys.stderr.write("the look for processes failed: " + type(error).__name__ + "\n")
+      sys.exit(2)
+# After a failed build, and before a retry removes anything, nothing is cleaned up until no process of the build works: the script, with its own deadline, tried again this many
+# times, this many seconds apart.
+runner_checkout_stop_check_deadline_seconds: 10
+runner_checkout_stop_check_retries: 3
+runner_checkout_stop_check_delay_seconds: 5
