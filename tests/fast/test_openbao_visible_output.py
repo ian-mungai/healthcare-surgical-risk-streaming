@@ -4,9 +4,9 @@ The playbook prints the actions, the count of unlisted roles and the refusal of 
 a value in the shape of a secret here. No real server sends such a reply, so the connection is replaced; the run through ``ansible-playbook`` is in
 ``tests/slow/test_openbao_role_tasks.py``. The values are synthetic markers.
 
-The failures covered: a seal status whose flags are no Booleans; a role or policy list that is no list of names, holds another thing than a name or has no
-data; a role or a ``service_`` policy whose name the service list does not hold, in the action that retires it, in the refusal of its read or its write and in
-a request that cannot be sent.
+The failures covered: a seal status whose flags are no Booleans; a role listing that is refused; a role or policy list that is no list of names, holds another
+thing than a name or has no data; a role or a ``service_`` policy whose name the service list does not hold, in the action that retires it, in the refusal of
+its read or its write and in a request that cannot be sent.
 """
 
 from __future__ import annotations
@@ -140,6 +140,13 @@ class RoleListTest(VisibleOutputCase):
         self.server.replies[("GET", ROLE_LIST)] = (200, {"data": {"keys": ["bootstrap", "nessie", MARKER, f"{MARKER}-two"]}})
         shown = self.visible()
         self.assertEqual({"actions": [], "unlisted": 2}, json.loads(shown))
+
+    def test_a_role_listing_that_is_refused_gives_no_count_but_unavailable_with_the_status(self) -> None:
+        for status in (204, 403, 404, 500, 503):
+            with self.subTest(status=status):
+                self.server.replies[("GET", ROLE_LIST)] = (status, {"errors": [MARKER], "data": {"keys": [MARKER]}})
+                shown = self.visible()
+                self.assertEqual({"actions": [], "unlisted": f"unavailable (HTTP {status})"}, json.loads(shown))
 
     def test_a_reply_that_is_no_list_of_names_is_refused_with_a_fixed_text(self) -> None:
         replies: list[Any] = [{"data": {"keys": [shape]}} for shape in ({"client_token": MARKER}, [MARKER], 7, None)]

@@ -1,9 +1,9 @@
 # Run once OpenBao is healthy. Reads openbao_services_file, openbao_tools_file, openbao_external_secrets_file, openbao_address, openbao_user, secret_files_root_owner,
 # the token lifetimes and openbao_client_service (the service whose role reads the one path of the AIStor project user's sign-in). The task is hidden: it handles
 # secret IDs and passwords. The two tasks after it print what is safe to print, which an operator and the host check (tests/e2e/stack_openbao.py) read: the actions
-# that it took (an empty list on a run that changed nothing) and the count of unlisted roles, or the step's own refusal, which names a request by its method, its
-# path and its status. Nothing of a server's reply is in them but a validated Boolean, a status code and the name of a listed service. Any other failure of the
-# hidden task is not printed.
+# that it took (an empty list on a run that changed nothing) and the count of unlisted roles (or, when the role listing is refused, that the count is unavailable,
+# with the status), or the step's own refusal, which names a request by its method, its path and its status. Nothing of a server's reply is in them but a validated
+# Boolean, a status code and the name of a listed service. Any other failure of the hidden task is not printed.
 # Prints no secret.
 - name: Make OpenBao match the service list
   openbao_bootstrap:

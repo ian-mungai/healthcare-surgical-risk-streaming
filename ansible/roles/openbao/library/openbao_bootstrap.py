@@ -372,11 +372,12 @@ def apply(
         api.must("POST", f"secret/data/services/{service}/postgres", token, {"data": {"password": password}})
 
 
-def unlisted_role_count(api: Api, token: str, services: list[str]) -> int:
-    """How many roles the server holds that the service list does not. They are counted and never named."""
+def unlisted_role_count(api: Api, token: str, services: list[str]) -> int | str:
+    """How many roles the server holds that the service list does not. They are counted and never named. A listing that the server refuses gives no count: the
+    text says that it is unavailable, with the status."""
     status, document = api.call("GET", "auth/approle/role?list=true", token)
     if status != 200:
-        return 0
+        return f"unavailable (HTTP {status})"
     return len({key for key in listed_names(document, "GET auth/approle/role?list=true") if key != ADMIN_ROLE and key not in services})
 
 
