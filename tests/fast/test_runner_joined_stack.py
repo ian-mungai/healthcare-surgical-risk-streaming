@@ -25,6 +25,7 @@ from unittest import mock
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.stack.groups import LICENSED_SERVICES
 from scripts.stack.limits import load_limits
+from scripts.stack.spark_slot import SLOT_NAME
 from tests.fast.runner_import import ABSENT, E2E, import_runner, present
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -212,6 +213,11 @@ KAFKA_ROW = (KAFKA, "p2_join3_test-kafka-1", "512MiB / 1GiB")
 OPENBAO_ROW = (OPENBAO, "p2_join3_test-openbao-1", "64MiB / 1GiB")
 # What Docker CLI 29.9.3 prints for a running container whose first stats response timed out: no name and no figure.
 NAMELESS_ROW = (OPENBAO, "--", "-- / --")
+SPARK, UNLABELLED = ("e" * 64, "f" * 64)
+# The catalog proof's one-off: its container has the Spark slot's name, which does not start with the project's name.
+SPARK_ROW = (SPARK, SLOT_NAME, "512MiB / 4GiB")
+# The Compose service label of each listed container; an ID that is not here has no such label.
+SERVICE_LABELS = {KAFKA: "kafka", POSTGRES: "postgres", OPENBAO: "openbao", SPARK: "spark_maintenance"}
 
 
 class Sample:
@@ -224,10 +230,10 @@ class Sample:
 
 class Stats:
     """The Docker commands of the memory sampler. It answers the planted reads in their order, an exception being raised, and then complete samples. Each
-    row of ``docker stats`` is printed as the runner's own ``--format`` asks for it. ``answered`` is set at the first read after the planted ones, or at a held
-    one, when the sampler has finished each read before it."""
+    row of the listing and of ``docker stats`` is printed as the runner's own ``-q`` or ``--format`` asks for it. ``answered`` is set at the first read after
+    the planted ones, or at a held one, when the sampler has finished each read before it."""
 
-    LISTING = ["ps", "-q", "--no-trunc", "--filter", "label=com.docker.compose.project=p2_join3_test"]
+    LISTING = ["ps", "--no-trunc", "--filter", "label=com.docker.compose.project=p2_join3_test"]
 
     def __init__(self, *reads: Any) -> None:
         self.reads = list(reads)
@@ -242,22 +248,33 @@ class Stats:
     def sample(cls) -> Sample:
         return Sample(KAFKA_ROW)
 
-    def listing(self, listed: Any) -> CompletedProcess[str]:
+    def listing(self, listed: Any, template: str) -> CompletedProcess[str]:
         if isinstance(listed, BaseException):
             raise listed
         if isinstance(listed, CompletedProcess):
             return listed
-        return self.completed(0, "".join(f"{identifier}\n" for identifier in listed))
+        lines = []
+        for identifier in listed:
+            label = SERVICE_LABELS.get(identifier, "")
+            line = template.replace("{{.ID}}", identifier).replace('{{.Label "com.docker.compose.service"}}', label)
+            lines.append(f"{line}\n")
+        return self.completed(0, "".join(lines))
 
     def __call__(self, program: str, arguments: list[str], **_: object) -> CompletedProcess[str]:
-        if program == "docker" and arguments == self.LISTING:
+        words, template = list(arguments), "{{.ID}}"
+        if "--format" in words and words[0] == "ps":
+            at = words.index("--format")
+            template = words[at + 1]
+            del words[at : at + 2]
+        if program == "docker" and [word for word in words if word != "-q"] == self.LISTING:
             if self.after is not None:
                 listed, self.after = self.after, None
-                return self.listing(listed)
+                return self.listing(listed, template)
             upcoming = self.reads[0] if self.reads and isinstance(self.reads[0], Sample) else self.sample()
-            if isinstance(upcoming.before, (BaseException, CompletedProcess)):
-                self.reads.pop(0)  # a listing that fails ends its read before the stats command
-            return self.listing(upcoming.before)
+            failing = isinstance(upcoming.before, (BaseException, CompletedProcess))
+            if failing or any(identifier not in SERVICE_LABELS for identifier in upcoming.before):
+                self.reads.pop(0)  # a listing that fails, or names a container with no service label, ends its read before the stats command
+            return self.listing(upcoming.before, template)
         if (program, arguments[0]) != ("docker", "stats"):
             raise AssertionError("no other command of the computer runs in this test")
         self.after = None
@@ -481,6 +498,21 @@ class JoinedStackCleanup(unittest.TestCase):
                 Sample(KAFKA_ROW, NAMELESS_ROW, before=(KAFKA,), after=(KAFKA, OPENBAO)),
                 f"--: '-- / --' (container {OPENBAO[:12]})",
             ),
+            (
+                "a figure with a blank name for a running container",
+                Sample(KAFKA_ROW, (OPENBAO, "", "64MiB / 1GiB"), before=(KAFKA, OPENBAO)),
+                f": '64MiB / 1GiB' (container {OPENBAO[:12]})",
+            ),
+            (
+                "a listing before the read that names a container with no service label",
+                Sample(KAFKA_ROW, (UNLABELLED, SLOT_NAME, "64MiB / 1GiB"), before=(KAFKA, UNLABELLED)),
+                f"no Compose service label for the container {UNLABELLED[:12]}",
+            ),
+            (
+                "a listing after the read that names a container with no service label",
+                Sample(KAFKA_ROW, before=(KAFKA,), after=(KAFKA, UNLABELLED)),
+                f"no Compose service label for the container {UNLABELLED[:12]}",
+            ),
             ("no row for a running container", Sample(KAFKA_ROW, before=(KAFKA, OPENBAO)), f"no row for the running containers {OPENBAO[:12]}"),
             ("no row at all while a container runs", Sample(), f"no row for the running containers {KAFKA[:12]}"),
             (
@@ -512,6 +544,14 @@ class JoinedStackCleanup(unittest.TestCase):
         document = self.saved()
         self.assertEqual("", self.failed(document))
         self.assertEqual([{"kafka": 512.0}], [run.peaks for run in self.peaks_evaluated])
+        self.assertEqual([True], self.read_checks(document))
+
+    def test_a_valid_row_of_the_spark_slot_container_is_a_peak_of_its_compose_service(self) -> None:
+        spark = Sample(KAFKA_ROW, SPARK_ROW, before=(KAFKA, SPARK))
+        self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), spark, Stats.sample())))
+        document = self.saved()
+        self.assertEqual("", self.failed(document))
+        self.assertEqual([{"kafka": 512.0, "spark_maintenance": 512.0}], [run.peaks for run in self.peaks_evaluated])
         self.assertEqual([True], self.read_checks(document))
 
     def test_the_rows_of_containers_outside_the_project_are_ignored_whatever_their_names_and_figures(self) -> None:
