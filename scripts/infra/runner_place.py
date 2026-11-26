@@ -280,8 +280,10 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
     The probes (the .py files of PROBE_FOLDER) are followed on their own. Their imports must resolve in the same way, but only the packages that a probe names
     itself are asked of the lock files: the repository's modules that it imports run with the image's packages. A probe runs on its own, so a relative import
     in it is refused. Another probe of this call resolves by its bare name, for the probes only, against the text that is sent: a name that a probe takes from
-    it must be defined or imported at its top level, as must each name of its ``__all__`` for a star import of it, and it has no submodules. What a file for the
-    host reaches is checked in full, also when a probe of the same call reaches it too. A .yml file is not Python and has no imports."""
+    it must be defined or imported at its top level, and it has no submodules. A star import of it is accepted only when its one mention of ``__all__`` is a
+    plain top-level list or tuple of string literals and each entry is bound by an unconditional top-level ``def``, ``class``, plain assignment or import
+    (``star_problems``). What a file for the host reaches is checked in full, also when a probe of the same call reaches it too. A .yml file is not Python and
+    has no imports."""
     source = CommitSource(commit, root, env)
     locks = []
     for name in lock_files(source):

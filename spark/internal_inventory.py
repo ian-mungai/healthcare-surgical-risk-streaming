@@ -231,9 +231,10 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "main", "write_inventory",
     ),
     "scripts/infra/runner_imports.py": (
-        "Closure", "DiskSource", "OverlaySource", "Source", "absolute_module", "closure", "exported_names", "imported_names", "literal_all",
-        "locked_distributions", "module_file", "module_files", "normalized", "parsed", "read", "sibling_module", "sibling_problems", "star_names",
-        "star_problems", "target_names", "top_level_statements", "unlocked", "uses_dynamic_import",
+        "Closure", "DiskSource", "OverlaySource", "Source", "absolute_module", "all_mentions", "closure", "exported_names", "imported_names",
+        "locked_distributions", "module_file", "module_files", "normalized", "parsed", "plain_all", "plain_targets", "read", "sibling_module",
+        "sibling_problems", "star_names", "star_problems", "target_names", "top_level_statements", "unconditional_names", "unlocked",
+        "uses_dynamic_import",
     ),
     "scripts/infra/runner_place.py": (
         "CommitSource", "Placement", "__init__", "check_imports", "folder_step", "git_succeeds", "hashed_lines", "host_runners_place", "lock_files",

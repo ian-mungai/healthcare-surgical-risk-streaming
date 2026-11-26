@@ -149,30 +149,71 @@ def sibling_module(path: str) -> str:
     return path.removesuffix(".py").replace("/", ".")
 
 
-def literal_all(tree: ast.Module) -> set[str] | None:
-    """The names of a module's ``__all__`` when the module holds it as one list or tuple of strings, assigned directly at its top level, and names it nowhere
-    else; otherwise None."""
-    uses = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "__all__"]
-    values = [
-        node.value
-        for node in tree.body
-        if (isinstance(node, ast.Assign) and any(target in uses for target in node.targets)) or (isinstance(node, ast.AnnAssign) and node.target in uses)
-    ]
-    if len(uses) != 1 or len(values) != 1 or not isinstance(values[0], ast.List | ast.Tuple):
+def all_mentions(tree: ast.AST) -> int:
+    """How often any identifier or string of a syntax tree is ``__all__`` or a dotted name that starts with it, whatever construct holds it."""
+    values = (value for node in ast.walk(tree) for _, value in ast.iter_fields(node))
+    items = (item for value in values for item in (value if isinstance(value, list) else [value]))
+    return sum(isinstance(item, str) and item.split(".")[0] == "__all__" for item in items)
+
+
+def plain_all(tree: ast.AST | None) -> list[str] | None:
+    """The entries of a module's ``__all__`` when its one mention of that name is a plain top-level ``__all__ = [...]`` or ``(...)`` of string literals;
+    otherwise None."""
+    if not isinstance(tree, ast.Module) or all_mentions(tree) != 1:
         return None
-    listed = [element.value for element in values[0].elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
-    return set(listed) if len(listed) == len(values[0].elts) else None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "__all__":
+            if not isinstance(node.value, ast.List | ast.Tuple):
+                return None
+            listed = [element.value for element in node.value.elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+            return listed if len(listed) == len(node.value.elts) else None
+    return None
 
 
-def star_names(source: Source, path: str, seen: frozenset[str], siblings: Mapping[str, str]) -> tuple[set[str], bool]:
-    """The names that ``from <sibling> import *`` takes from the sibling at ``path``, and whether other names may exist: with an ``__all__``, the names that it
-    lists and the sibling holds; without one, each name without a leading underscore. An ``__all__`` that ``literal_all`` cannot read lists no name."""
-    names, open_ended = exported_names(source, sibling_module(path), seen, siblings)
-    if "__all__" not in names:
-        return {name for name in names if not name.startswith("_")}, open_ended
-    tree = parsed(source.read(path) or "", path)
-    listed = literal_all(tree) if isinstance(tree, ast.Module) else None
-    return (set(), True) if listed is None else (listed & names, open_ended)
+def plain_targets(target: ast.expr) -> set[str]:
+    """The bare names that the target of a plain assignment binds, also inside a tuple, a list or a starred item."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return plain_targets(target.value)
+    return set().union(*(plain_targets(item) for item in target.elts)) if isinstance(target, ast.Tuple | ast.List) else set()
+
+
+def unconditional_names(source: Source, tree: ast.Module, file: str, siblings: Mapping[str, str], seen: frozenset[str]) -> set[str]:
+    """The names that a probe binds by a statement of its own top level: a ``def``, a ``class``, a plain assignment or an import, less those that a later such
+    ``del`` removes. A binding inside any other statement and a walrus bind nothing here. A star import of a repository module gives every name of it."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names |= set().union(*(plain_targets(target) for target in node.targets))
+        elif isinstance(node, ast.Import):
+            names |= {alias.asname or alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+                    continue
+                target = absolute_module(file, node.level, node.module) if node.level else node.module
+                if not node.level and target and target in siblings:
+                    names |= star_names(source, siblings[target], siblings, seen)
+                elif target and target.split(".")[0] in FIRST_PARTY:
+                    names |= exported_names(source, target)[0] - {"__all__"}
+        elif isinstance(node, ast.Delete):
+            names -= set().union(*(target_names(target, ast.Del) for target in node.targets))
+    return names
+
+
+def star_names(source: Source, path: str, siblings: Mapping[str, str], seen: frozenset[str] = frozenset()) -> set[str]:
+    """The names that ``from <sibling> import *`` takes from the sibling at ``path``: the entries of its ``plain_all`` that it binds unconditionally, and none
+    when it has no such ``__all__``, because ``star_problems`` refuses that import. ``seen`` ends a read of probes that take from each other."""
+    text = source.read(path)
+    tree = parsed(text, path) if text is not None else None
+    listed = plain_all(tree)
+    if not isinstance(tree, ast.Module) or listed is None or path in seen:
+        return set()
+    return set(listed) & unconditional_names(source, tree, path, siblings, seen | {path})
 
 
 def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset(), siblings: Mapping[str, str] | None = None) -> tuple[set[str], bool]:
@@ -198,7 +239,7 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
                     continue
                 target = absolute_module(file, node.level, node.module) if node.level else node.module
                 if not node.level and target and target in siblings:
-                    more, wide = star_names(source, siblings[target], seen | {module}, siblings)
+                    more, wide = star_names(source, siblings[target], siblings), False
                 elif target and target.split(".")[0] in FIRST_PARTY:
                     more, wide = exported_names(source, target, seen | {module})
                 else:
@@ -222,20 +263,20 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
 
 
 def star_problems(source: Source, file: str, sibling: str, siblings: Mapping[str, str]) -> list[str]:
-    """One line for each reason why ``from <sibling> import *`` in ``file`` cannot be accepted. Python takes every name that the sibling's ``__all__`` lists
-    and fails at one that the sibling does not hold, so each listed name must be held, and an ``__all__`` that ``literal_all`` cannot read is refused. A
-    sibling without an ``__all__`` has nothing to check."""
+    """One line for each reason why ``from <sibling> import *`` in ``file`` is refused. It is accepted only when the sibling has a ``plain_all`` and binds each
+    entry of it unconditionally (``unconditional_names``). An entry is named by its position: its text is source text and is never shown."""
     path = siblings[sibling]
-    held = exported_names(source, sibling_module(path), siblings=siblings)[0]
-    if "__all__" not in held:
-        return []
-    tree = parsed(source.read(path) or "", path)
-    listed = literal_all(tree) if isinstance(tree, ast.Module) else None
-    if listed is None:
-        return [f"{file}: a star import of the probe {sibling} is refused: this check cannot read its __all__ as one list of names"]
+    text = source.read(path)
+    tree = parsed(text, path) if text is not None else None
+    refused = f"{file}: a star import of the probe {sibling} is refused:"
+    listed = plain_all(tree)
+    if not isinstance(tree, ast.Module) or listed is None:
+        return [f"{refused} it needs one __all__, a plain top-level list or tuple of string literals, and no other mention of that name"]
+    bound = unconditional_names(source, tree, path, siblings, frozenset({path}))
     return [
-        f"{file}: a star import of the probe {sibling} fails: its __all__ names {name}, which it does not hold at its top level"
-        for name in sorted(listed - held)
+        f"{refused} entry {position} of its __all__ is not bound by an unconditional top-level def, class, plain assignment or import"
+        for position, name in enumerate(listed, 1)
+        if name not in bound
     ]
 
 
