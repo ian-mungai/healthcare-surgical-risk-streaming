@@ -3,11 +3,9 @@
 # vulnerability's ID, the package URL with its version, the reason that no release can fix it in this image and the date. A finding of Docker Scout or of Trivy
 # passes only when each of its artifacts has an entry for its image (scripts/images/trivy_scan.py says how a Trivy finding names its artifact and package).
 # Add an entry only for such a finding, and remove it when a release holds the fix.
-findings: []
-# PENDING the owner's decision: the gate never reads this list, so none of these entries lets a push through. Move an entry to findings only when the owner accepts it.
-# Each date is the day the entry was written, not a day of acceptance. A scanner calls each of these fixable because the library has a fixed release; no newer
-# release of a jar that holds one of these copies has the fix.
-pending:
+# Accepted by the owner on Nov 26 2026 ("A"): every entry below is a library shaded inside the newest upstream Hadoop, Iceberg or Spark 4.1 jar,
+# with no upstream release that holds the fixed library. Each date is the day the entry was written; acceptance is Nov 26 2026.
+findings:
   - image: spark
     artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
     cve: CVE-2026-68494
@@ -266,3 +264,5 @@ pending:
     package: pkg:maven/org.jline/jline-remote-telnet@3.9.0
     reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 4.2.1."
     date: "2026-11-25"
+# PENDING the owner's decision: the gate never reads this list, so none of its entries lets a push through. Move an entry to findings only when the owner accepts it.
+pending: []
