@@ -10,8 +10,13 @@ Failure modes covered here:
 - A secret in the command line or the environment of such a container is not found, or the unlock key is allowed in another read than OpenBao's environment.
 - ``docker top`` fails, names no process or answers with something that is no process number, and the empty or partial read passes. A text that is no
   number reaches the host's shell.
-- A process of either listing that no read read passes: one that is gone, one that is there and cannot be read, or one that only the second listing names
-  and that is never read, so a secret in it is not searched. A process that no read reported is not read again.
+- A container passes with no one whole read of it that read every process of both its listings: one that is gone, one that is there and cannot be read, or
+  one that only the second listing names and that is never read, so a secret in it is not searched. A process that no read reported is not read again.
+  The reads of two attempts are added together.
+- A short-lived process, such as a health check, ends between a listing and its read and fails the whole sweep, because the container is not read again.
+  The attempts have no bound or no pause between them, the output of a failed attempt is not searched, the record does not say how many attempts each read
+  took or which processes stayed unread, or a read with no successful attempt leaves no failed command.
+- A paused container, whose processes cannot answer, counts as the running consumer of its service, or its processes are no longer searched.
 - Two containers of one Compose service (a one-off beside a retained one) are taken for one, so only one of them is inspected and its processes read. A
   retained stopped container, which has no process, fails the sweep or hides a service that has no running container. A line of the container listing that
   is not understood is dropped and the sweep passes.
@@ -25,10 +30,11 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest import mock
 
@@ -102,7 +108,7 @@ class FakeHost:
             if self.top_reply is not None:
                 code, listed = self.top_reply(container.removeprefix("id_"), call)
                 return code, listed, ""
-            if next(state for _, known, state in self.rows if known == container) != "running":
+            if next(state for _, known, state in self.rows if known == container) not in ("running", "paused", "restarting"):
                 return 1, "", "Error response from daemon: container is not running"
             return 0, "".join(f"{line}\n" for line in ["PID", *self.pids[container]]), ""
         if args[:2] == ["sh", "-c"] and len(args) > 5 and ('"$p/environ"' in args[2] or '"$p/cmdline"' in args[2]):
@@ -126,6 +132,22 @@ class HostCase(unittest.TestCase):
         self.module: ModuleType = import_runner("secret_sinks")
         self.tree = Path(tempfile.mkdtemp(prefix="secret_sinks_fake_proc_"))
         self.addCleanup(shutil.rmtree, self.tree)
+        self.pauses: list[float] = []
+        clock = mock.patch.object(self.module, "time", SimpleNamespace(sleep=self.pauses.append, monotonic=time.monotonic))
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def reset(self) -> None:
+        for entry in self.tree.iterdir():
+            shutil.rmtree(entry)
+        self.pauses.clear()
+
+    def deployed(self, **kwargs: Any) -> tuple[FakeHost, Any]:
+        host, stack = self.host()
+        host.process("101", "/usr/bin/loki -config.file=/etc/loki/config.yml", kwargs.get("loki_environment", "PATH=/usr/bin"))
+        host.process("201", kwargs.get("openbao_line", "bao server"), kwargs.get("openbao_environment", "HOME=/openbao"))
+        host.process("202")
+        return host, stack
 
     def host(self, **containers: list[str]) -> tuple[FakeHost, Any]:
         host = FakeHost(self.tree, containers or {SHELL_LESS: ["101"], "openbao": ["201", "202"]})
@@ -134,13 +156,6 @@ class HostCase(unittest.TestCase):
 
 
 class ContainerProcesses(HostCase):
-    def deployed(self, **kwargs: Any) -> tuple[FakeHost, Any]:
-        host, stack = self.host()
-        host.process("101", "/usr/bin/loki -config.file=/etc/loki/config.yml", kwargs.get("loki_environment", "PATH=/usr/bin"))
-        host.process("201", kwargs.get("openbao_line", "bao server"), kwargs.get("openbao_environment", "HOME=/openbao"))
-        host.process("202")
-        return host, stack
-
     def test_every_container_is_read_with_no_failure_and_none_is_entered(self) -> None:
         host, stack = self.deployed()
         sizes, failed = self.module.collect_host(stack)
@@ -179,7 +194,7 @@ class ContainerProcesses(HostCase):
                 self.assertEqual(stack.unlock_seen, not leaked)
 
     def read(self, stack: Any, service: str = SHELL_LESS) -> tuple[int, str]:
-        code, out = self.module.read_host_processes(stack, f"id_{service}", self.module.HOST_ENVIRONMENT_READ)
+        code, out = self.module.read_host_processes(stack, f"id_{service}", self.module.HOST_ENVIRONMENT_READ, label=service)
         return int(code), str(out)
 
     def test_a_listing_that_fails_or_is_no_list_of_process_numbers_fails_the_read_and_nothing_is_read(self) -> None:
@@ -197,17 +212,105 @@ class ContainerProcesses(HostCase):
         host.top_reply = lambda service, call: (0, "PID\n101\n") if call == 1 else (1, "")
         self.assertNotEqual(self.read(stack)[0], 0)
 
-    def test_a_process_that_is_gone_before_its_read_fails_the_read_whether_the_second_listing_still_names_it_or_not(self) -> None:
+    def test_a_process_that_no_attempt_can_read_fails_after_three_attempts_with_a_pause_between_them_and_is_named(self) -> None:
         for second in ("PID\n101\n102\n", "PID\n101\n"):
             with self.subTest(second=second):
-                for entry in self.tree.iterdir():
-                    shutil.rmtree(entry)
+                self.reset()
                 host, stack = self.host(loki=["101", "102"])
                 host.process("101", environment="KEPT=one")
-                host.top_reply = lambda service, call, second=second: (0, "PID\n101\n102\n" if call == 1 else second)
+                host.top_reply = lambda service, call, second=second: (0, "PID\n101\n102\n" if call % 2 else second)
                 code, out = self.read(stack)
                 self.assertNotEqual(code, 0)
                 self.assertIn("KEPT=one", out)
+                self.assertEqual((stack.attempts, stack.unread), ({"loki": 3}, {"loki": ["102"]}))
+                self.assertEqual((len(self.pauses), len(set(self.pauses)), self.pauses[0] > 0), (2, 1, True))
+                self.assertEqual(len(stack.failures), 1)
+
+    def test_a_short_lived_process_that_ends_before_its_read_is_covered_by_a_second_whole_attempt(self) -> None:
+        host, stack = self.host(loki=["101", "102"])
+        host.process("101", environment="KEPT=one")
+        host.top_reply = lambda service, call: (0, "PID\n101\n102\n" if call <= 2 else "PID\n101\n")
+        code, out = self.read(stack)
+        self.assertEqual((code, out.count("KEPT=one")), (0, 1))
+        self.assertEqual((stack.attempts, stack.unread, stack.failures, len(self.pauses)), ({"loki": 2}, {}, [], 1))
+
+    def test_a_read_that_succeeds_at_once_takes_one_attempt_and_no_pause(self) -> None:
+        host, stack = self.host(loki=["101"])
+        host.process("101")
+        self.assertEqual(self.read(stack)[0], 0)
+        self.assertEqual((stack.attempts, stack.unread, self.pauses), ({"loki": 1}, {}, []))
+
+    def test_the_reads_of_two_attempts_are_never_added_together(self) -> None:
+        host, stack = self.host(loki=["101", "102"])
+        host.process("101")
+        host.process("102")
+        reads = 0
+        original = host.capture
+
+        def one_unreported(args: list[str], **options: Any) -> tuple[int, str, str]:
+            nonlocal reads
+            if args[:2] == ["sh", "-c"]:
+                host.silent = {"101" if (reads // 2) % 2 else "102"}
+                reads += 1
+            return original(args, **options)
+
+        host.capture = one_unreported  # type: ignore[method-assign]
+        self.assertNotEqual(self.read(stack)[0], 0)
+        self.assertEqual(stack.attempts, {"loki": 3})
+
+    def test_a_secret_that_only_a_failed_attempt_read_is_found(self) -> None:
+        marker = Marker("canary", make_marker("urlsafe").value)
+        host, stack = self.host(loki=["101"])
+        host.process("101")
+        host.process("103", environment=f"ONCE={marker.value}")
+        host.top_reply = lambda service, call: (0, "PID\n101\n102\n103\n" if call <= 2 else "PID\n101\n")
+        stack.markers.append(marker)
+        code, out = self.read(stack)
+        self.assertEqual((code, "ONCE=" in out, stack.attempts), (0, False, {"loki": 2}))
+        self.assertTrue(any("canary" in leak for leak in stack.leaks))
+        stack.rescan()
+        self.assertTrue(any("canary" in leak for leak in stack.leaks))
+
+    def test_a_listing_or_a_read_that_fails_once_is_covered_by_the_next_attempt_and_leaves_no_failed_command(self) -> None:
+        host, stack = self.host(loki=["101"])
+        host.process("101")
+        host.top_reply = lambda service, call: (1, "") if call == 1 else (0, "PID\n101\n")
+        self.assertEqual(self.read(stack)[0], 0)
+        self.assertEqual((stack.attempts, stack.failures), ({"loki": 2}, []))
+
+    def test_a_listing_that_never_works_names_no_process_and_leaves_a_failed_command(self) -> None:
+        host, stack = self.host(loki=["101"])
+        host.top_reply = lambda service, call: (1, "")
+        self.assertNotEqual(self.read(stack)[0], 0)
+        self.assertEqual((stack.attempts, stack.unread, len(stack.failures)), ({"loki": 3}, {"loki": ["no usable listing"]}, 1))
+
+    def test_the_sweep_counts_the_attempts_of_every_read_by_its_container(self) -> None:
+        _, stack = self.deployed()
+        self.module.collect_host(stack)
+        labels = {f"{read} of {service}" for read in ("command lines", "environment") for service in (SHELL_LESS, "openbao")}
+        self.assertEqual(stack.attempts, dict.fromkeys(labels, 1))
+
+    def test_the_record_of_the_sweep_gives_the_attempts_and_names_the_unread_processes(self) -> None:
+        host, _ = self.host(loki=["101"])
+        host.process("101")
+        host.top_reply = lambda service, call: (0, "PID\n101\n102\n")
+        host.configuration = {"AWS_PROFILE": "p", "AWS_REGION": "r", "ENVIRONMENT": "dev"}  # type: ignore[attr-defined]
+        record = Record(feature="x", slug="x", rerun="x")
+        binding = SimpleNamespace(run_id="run", bucket="bucket", state_keys=[], region="r")
+        with (
+            mock.patch.object(self.module, "Remote", lambda: host),
+            mock.patch.object(self.module, "inventory_case"),
+            mock.patch.object(self.module, "HostValues", return_value=SimpleNamespace(secret_files=dict)),
+            mock.patch.object(self.module, "learn_project_key"),
+            mock.patch.object(self.module, "load_run", return_value=binding),
+            mock.patch.object(self.module, "archive_text", return_value=[]),
+            mock.patch.object(self.module, "read_state_objects", return_value=([], [])),
+        ):
+            self.module.run_host_sweep(record, [])
+        sinks = next(item for item in record.observations if item.case == "host sinks")
+        self.assertFalse(sinks.passed)
+        self.assertIn("'environment of loki': 3", sinks.observed)
+        self.assertIn("unread processes: {'command lines of loki': ['102'], 'environment of loki': ['102']}", sinks.observed)
 
     def test_a_process_that_only_the_second_listing_names_is_read_and_its_secret_is_found(self) -> None:
         marker = Marker("canary", make_marker("urlsafe").value)
@@ -351,6 +454,29 @@ class ContainersByID(HostCase):
                 host, stack = self.twins()
                 host.health_by_id = {sick: "unhealthy"}
                 self.assertEqual(self.unhealthy(stack), [label])
+
+    def test_a_paused_or_restarting_container_is_not_ready_even_when_docker_still_calls_it_healthy(self) -> None:
+        for state in ("paused", "restarting"):
+            with self.subTest(state=state):
+                self.reset()
+                host, stack = self.host(grafana=["301"])
+                host.rows = [("grafana", "id_grafana", state)]
+                self.assertEqual(self.unhealthy(stack), ["grafana", "grafana: no running container"])
+
+    def test_a_paused_container_beside_a_healthy_running_one_is_still_not_ready(self) -> None:
+        host, stack = self.twins()
+        host.rows[1] = ("spark_bronze", "id_later", "paused")
+        self.assertEqual(self.unhealthy(stack), ["spark_bronze (container 2)"])
+
+    def test_the_processes_of_a_paused_container_are_still_read_and_searched(self) -> None:
+        marker = Marker("canary", make_marker("urlsafe").value)
+        host, stack = self.host(grafana=["301"])
+        host.process("301", environment=f"A={marker.value}")
+        host.rows = [("grafana", "id_grafana", "paused")]
+        stack.markers.append(marker)
+        _, failed = self.module.collect_host(stack)
+        self.assertEqual((failed, stack.stopped), ([], []))
+        self.assertTrue(any("canary" in leak for leak in stack.leaks))
 
     def test_a_service_with_no_running_container_is_not_up(self) -> None:
         host, stack = self.host(grafana=["301"])
