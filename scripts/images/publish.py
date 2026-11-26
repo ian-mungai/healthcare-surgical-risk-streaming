@@ -19,8 +19,9 @@ written it. The command takes no lock. Trigger to revisit: more than one person 
 Scan gate: every image that the run builds is scanned with Docker Scout (``scripts.images.scan``) and with the pinned Trivy and its pinned databases
 (``scripts.images.trivy_scan``) before any image is pushed. One finding of either scanner that the committed list ``image_scan/accepted_findings.yml`` does
 not name, in any of the images, refuses the whole push, and so does a scan that fails or writes no complete report. The refusal names each such finding of
-each image and the scanner that reported it. An image to build needs the pinned databases (``make trivy-db``) before its build. An image whose tag the pin
-file already holds is not pushed and is not scanned again, so a finding published after its push shows only at a scan run by hand or when its sources change.
+each image and the scanner that reported it. An image to build needs the pinned databases (``make trivy-db``) before its build, and their files are checked
+again before its Trivy scan. An image whose tag the pin file already holds is not pushed and is not scanned again, so a finding published after its push shows
+only at a scan run by hand or when its sources change.
 
 The command relies on the ``docker login`` that this computer already has, which Docker Scout uses too. It reads, prints and writes no token, and every
 message is fixed text: no output of Docker, Trivy or Git is ever shown. The one exception is a refused finding's vulnerability ID, package URL and artifact
@@ -217,7 +218,10 @@ def scout_findings(settings: Settings, name: str, tag: str, scratch: Path) -> fr
 
 
 def trivy_findings(settings: Settings, name: str, tag: str, databases: Path, scratch: Path) -> frozenset[scan.Finding]:
-    """Scan the built image with Trivy and the pinned databases in ``databases`` into a new report and return its findings."""
+    """Scan the built image with Trivy and the pinned databases in ``databases`` into a new report and return its findings. The databases are checked here,
+    just before the scan, because a build can take long and a damaged file would give a clean report."""
+    if not trivy_scan.intact(databases):
+        raise PublishError(f"{name}: a pinned Trivy database file is not as its download wrote it: run make trivy-db")
     work = trivy_scan.workspace(scratch / f"{name}.trivy")
     report = scratch / f"{name}.trivy.json"
     try:

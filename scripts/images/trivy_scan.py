@@ -12,25 +12,27 @@ A finding is matched to ``image_scan/accepted_findings.yml`` in the same way as 
 - A library file that Trivy names (``PkgPath``) is the artifact, with a leading slash. A library that is shaded into a jar is at the jar, which is also the
   artifact of Docker Scout. A path that goes further into a jar stays whole, so an entry for the outer jar never covers it.
 - A Go or Rust program file is its own result, and that file is the artifact.
-- An operating system package has no path: its artifact is the package database of the system (``/var/lib/dpkg/status``), which Docker Scout names too. Its
-  package URL is Trivy's: the binary package, with the epoch in the version as Docker Scout writes it. Docker Scout names the source package instead, so one
-  entry covers both only where the two have the same name and version, and only for that artifact.
-- A library with no path, which is how Trivy reports a package that it reads from an SBOM file in the image, has no artifact that an entry could name, so no
-  entry ever accepts it.
+- Every other finding without a path has no artifact that an entry could name, so no entry ever accepts it. Two kinds have none: an operating system package,
+  and a library that Trivy reads from an SBOM file in the image. The package URL of an operating system package is Trivy's: the binary package, with the epoch
+  in the version as Docker Scout writes it.
 
 Everything that is not a complete report of the pinned Trivy for the scanned image is refused, as in ``scripts.images.scan``: a key held twice, a number that
 standard JSON does not have, another tool or version, another image, an exit status other than 0, an operating system that was not detected, is not
-supported or is past its end of life, and a result without its list of packages. Only an ID, a package URL and an artifact path in their forms are shown.
+supported or is past its end of life, and a result without its list of packages, each of which is a mapping with its name. Only an ID, a package URL and an
+artifact path in their forms are shown.
 
 The vulnerability database and the Java database (which names jars without their own metadata) are pinned by digest in
 ``image_scan/trivy_databases.yml``, so the same pins give the same findings. ``make trivy-db`` (``python -m scripts.images.trivy_scan``) downloads both into
-a new folder under ``.tools/trivy_db`` that is named after those digests, writes the file ``complete`` in it after the last download and does nothing when
-such a folder is there. A folder without that file is never read. A pinned database holds nothing published after its date: refresh the pins as the README
-says. Docker Scout is not pinned.
+a new folder under ``.tools/trivy_db`` that is named after those digests, and writes the file ``complete`` in it after the last download, with the size and the
+SHA-256 of each database file. Trivy reads a damaged Java database as one without findings, so a folder is read only while each file has the recorded nonzero
+size and SHA-256. The publisher checks this before each build and again before each Trivy scan, and ``make trivy-db`` does nothing only when such a folder is
+there. The record shows what the download wrote, not that the registry's content was whole: the pinned digest and the exit status of Trivy stand for that. A
+pinned database holds nothing published after its date: refresh the pins as the README says. Docker Scout is not pinned.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -58,7 +60,7 @@ DATABASE_FILES = ("db/trivy.db", "db/metadata.json", "java-db/trivy-java.db", "j
 COMPLETE = "complete"
 REFERENCE = re.compile(r"[a-z0-9.-]+(?::[0-9]+)?(?:/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}")
 DOWNLOAD_SECONDS = 1800
-OS_DATABASES = {"debian": "/var/lib/dpkg/status", "ubuntu": "/var/lib/dpkg/status"}
+OS_FAMILIES = ("debian", "ubuntu")
 # Trivy gives each program file of these types its own result, named by the file's path.
 FILE_TARGETS = {"gobinary", "rustbinary"}
 NO_PATH = "(no path in Trivy's report)"
@@ -90,23 +92,43 @@ def folder_prefix(databases: Databases) -> str:
     return "_".join(reference.rpartition(":")[2][:16] for reference in (databases.db, databases.java_db)) + "."
 
 
-def holds(folder: Path, names: Sequence[str]) -> bool:
-    return all((folder / name).is_file() for name in names)
+def written(folder: Path) -> bool:
+    """Whether ``folder`` holds every database file, none of them empty."""
+    return all((folder / name).is_file() and (folder / name).stat().st_size > 0 for name in DATABASE_FILES)
+
+
+def file_record(path: Path) -> dict[str, object]:
+    with path.open("rb") as file:
+        return {"size": path.stat().st_size, "sha256": hashlib.file_digest(file, "sha256").hexdigest()}
+
+
+def intact(folder: Path) -> bool:
+    """Whether the download of ``folder`` completed and each database file still has the nonzero size and the SHA-256 that the mark records. The files are
+    hashed only after every size matches. A mark or a file that cannot be read is not intact."""
+    try:
+        recorded = json.loads((folder / COMPLETE).read_text(), object_pairs_hook=unique_keys)
+        if not (isinstance(recorded, dict) and set(recorded) == set(DATABASE_FILES) and written(folder)):
+            return False
+        if not all(isinstance(value, dict) and value.get("size") == (folder / name).stat().st_size for name, value in recorded.items()):
+            return False
+        return all(file_record(folder / name) == value for name, value in recorded.items())
+    except OSError, ValueError, RecursionError:
+        return False
 
 
 def downloaded_folder(cache: Path, databases: Databases) -> Path | None:
-    """A folder of these pins whose download completed, or None."""
+    """A folder of these pins whose download completed and whose files are intact, or None."""
     try:
         folders = list_folder(cache, f"{folder_prefix(databases)}*")
     except OSError as error:
         raise ScanError("the Trivy database cache cannot be read") from error
-    return next((folder for folder in folders if holds(folder, (*DATABASE_FILES, COMPLETE))), None)
+    return next((folder for folder in folders if intact(folder)), None)
 
 
 def require_databases(cache: Path, databases: Databases) -> Path:
     folder = downloaded_folder(cache, databases)
     if folder is None:
-        raise ScanError("the pinned Trivy databases are not downloaded: run make trivy-db")
+        raise ScanError("the pinned Trivy databases are not downloaded, or a file is not as its download wrote it: run make trivy-db")
     return folder
 
 
@@ -165,7 +187,7 @@ def run_trivy(trivy: str, arguments: Sequence[str], work: Path, seconds: int, la
 
 
 def download(trivy: str, folder: Path, databases: Databases) -> None:
-    """Download both databases into ``folder``, and mark it complete only when every file is there."""
+    """Download both databases into ``folder``, and mark it complete only when every file is there and not empty, with the record of each file."""
     downloads = (("--download-db-only", "--db-repository", databases.db), ("--download-java-db-only", "--java-db-repository", databases.java_db))
     with tempfile.TemporaryDirectory(prefix="trivy_") as scratch:
         work = workspace(Path(scratch) / "work")
@@ -175,13 +197,13 @@ def download(trivy: str, folder: Path, databases: Databases) -> None:
             status = run_trivy(trivy, arguments, work, DOWNLOAD_SECONDS, "the download of a Trivy database")
             if status != 0:
                 raise ScanError(f"the download of a Trivy database failed with the exit status {status} of trivy")
-    if not holds(folder, DATABASE_FILES):
+    if not written(folder):
         raise ScanError("the download of the Trivy databases did not write every database file")
-    write_new_file(folder / COMPLETE, "")
+    write_new_file(folder / COMPLETE, json.dumps({name: file_record(folder / name) for name in DATABASE_FILES}))
 
 
 def fetch_databases(trivy: str, cache: Path, databases: Databases) -> bool:
-    """Download both pinned databases into a new folder under ``cache``, and return False when a complete one is there. A download that fails or is
+    """Download both pinned databases into a new folder under ``cache``, and return False when an intact one is there. A download that fails or is
     interrupted removes its folder."""
     if downloaded_folder(cache, databases) is not None:
         return False
@@ -217,7 +239,7 @@ def absolute(path: object) -> str:
     return checked_artifact(f"/{path}")
 
 
-def reported(kind: str, type_: str, target: str, family: str, value: Any) -> Finding:
+def reported(kind: str, type_: str, target: str, value: Any) -> Finding:
     try:
         cve, purl = value["VulnerabilityID"], value["PkgIdentifier"]["PURL"]
     except (KeyError, TypeError) as error:
@@ -226,7 +248,7 @@ def reported(kind: str, type_: str, target: str, family: str, value: Any) -> Fin
     if kind == "os-pkgs":
         if "PkgPath" in value:
             raise ScanError("an operating system package gives a path, which the pinned Trivy does not write")
-        artifact = OS_DATABASES[family]
+        artifact = NO_PATH
     elif "PkgPath" in value:
         artifact = absolute(value["PkgPath"])
     elif type_ in FILE_TARGETS:
@@ -240,7 +262,8 @@ def os_family(metadata: Any) -> str:
     found = metadata.get("OS") if isinstance(metadata, dict) else None
     if not (
         isinstance(found, dict)
-        and found.get("Family") in OS_DATABASES
+        and isinstance(found.get("Family"), str)
+        and found["Family"] in OS_FAMILIES
         and isinstance(found.get("Name"), str)
         and found["Name"]
         and found.get("EOSL", False) is False
@@ -262,6 +285,7 @@ def checked_result(value: Any) -> tuple[str, str, str, list[Any]]:
         and isinstance(target, str)
         and isinstance(packages, list)
         and packages
+        and all(isinstance(package, dict) and isinstance(package.get("Name"), str) and package["Name"] for package in packages)
         and isinstance(found, list)
     ):
         raise ScanError("a result of the report is not a list of checked packages and their vulnerabilities")
@@ -286,7 +310,7 @@ def read_report(text: str, exit_status: object, tag: str) -> frozenset[Finding]:
     checked_results = [checked_result(value) for value in results]
     if [type_ for kind, type_, _, _ in checked_results if kind == "os-pkgs"] != [family]:
         raise ScanError("the report does not hold exactly one result of the packages of the operating system")
-    return frozenset(reported(kind, type_, target, family, value) for kind, type_, target, found in checked_results for value in found)
+    return frozenset(reported(kind, type_, target, value) for kind, type_, target, found in checked_results for value in found)
 
 
 def main(argv: Sequence[str] | None = None, trivy: str = str(install_tools.TRIVY.path), cache: Path = CACHE, database_file: Path = DATABASE_FILE) -> int:

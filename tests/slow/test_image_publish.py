@@ -9,6 +9,7 @@ writes the report that a case planted for the image, or a report with no finding
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -47,6 +48,8 @@ if args[:2] == ["buildx", "build"]:
     paths = [args[-1]] + [a.split("=", 2)[2] for a in args if a.startswith("--build-context=")]
     with (here / "contexts.log").open("a") as out:
         out.write(json.dumps({{"paths": {{p: files(p) for p in paths}}, "args": args}}) + "\\n")
+    if (here / "build_empties").exists():
+        Path((here / "build_empties").read_text()).write_bytes(b"")
     sys.exit(0)
 if args[:2] == ["scout", "cves"]:
     image = args[-1].rsplit(":", 1)[1].split("-")[0]
@@ -136,8 +139,6 @@ IMAGES = [
 
 
 def digest_of(tag: str) -> str:
-    import hashlib
-
     return "sha256:" + hashlib.sha256(tag.encode()).hexdigest()
 
 
@@ -171,9 +172,12 @@ class Case(unittest.TestCase):
         self.database_file.write_text(DB_PINS)
         self.cache = base / "trivy_cache"
         self.databases = self.cache / (trivy_scan.folder_prefix(trivy_scan.load_databases(self.database_file)) + "fixture")
-        for relative in (*trivy_scan.DATABASE_FILES, trivy_scan.COMPLETE):
+        record = {}
+        for relative in trivy_scan.DATABASE_FILES:
             (self.databases / relative).parent.mkdir(parents=True, exist_ok=True)
             (self.databases / relative).write_text("{}")
+            record[relative] = {"size": 2, "sha256": hashlib.sha256(b"{}").hexdigest()}
+        (self.databases / trivy_scan.COMPLETE).write_text(json.dumps(record))
         self.git("init", "--quiet", "--initial-branch", "main")
         self.git("config", "user.name", "Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
@@ -603,6 +607,26 @@ class ScanGateTest(Case):
                 self.assertIn("run make trivy-db", str(self.refusal()))
                 self.assertEqual([], self.calls())
                 path.write_text(content)
+
+    def test_a_database_file_that_is_emptied_during_the_build_stops_the_command_before_trivy_scans(self) -> None:
+        (self.bin / "build_empties").write_text(str(self.databases / "java-db" / "trivy-java.db"))
+        self.assertIn("run make trivy-db", str(self.refusal()))
+        self.assertEqual([], [line for line in self.calls() if line.startswith("trivy ")])
+        self.assert_nothing_pushed_or_pinned()
+
+    def test_a_trivy_report_with_a_null_package_record_or_an_os_family_that_is_a_list_pushes_nothing(self) -> None:
+        clean = {"SchemaVersion": 2, "Trivy": {"Version": "0.76.2"}, "ArtifactName": "TAG", "ArtifactType": "container_image"}
+        listed = {"Target": "TAG (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Packages": [{"Name": "base"}]}
+        debian = {"OS": {"Family": "debian", "Name": "13.7"}}
+        cases = (
+            ({**clean, "Metadata": debian, "Results": [{**listed, "Packages": [None]}]}, "list of checked packages"),
+            ({**clean, "Metadata": {"OS": {"Family": ["debian"], "Name": "13.7"}}, "Results": [listed]}, "operating system"),
+        )
+        for document, message in cases:
+            with self.subTest(case=message):
+                (self.bin / "trivy_report_tool").write_text(json.dumps(document))
+                self.assertIn(message, str(self.refusal()))
+                self.assert_nothing_pushed_or_pinned()
 
     def test_new_pins_ask_for_their_own_download_and_unreadable_pins_stop_the_command_before_any_docker_call(self) -> None:
         self.database_file.write_text(DB_PINS.replace("1" * 64, "3" * 64))

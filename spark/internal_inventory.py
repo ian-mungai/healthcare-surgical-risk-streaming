@@ -208,9 +208,9 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "refused_constant", "reported", "require_exit_zero", "require_success", "scan_arguments", "shown", "unaccepted", "unique_keys",
     ),
     "scripts/images/trivy_scan.py": (
-        "Databases", "absolute", "checked_result", "clean_environment", "download", "downloaded_folder", "fetch_databases", "folder_prefix", "holds",
-        "load_databases", "main", "os_family", "own_files", "package_url", "read_report", "reported", "require_databases", "run_trivy",
-        "scan_arguments", "workspace",
+        "Databases", "absolute", "checked_result", "clean_environment", "download", "downloaded_folder", "fetch_databases", "file_record",
+        "folder_prefix", "intact", "load_databases", "main", "os_family", "own_files", "package_url", "read_report", "reported", "require_databases",
+        "run_trivy", "scan_arguments", "workspace", "written",
     ),
     "scripts/infra/__init__.py": (),
     "scripts/infra/aistor_licence.py": (

@@ -5,7 +5,9 @@ The reports here are fixtures in the shape that the pinned Trivy writes (real re
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,9 +84,11 @@ class ReportTest(unittest.TestCase):
         (found,) = read(report(os_result(), result("lang-pkgs", "jar", "Java", vulnerability(path=inside))))
         self.assertEqual(("/" + inside,), found.artifacts)
 
-    def test_an_os_package_is_a_finding_at_the_dpkg_database_with_its_own_binary_package_url_and_its_epoch_in_the_version(self) -> None:
+    def test_an_os_package_has_no_reported_path_so_no_entry_accepts_it_and_it_keeps_its_binary_package_url_with_the_epoch_in_the_version(self) -> None:
         (found,) = read(report(os_result(vulnerability(purl=DEBIAN_WITH_EPOCH, path=None))))
-        self.assertEqual(Finding("CVE-2026-1111", "pkg:deb/debian/passwd@1:4.17.4-2+b1", ("/var/lib/dpkg/status",)), found)
+        self.assertEqual(Finding("CVE-2026-1111", "pkg:deb/debian/passwd@1:4.17.4-2+b1", (trivy_scan.NO_PATH,)), found)
+        dpkg = frozenset({Accepted("spark", "/var/lib/dpkg/status", "CVE-2026-1111", found.package)})
+        self.assertEqual([found], scan.unaccepted("spark", frozenset({found}), dpkg))
 
     def test_an_os_package_without_an_epoch_keeps_its_version(self) -> None:
         (found,) = read(report(os_result(vulnerability(purl="pkg:deb/debian/adduser@3.152?arch=all&distro=debian-13.7", path=None))))
@@ -166,6 +170,9 @@ class RefusalTest(unittest.TestCase):
             "no name": {"Family": "debian"},
             "an empty name": {"Family": "debian", "Name": ""},
             "another family": {"Family": "alpine", "Name": "3.20"},
+            "a family that is a list": {"Family": ["debian"], "Name": "13.7"},
+            "a family that is a mapping": {"Family": {"debian": "13"}, "Name": "13.7"},
+            "a family that is a number": {"Family": 13, "Name": "13.7"},
             "end of life": {"Family": "debian", "Name": "13.7", "EOSL": True},
             "an end of life that is not true or false": {"Family": "debian", "Name": "13.7", "EOSL": "true"},
         }
@@ -193,6 +200,26 @@ class RefusalTest(unittest.TestCase):
         for name, results in cases.items():
             with self.subTest(case=name):
                 self.refused(json.dumps({**report(), "Results": results}))
+
+    def test_a_package_record_that_is_not_a_mapping_with_a_name_refuses_the_report_in_fixed_text(self) -> None:
+        cases: dict[str, Any] = {
+            "null": None,
+            "text": "forged",
+            "a number": 7,
+            "a list": ["forged"],
+            "an empty mapping": {},
+            "no name": {"Version": "forged"},
+            "an empty name": {"Name": ""},
+            "a name that is a number": {"Name": 7},
+            "a name that is null": {"Name": None},
+        }
+        for name, record in cases.items():
+            for packages in ([record], [{"Name": "a-package"}, record]):
+                for results in ([{**os_result(), "Packages": packages}], [os_result(), {**result(), "Packages": packages}]):
+                    with self.subTest(case=name, records=len(packages), results=len(results)):
+                        with self.assertRaisesRegex(ScanError, "list of checked packages") as raised:
+                            read({**report(), "Results": results})
+                        self.assertNotIn("forged", str(raised.exception))
 
     def test_a_vulnerability_that_does_not_name_its_id_package_and_artifact_in_their_forms_refuses_the_report_and_is_never_shown(self) -> None:
         def library(**more: object) -> dict[str, Any]:
@@ -333,23 +360,114 @@ class DatabasePinTest(unittest.TestCase):
             with self.assertRaisesRegex(ScanError, "cache cannot be read"):
                 trivy_scan.require_databases(cache, pinned)
 
-    def test_only_a_folder_of_the_pins_that_holds_every_file_and_the_mark_of_a_complete_download_is_read(self) -> None:
-        pinned = trivy_scan.Databases(f"r/db@sha256:{DIGEST}", f"r/java@sha256:{DIGEST}")
-        with tempfile.TemporaryDirectory(prefix="databases_") as scratch:
-            cache = Path(scratch)
-            ready = (*trivy_scan.DATABASE_FILES, trivy_scan.COMPLETE)
-            for position, missing in enumerate((*ready, None)):
-                folder = cache / f"{trivy_scan.folder_prefix(pinned)}{position}"
-                for name in ready:
-                    if name != missing:
-                        (folder / name).parent.mkdir(parents=True, exist_ok=True)
-                        (folder / name).write_text("x")
-                with self.subTest(missing=missing):
-                    if missing is None:
-                        self.assertEqual(folder, trivy_scan.require_databases(cache, pinned))
+
+def synthetic_download(trivy: str, arguments: list[str], work: Path, seconds: int, label: str) -> int:
+    """In place of ``run_trivy``: write the two files of the database that the arguments ask for."""
+    cache = Path(next(argument for argument in arguments if argument.startswith("--cache-dir=")).partition("=")[2])
+    folder, name = ("java-db", "trivy-java.db") if "--download-java-db-only" in arguments else ("db", "trivy.db")
+    (cache / folder).mkdir(parents=True, exist_ok=True)
+    (cache / folder / name).write_text(f"the {folder} database")
+    (cache / folder / "metadata.json").write_text("{}")
+    return 0
+
+
+class DownloadedFilesTest(unittest.TestCase):
+    PINNED = trivy_scan.Databases(f"r/db@sha256:{DIGEST}", f"r/java@sha256:{DIGEST}")
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="databases_")
+        self.addCleanup(scratch.cleanup)
+        self.cache = Path(scratch.name) / "cache"
+        stand_in = mock.patch.object(trivy_scan, "run_trivy", side_effect=synthetic_download)
+        self.download = stand_in.start()
+        self.addCleanup(stand_in.stop)
+
+    def fetch(self) -> bool:
+        return trivy_scan.fetch_databases("trivy", self.cache, self.PINNED)
+
+    def fetched(self) -> Path:
+        self.assertTrue(self.fetch())
+        return trivy_scan.require_databases(self.cache, self.PINNED)
+
+    def refused(self) -> None:
+        with self.assertRaisesRegex(ScanError, "run make trivy-db"):
+            trivy_scan.require_databases(self.cache, self.PINNED)
+
+    def test_the_mark_of_a_complete_download_records_the_size_and_the_sha256_of_each_database_file(self) -> None:
+        folder = self.fetched()
+        expected = {}
+        for name in trivy_scan.DATABASE_FILES:
+            content = (folder / name).read_bytes()
+            expected[name] = {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        self.assertEqual(expected, json.loads((folder / trivy_scan.COMPLETE).read_text()))
+
+    def test_a_database_file_that_is_missing_empty_shorter_or_changed_at_the_same_size_is_never_read_and_is_downloaded_again(self) -> None:
+        for name in trivy_scan.DATABASE_FILES:
+            folder = self.fetched()
+            path = folder / name
+            good = path.read_bytes()
+            changes = {"empty": b"", "shorter": good[:-1], "longer": good + b"x", "changed at the same size": bytes(len(good)), "missing": None}
+            for change, content in changes.items():
+                with self.subTest(file=name, change=change):
+                    if content is None:
+                        path.unlink()
                     else:
-                        with self.assertRaisesRegex(ScanError, "run make trivy-db"):
-                            trivy_scan.require_databases(cache, pinned)
+                        path.write_bytes(content)
+                    self.refused()
+                    path.write_bytes(good)
+                    self.assertEqual(folder, trivy_scan.require_databases(self.cache, self.PINNED))
+            path.write_bytes(b"")
+            calls = self.download.call_count
+            self.assertTrue(self.fetch(), "make trivy-db downloads again instead of reusing the damaged folder")
+            self.assertEqual(calls + 2, self.download.call_count)
+            self.assertNotEqual(folder, trivy_scan.require_databases(self.cache, self.PINNED))
+            for left in self.cache.iterdir():
+                shutil.rmtree(left)
+
+    def test_a_download_that_writes_an_empty_database_file_fails_and_leaves_no_folder(self) -> None:
+        def empty_java(trivy: str, arguments: list[str], work: Path, seconds: int, label: str) -> int:
+            synthetic_download(trivy, arguments, work, seconds, label)
+            for path in Path(next(a for a in arguments if a.startswith("--cache-dir=")).partition("=")[2]).glob("java-db/trivy-java.db"):
+                path.write_bytes(b"")
+            return 0
+
+        self.download.side_effect = empty_java
+        with self.assertRaisesRegex(ScanError, "every database file"):
+            self.fetch()
+        self.assertEqual([], list(self.cache.iterdir()))
+
+    def test_a_mark_that_does_not_record_a_nonzero_size_and_a_sha256_for_exactly_the_database_files_is_never_trusted(self) -> None:
+        folder = self.fetched()
+        mark = folder / trivy_scan.COMPLETE
+        good = json.loads(mark.read_text())
+        first = trivy_scan.DATABASE_FILES[2]
+        empty = {"size": 0, "sha256": hashlib.sha256(b"").hexdigest()}
+        cases: dict[str, str] = {
+            "empty, as an earlier download wrote it": "",
+            "not JSON": "{",
+            "a list": "[]",
+            "text": '"complete"',
+            "no file": "{}",
+            "a file less": json.dumps({name: value for name, value in good.items() if name != first}),
+            "a file more": json.dumps({**good, "other": good[first]}),
+            "a record that is a number": json.dumps({**good, first: 7}),
+            "no size": json.dumps({**good, first: {"sha256": good[first]["sha256"]}}),
+            "no sha256": json.dumps({**good, first: {"size": good[first]["size"]}}),
+            "the size as text": json.dumps({**good, first: {**good[first], "size": str(good[first]["size"])}}),
+            "a key twice": mark.read_text().replace("{", f'{{"{first}": 1, ', 1),
+            "nested too deep": "[" * 100_000,
+        }
+        for name, text in cases.items():
+            with self.subTest(mark=name):
+                mark.write_text(text)
+                self.refused()
+        with self.subTest(mark="an empty file recorded as empty"):
+            (folder / first).write_bytes(b"")
+            mark.write_text(json.dumps({**good, first: empty}))
+            self.refused()
+        with self.subTest(mark="bytes that are not UTF-8"):
+            mark.write_bytes(b"\xff\xfe")
+            self.refused()
 
 
 if __name__ == "__main__":
