@@ -2,11 +2,11 @@
 # An empty list means that nothing was pushed yet. The host's Compose settings (IMAGE_<NAME>) are rendered from this file.
 images:
   dagster:
-    tag: ianmungai/healthcare_surgical_risk_streaming:dagster-1.13.31-7713e29cfa6f
-    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:ea867977de0270746c47ab2e5ebdaba5aa635d6be6f5621e67dfa89db2171930
+    tag: ianmungai/healthcare_surgical_risk_streaming:dagster-1.13.31-8918dfd97c6e
+    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:7a848d1b6afd35a0c3c7e18ed3aa36b5bc1ea52e9fd833ddc181ebd74fd7f30b
   replay:
-    tag: ianmungai/healthcare_surgical_risk_streaming:replay-1.7.2-36324f7a10d0
-    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:57e13687fee403eacd8e77c4272c2d81c38ca75ddaddfea22ce18088ee0bbc01
+    tag: ianmungai/healthcare_surgical_risk_streaming:replay-1.7.2-c9f2f12ea785
+    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:e31f7f3512a397ab5c3d429f01844c27af3d6b75ecee6cb38d4666445c4ce3b6
   spark:
-    tag: ianmungai/healthcare_surgical_risk_streaming:spark-4.1.4-a643a7be1afa
-    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:aa8ad3acdf45ebbe87e1463c6e165b970de0540d9d62d39983baef2d204a170c
+    tag: ianmungai/healthcare_surgical_risk_streaming:spark-4.1.4-fcef17ce5b97
+    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:c992015c9cc8c575fa5b312e46ed75b24a95161a3d4ed71bae819aa2e1509d57
