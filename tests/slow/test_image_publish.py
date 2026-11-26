@@ -545,6 +545,18 @@ class ScanGateTest(Case):
         self.assertIn("tool: the scan report holds a key twice in one object", str(self.refusal()))
         self.assert_nothing_pushed_or_pinned()
 
+    def test_a_clean_report_that_holds_a_constant_that_standard_json_does_not_have_pushes_nothing(self) -> None:
+        self.plant_report("tool", [])
+        path = self.bin / "report_tool"
+        text = path.read_text()
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                changed = text.replace('"results": []', f'"results": [], "score": {constant}')
+                self.assertNotEqual(text, changed)
+                path.write_text(changed)
+                self.assertIn("tool: the scan report holds a number that is not standard JSON", str(self.refusal()))
+                self.assert_nothing_pushed_or_pinned()
+
     def test_an_unreadable_accepted_list_stops_the_command_before_any_docker_call(self) -> None:
         self.accepted_file.write_text("findings:\n")
         self.refusal()

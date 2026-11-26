@@ -188,6 +188,23 @@ class CompletionTest(unittest.TestCase):
                     self.refused(stated(report(*results), invocations))
         self.assertEqual(frozenset(), read(stated(report(), [good, good])))
 
+    def test_a_constant_that_standard_json_does_not_have_refuses_the_report_wherever_it_stands(self) -> None:
+        whole = json.dumps(report(result()))
+        invoked = stated(report(), [{"executionSuccessful": True}])
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            cases = {
+                "a property of the report": whole.replace('"version": "2.1.0", ', f'"version": "2.1.0", "extra": {constant}, ', 1),
+                "a number in a result": whole.replace('"ruleIndex": 0', f'"ruleIndex": {constant}'),
+                "a value in a list": whole.replace('"rules": []', f'"rules": [{constant}]'),
+                "a property of an invocation": invoked.replace('"executionSuccessful": true', f'"executionSuccessful": true, "exitCode": {constant}'),
+            }
+            for name, changed in cases.items():
+                with self.subTest(case=name, constant=constant):
+                    self.assertNotIn(changed, (whole, invoked), "the case changed the report")
+                    with self.assertRaisesRegex(ScanError, "not standard JSON"):
+                        read(changed)
+        self.assertEqual(1, len(read(json.dumps(report(result(uris=("/opt/NaN/Infinity",)))))), "the same letters inside a text are no constant")
+
     def test_a_key_that_one_object_holds_twice_is_refused_because_the_last_value_would_hide_the_first(self) -> None:
         text = stated(report(), [{"executionSuccessful": True}])
         finding = json.dumps([result()])

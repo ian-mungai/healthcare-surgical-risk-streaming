@@ -10,9 +10,9 @@ version of the package.
 decision. The gate never reads ``pending``. The file is outside every image's sources, so a change in it changes no image tag.
 
 Everything that is not a complete report is refused and is never read as a clean image: a missing or unreadable file, another format or tool, an object that
-holds a key twice (a second, empty list of results would hide the first), a scan whose exit status is not the number 0, a run whose invocations, when it holds
-the key, do not all report ``executionSuccessful`` as true, and a result that does not name exactly one package and at least one location. Only an ID, a
-package URL and an artifact path that match their forms are ever shown.
+holds a key twice (a second, empty list of results would hide the first), a number that standard JSON does not have (NaN, Infinity, -Infinity), a scan whose
+exit status is not the number 0, a run whose invocations, when it holds the key, do not all report ``executionSuccessful`` as true, and a result that does not
+name exactly one package and at least one location. Only an ID, a package URL and an artifact path that match their forms are ever shown.
 
 The reports of Docker Scout 1.28.0 hold no ``invocations`` (read on Nov 25 2026), so for them the exit status of the scan alone says that it completed.
 """
@@ -111,6 +111,11 @@ def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return found
 
 
+def refused_constant(name: str) -> object:
+    """``json.loads`` reads NaN, Infinity and -Infinity, which standard JSON does not have, so a report that holds one is refused."""
+    raise ScanError("the scan report holds a number that is not standard JSON")
+
+
 def require_success(run: dict[str, Any], exit_status: object) -> None:
     """The scan completed: its exit status is the number 0, and a run that holds invocations says so in every one of them, of which there is at least one."""
     if type(exit_status) is not int or exit_status != 0:
@@ -125,7 +130,7 @@ def require_success(run: dict[str, Any], exit_status: object) -> None:
 def read_report(text: str, exit_status: object) -> frozenset[Finding]:
     """The findings of a complete SARIF 2.1.0 report of Docker Scout, from a scan that ended with ``exit_status``."""
     try:
-        document = json.loads(text, object_pairs_hook=unique_keys)
+        document = json.loads(text, object_pairs_hook=unique_keys, parse_constant=refused_constant)
         version = document["version"]
         (run,) = document["runs"]
         tool = run["tool"]["driver"]["name"]
