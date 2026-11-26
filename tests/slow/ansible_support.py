@@ -14,6 +14,7 @@ from pathlib import Path
 
 from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT
+from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import ROLES as ROLES
 from tests.fast.ansible_paths import SHARED_MODULE_UTILS as SHARED_MODULE_UTILS
 from tests.fast.ansible_paths import shared_module as shared_module
@@ -28,6 +29,7 @@ def environment(folder: Path) -> dict[str, str]:
         "ANSIBLE_LOCAL_TEMP": str(folder / "tmp"),
         "ANSIBLE_REMOTE_TMP": str(folder / "remote_tmp"),
         "ANSIBLE_PYTHON_INTERPRETER": str(ROOT / ".venv" / "bin" / "python"),
+        "ANSIBLE_ROLES_PATH": str(ROLES),
         "ANSIBLE_NOCOLOR": "1",
         "ANSIBLE_FORCE_COLOR": "0",
     }
@@ -85,6 +87,22 @@ def load_variable(variables_file: Path, name: str) -> object:
         if result.returncode != 0:
             raise RuntimeError(result.stdout + result.stderr)
         return json.loads(base64.b64decode((folder / "value.json").read_text()))
+
+
+def included_roles(playbook: str) -> list[tuple[str, str]]:
+    """The roles that the tasks of ``ansible/<playbook>`` include, in order, each as ``(role name, tasks file)``; ``main.yml`` when no file is named.
+
+    ``role_order`` lists only the roles of a playbook's ``roles`` section, so a role that a playbook includes from its tasks is read from its text."""
+    document = load_yaml((ROOT / "ansible" / playbook).read_text())
+    if not isinstance(document, list):
+        raise TypeError(f"{playbook} is not a list of plays")
+    found: list[tuple[str, str]] = []
+    for play in document:
+        for task in play.get("tasks") or []:
+            role = task.get("ansible.builtin.include_role")
+            if isinstance(role, dict):
+                found.append((str(role["name"]), str(role.get("tasks_from", "main.yml"))))
+    return found
 
 
 def role_order(playbook: str) -> list[str]:

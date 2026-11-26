@@ -167,9 +167,9 @@ def service_list(*, tool_group: int) -> str:
     return f"nessie {UID}:{tool_group}\nairbyte\n"
 
 
-def step_order() -> list[str]:
-    """The steps of the role in the order they run: a task file by name (with the services it starts), or a file of another role as ``role/file``."""
-    tasks: Any = load_yaml((ROLE / "tasks" / "main.yml").read_text())
+def step_order(file: str = "main.yml") -> list[str]:
+    """The steps of a task file of the role in the order they run: a task file by name (with its services), or another role's file as ``role/file``."""
+    tasks: Any = load_yaml((ROLE / "tasks" / file).read_text())
     steps: list[str] = []
     for task in tasks:
         if "ansible.builtin.include_tasks" in task:
@@ -182,9 +182,7 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_but_the_orchestration_services_and_makes_openbao_match(
-        self,
-    ) -> None:
+    def test_the_host_playbook_part_prepares_openbao_starts_it_alone_makes_it_match_the_lists_and_installs_the_intake_script(self) -> None:
         self.assertEqual(
             [
                 "place_files.yml",
@@ -192,24 +190,33 @@ class StepOrderTest(unittest.TestCase):
                 "render_environment.yml",
                 "passwords.yml",
                 "verify_secrets.yml",
+                "openbao/prepare.yml",
+                "start.yml openbao",
+                "openbao/bootstrap.yml",
+                "openbao/intake_script.yml",
+            ],
+            step_order(),
+        )
+
+    def test_the_stack_playbook_part_makes_the_grafana_password_pulls_with_the_stored_token_starts_postgresql_first_and_then_the_rest(self) -> None:
+        self.assertEqual(
+            [
                 "grafana_password.yml",
                 "pull_images.yml",
                 "airbyte/cluster.yml",
                 "airbyte/group_access.yml",
                 "start.yml postgres",
                 "provision.yml",
-                "openbao/prepare.yml",
                 "start.yml all",
                 "kafka.yml",
                 "registry.yml",
-                "openbao/bootstrap.yml",
             ],
-            step_order(),
+            step_order("deploy.yml"),
         )
 
     def test_the_k3s_access_files_exist_before_the_first_start_so_a_fresh_host_deploys_in_one_pass(self) -> None:
         """The code location reads the k3s token and certificate authority as Compose secrets, which the Airbyte role's access step writes."""
-        steps = step_order()
+        steps = step_order("deploy.yml")
         first_start = next(index for index, step in enumerate(steps) if step.startswith("start.yml"))
         self.assertLess(steps.index("airbyte/cluster.yml"), steps.index("airbyte/group_access.yml"))
         self.assertLess(steps.index("airbyte/group_access.yml"), first_start)
@@ -228,8 +235,13 @@ class OrchestrationStartTest(unittest.TestCase):
     def test_the_host_playbook_does_not_start_them_and_the_connection_playbook_does_after_the_raw_connection(self) -> None:
         host_document: Any = load_yaml((ROOT / "ansible" / "host.yml").read_text())
         host = host_document[0]
-        self.assertEqual("airbyte", host["roles"][-1])
-        self.assertNotIn("post_tasks", host, "the key that the code location mounts is placed after this playbook")
+        self.assertEqual("compose_stack", host["roles"][-1])
+        stack_document: Any = load_yaml((ROOT / "ansible" / "stack.yml").read_text())
+        stack = stack_document[0]
+        stack_roles = [task["ansible.builtin.include_role"]["name"] for task in stack["tasks"]]
+        self.assertEqual(["compose_stack", "airbyte"], stack_roles)
+        for play in (host, stack):
+            self.assertNotIn("post_tasks", play, "the key that the code location mounts is placed after these playbooks")
         connection_document: Any = load_yaml((ROOT / "ansible" / "connection.yml").read_text())
         connection = connection_document[0]
         names = [task["ansible.builtin.include_role"]["name"] + "/" + task["ansible.builtin.include_role"]["tasks_from"] for task in connection["tasks"]]
@@ -322,53 +334,25 @@ class PasswordFilesTest(unittest.TestCase):
 
 
 class GrafanaPasswordTest(unittest.TestCase):
-    """Grafana's administrator password is a file of its own container user, mode 0400, made once and never replaced."""
+    """Grafana's administrator password is made once, kept in OpenBao and written from there to a file of its own container user, mode 0400."""
 
     def values(self, folder: Path, owner: tuple[int, int]) -> dict[str, object]:
         return variables(folder) | {"grafana_user": f"{owner[0]}:{owner[1]}"}
 
-    def test_the_file_is_made_for_the_grafana_user_with_mode_0400_in_a_folder_for_root_and_no_output_holds_the_password(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            code, output = run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
-            target = folder / "secrets" / "grafana" / "admin.password"
-            status = target.stat()
-            folder_status = target.parent.stat()
-            text = target.read_text()
-        self.assertEqual(0, code, output)
-        self.assertEqual((0o400, UID, TOOL_GID), (stat.S_IMODE(status.st_mode), status.st_uid, status.st_gid))
-        self.assertEqual((0o700, UID, GID), (stat.S_IMODE(folder_status.st_mode), folder_status.st_uid, folder_status.st_gid))
-        self.assertRegex(text, r"^[A-Za-z0-9_-]{40,}$")
-        self.assertNotIn(text, output)
-
-    def test_a_second_run_changes_nothing_and_keeps_the_password(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
-            target = folder / "secrets" / "grafana" / "admin.password"
-            before = target.read_text()
-            code, output = run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
-            after = target.read_text()
-        self.assertEqual(0, code, output)
-        self.assertEqual(before, after)
-        self.assertRegex(output, CHANGED_NONE)
-
-    def test_a_file_with_another_mode_or_another_owner_is_given_the_right_ones_with_its_password_kept(self) -> None:
-        for mode, group in ((0o600, TOOL_GID), (0o640, TOOL_GID), (0o444, TOOL_GID), (0o400, GID)):
-            with self.subTest(mode=oct(mode), group=group), tempfile.TemporaryDirectory() as scratch:
-                folder = Path(scratch)
-                target = folder / "secrets" / "grafana" / "admin.password"
-                target.parent.mkdir(parents=True, mode=0o700)
-                target.write_text("an-existing-password-of-forty-characters-or-more")
-                os.chown(target, UID, group)
-                target.chmod(mode)
-                code, output = run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
-                status = target.stat()
-                self.assertEqual(0, code, output)
-                self.assertEqual(
-                    (0o400, UID, TOOL_GID, "an-existing-password-of-forty-characters-or-more"),
-                    (stat.S_IMODE(status.st_mode), status.st_uid, status.st_gid, target.read_text()),
-                )
+    def test_the_password_is_kept_in_openbao_and_written_from_there_to_the_file_of_the_grafana_user_and_then_checked(self) -> None:
+        """What the step does to OpenBao and the file is proven by ``tests/fast/test_openbao_secret_steps.py`` against a stand-in server."""
+        tasks: Any = load_yaml((ROLE / "tasks" / "grafana_password.yml").read_text())
+        include = tasks[0]["ansible.builtin.include_role"]
+        self.assertEqual(("openbao", "generated_secret.yml"), (include["name"], include["tasks_from"]))
+        self.assertEqual(
+            {
+                "openbao_generated_name": "grafana/admin_password",
+                "openbao_generated_dest": "{{ compose_stack_secrets_directory }}/grafana/admin.password",
+                "openbao_generated_owner": "{{ grafana_user }}",
+            },
+            tasks[0]["vars"],
+        )
+        self.assertEqual("verify_grafana_password.yml", tasks[1]["ansible.builtin.include_tasks"])
 
     def check(self, *, mode: int = 0o400, group: int = TOOL_GID, expected: tuple[int, int] = (UID, TOOL_GID), create: bool = True) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as scratch:

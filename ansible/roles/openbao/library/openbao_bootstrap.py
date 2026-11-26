@@ -8,7 +8,12 @@ and is given that owner and mode when it has others.
 only its own path, one AppRole named for the service with a renewable token, one secret ID in a file that only the service reads (mode 0400, owned by
 the numeric user on its list line, or by root when the line has none) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own
 path. A server that already matches needs no change and the step reports none. It reports every secret file with its owner, for the role's check. A
-service that left the list keeps its role and is reported as unlisted, never removed.
+service that left the list keeps its role and is reported as unlisted, never removed; its policy loses every external grant, and its other rules stay.
+
+``step: read`` returns one external secret (``compose/external_secrets.txt``) from OpenBao in its result, after the consumer logs in with its own AppRole,
+and writes no file: the pull of the images reads the Docker Hub token that way and hands it to one task's standard input. The calling task hides its result.
+``step: generated`` keeps a secret that the host makes for itself (the Grafana administrator password): made once, stored in OpenBao while its path is empty
+and written from OpenBao to the file that its container reads.
 
 It uses only the standard library and runs on the host's Python. No secret is a module argument, a command line, a log line or a message.
 """
@@ -20,13 +25,14 @@ import json
 import re
 import secrets
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.external_secrets import INTAKE_ROLE, ExternalSecretError, form_ok, parse_external, value_digest
 from ansible.module_utils.secret_files import (
     Entry,
     PasswordStore,
@@ -41,12 +47,13 @@ from ansible.module_utils.secret_files import (
 )
 
 ADMIN_ROLE = "bootstrap"
+POLICY_RULE = re.compile(r'path\s+"([^"]+)"\s*\{[^}]*\}\n?')
+GENERATED_NAME = re.compile(r"[a-z][a-z0-9_]*(?:/[a-z][a-z0-9_]*)+")
 OPENBAO_FOLDER = "openbao"
 ADMIN_ID_FILE = "bootstrap.secret_id"
 SECRET_BYTES = 32
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
-ERROR_CHARACTERS = 300
 # The form of a token that goes into a header: the characters of OpenBao's tokens and of a bearer token (RFC 6750, b64token), and nothing else. A control
 # character such as a line break makes the HTTP library's header error carry the token's text.
 TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
@@ -60,12 +67,43 @@ def policy_name(service: str) -> str:
     return f"service_{service}"
 
 
-def policy_text(service: str) -> str:
-    """The one policy of a service: it reads and lists its own path and nothing else."""
+def intake_policy_text(paths: Sequence[str]) -> str:
+    """The policy of the intake role: it creates, reads, updates and removes each declared external path, reads its metadata (the version for check-and-set)."""
+    return "".join(
+        f'path "{path}" {{ capabilities = ["create", "read", "update", "delete"] }}\n'
+        f'path "{path.replace("/data/", "/metadata/", 1)}" {{ capabilities = ["read"] }}\n'
+        for path in paths
+    )
+
+
+def policy_text(service: str, external_paths: Sequence[str] = ()) -> str:
+    """The one policy of a service: it reads and lists its own path, and reads each external secret that the list gives it as consumer, and nothing else.
+
+    The intake role has the other form (``intake_policy_text``): it writes the declared paths and has no path of its own."""
+    if service == INTAKE_ROLE:
+        return intake_policy_text(external_paths)
     return (
         f'path "secret/data/services/{service}/*" {{ capabilities = ["read"] }}\n'
         f'path "secret/metadata/services/{service}/*" {{ capabilities = ["read", "list"] }}\n'
+        + "".join(f'path "{path}" {{ capabilities = ["read"] }}\n' for path in external_paths)
     )
+
+
+def external_paths(list_text: str, services: Sequence[str]) -> dict[str, list[str]]:
+    """The paths of the external secrets that each consumer reads, from the tracked list, and under the intake role the paths of all of them.
+
+    A consumer that is no listed service has no policy: it is refused."""
+    try:
+        declared = parse_external(list_text)
+    except ExternalSecretError as error:
+        raise BootstrapError(str(error)) from error
+    paths: dict[str, list[str]] = {}
+    for item in declared:
+        if item.consumer not in services:
+            raise BootstrapError(f"the consumer {item.consumer!r} of external secret {item.name!r} is not in the service list, so it has no policy")
+        paths.setdefault(item.consumer, []).append(item.path)
+    paths[INTAKE_ROLE] = [item.path for item in declared]
+    return paths
 
 
 def role_settings(service: str, token_ttl: int, token_max_ttl: int) -> dict[str, Any]:
@@ -82,12 +120,19 @@ def role_settings(service: str, token_ttl: int, token_max_ttl: int) -> dict[str,
     }
 
 
+def without_external(policy: str) -> str:
+    """The policy text without any rule for an external path."""
+    return POLICY_RULE.sub(lambda rule: "" if "/external/" in rule.group(1) else rule.group(0), policy)
+
+
 @dataclass
 class State:
     policies: dict[str, str]
     roles: dict[str, dict[str, Any]]
     secret_id_valid: dict[str, bool]
     passwords: dict[str, str | None]
+    # The policies of services that left the list, by service name.
+    retired: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,14 +140,23 @@ class Action:
     kind: str
     service: str
     description: str
+    policy: str = ""
 
 
-def plan(services: list[str], tools: list[str], state: State, password_of: Callable[[str], str], token_ttl: int, token_max_ttl: int) -> list[Action]:
+def plan(
+    services: list[str],
+    tools: list[str],
+    state: State,
+    password_of: Callable[[str], str],
+    token_ttl: int,
+    token_max_ttl: int,
+    external: Mapping[str, Sequence[str]] | None = None,
+) -> list[Action]:
     """The changes that make the server match the list, and none when it already does."""
     actions: list[Action] = []
     for service in services:
         stored = state.policies.get(policy_name(service))
-        if stored is None or stored.strip() != policy_text(service).strip():
+        if stored is None or stored.strip() != policy_text(service, (external or {}).get(service, ())).strip():
             actions.append(Action("policy", service, f"write policy {policy_name(service)}"))
         role = state.roles.get(service)
         if role is None or any(role.get(key) != value for key, value in role_settings(service, token_ttl, token_max_ttl).items()):
@@ -111,6 +165,9 @@ def plan(services: list[str], tools: list[str], state: State, password_of: Calla
             actions.append(Action("secret_id", service, f"issue a secret ID for {service}"))
         if service in tools and state.passwords.get(service) != password_of(service):
             actions.append(Action("password", service, f"write the PostgreSQL password of {service}"))
+    for service, stored in state.retired.items():
+        if without_external(stored) != stored:
+            actions.append(Action("retire", service, f"drop the external grants of policy {policy_name(service)}", without_external(stored)))
     return actions
 
 
@@ -172,8 +229,7 @@ class Api:
     def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
         status, document = self.call(method, path, token, body)
         if status not in (200, 204):
-            errors = " ".join(str(item) for item in document.get("errors") or [])[:ERROR_CHARACTERS]
-            raise BootstrapError(f"{method} {path}: HTTP {status}: {errors}")
+            raise BootstrapError(f"{method} {path}: HTTP {status}")
         return document
 
     def wait_ready(self, deadline_seconds: int) -> None:
@@ -198,9 +254,7 @@ class Api:
         if status == 200 and token and type(token) is not str:
             raise BootstrapError(f"the login of role {role} gave a token that is not text")
         if status != 200 or not token:
-            raise BootstrapError(
-                f"the login of role {role} was refused (HTTP {status}); if OpenBao started with another admin secret ID, its data volume must be reset"
-            )
+            raise BootstrapError(f"the login of role {role} was refused (HTTP {status}): the secret ID in its file is not one that OpenBao holds for the role")
         return str(token)
 
 
@@ -230,13 +284,35 @@ def read_state(api: Api, token: str, services: list[str], tools: list[str], secr
                 state.passwords[service] = str(((document.get("data") or {}).get("data") or {}).get("password") or "")
             elif status != 404:
                 raise BootstrapError(f"GET secret/data/services/{service}/postgres: HTTP {status}")
+    status, document = api.call("GET", "sys/policies/acl?list=true", token)
+    if status != 200:
+        raise BootstrapError(f"GET sys/policies/acl (list): HTTP {status}")
+    for key in sorted(str(item) for item in (document.get("data") or {}).get("keys") or []):
+        service = key.removeprefix("service_")
+        if not key.startswith("service_") or service in services:
+            continue
+        status, document = api.call("GET", f"sys/policies/acl/{key}", token)
+        if status not in (200, 404):
+            raise BootstrapError(f"GET sys/policies/acl/{key}: HTTP {status}")
+        state.retired[service] = str((document.get("data") or {}).get("policy") or "") if status == 200 else ""
     return state
 
 
-def apply(api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int], token_ttl: int, token_max_ttl: int) -> None:
+def apply(
+    api: Api,
+    token: str,
+    action: Action,
+    secrets_directory: Path,
+    owner: tuple[int, int],
+    token_ttl: int,
+    token_max_ttl: int,
+    external: Mapping[str, Sequence[str]] | None = None,
+) -> None:
     service = action.service
-    if action.kind == "policy":
-        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service)})
+    if action.kind == "retire":
+        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": action.policy})
+    elif action.kind == "policy":
+        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service, (external or {}).get(service, ()))})
     elif action.kind == "role":
         api.must("POST", f"auth/approle/role/{service}", token, role_settings(service, token_ttl, token_max_ttl))
     elif action.kind == "secret_id":
@@ -275,6 +351,106 @@ def access_actions(entries: list[Entry], secrets_directory: Path, issued: list[s
     return actions
 
 
+def kv_document(api: Api, token: str, path: str) -> tuple[str | None, object]:
+    """The text in the field ``value`` at ``secret/data/<path>`` and the SHA-256 beside it, or ``(None, None)`` when the path is empty. Nothing is checked."""
+    status, document = api.call("GET", f"secret/data/{path}", token)
+    if status == 404:
+        return None, None
+    if status != 200:
+        raise BootstrapError(f"GET secret/data/{path}: HTTP {status}")
+    fields = (document.get("data") or {}).get("data") or {}
+    value = fields.get("value")
+    if not isinstance(value, str):
+        raise BootstrapError(f"the value at secret/data/{path} is not text")
+    return value, fields.get("sha256")
+
+
+def kv_value(api: Api, token: str, path: str) -> str | None:
+    """The text in the field ``value`` at ``secret/data/<path>``, or None when the path is empty. A text with no matching SHA-256 beside it is refused."""
+    value, digest = kv_document(api, token, path)
+    if value is not None and digest != value_digest(value):
+        raise BootstrapError(f"the text at secret/data/{path} does not match the SHA-256 that was stored beside it, so it is not used")
+    return value
+
+
+def kv_store(api: Api, token: str, path: str, value: str) -> None:
+    """Store ``value`` and its SHA-256 at ``secret/data/<path>`` in one write with check-and-set on the current version, read them back and compare.
+
+    A stored text that differs is an error, and every later read refuses it."""
+    status, document = api.call("GET", f"secret/metadata/{path}", token)
+    if status not in (200, 404):
+        raise BootstrapError(f"GET secret/metadata/{path}: HTTP {status}")
+    version = int((document.get("data") or {}).get("current_version") or 0) if status == 200 else 0
+    sent = value_digest(value)
+    api.must("POST", f"secret/data/{path}", token, {"options": {"cas": version}, "data": {"value": value, "sha256": sent}})
+    read_back, stored_digest = kv_document(api, token, path)
+    if read_back is None or value_digest(read_back) != sent or stored_digest != sent:
+        raise BootstrapError(f"OpenBao stored another text at secret/data/{path} than the one sent")
+
+
+def write_when_different(dest: Path, value: str, owner: tuple[int, int], *, check_only: bool) -> bool:
+    """Make the file hold ``value`` for ``owner`` with mode 0400 (a final line break counts as the same text) and return whether it had to change."""
+    same = dest.is_file() and dest.read_text().rstrip("\n") == value
+    if same and not access_differs(dest, owner):
+        return False
+    if not check_only:
+        if same:
+            set_access(dest, owner)
+        else:
+            write_private_file(dest, value, replace=True, owner=owner)
+    return True
+
+
+def read_external(params: dict[str, Any]) -> dict[str, Any]:
+    """Return an external secret from OpenBao to the playbook, after the consumer logs in with its own AppRole. Nothing is written.
+
+    The list names the consumer of each secret, and a consumer reads only its own. The value is in the result and in no argument or message: the task that calls
+    this step hides its result and hands the value to one task's standard input."""
+    name, consumer = str(params["name"]), str(params["consumer"])
+    try:
+        declared = {item.name: item for item in parse_external(Path(params["external_secrets_file"]).read_text())}
+    except ExternalSecretError as error:
+        raise BootstrapError(str(error)) from error
+    if name not in declared:
+        raise BootstrapError(f"external secret {name!r} is not declared in the list")
+    if declared[name].consumer != consumer:
+        raise BootstrapError(f"external secret {name!r} is for the consumer {declared[name].consumer!r}, not {consumer!r}")
+    api = Api(params["address"])
+    token = api.login(consumer, read_file(secret_file(Path(params["secrets_directory"]), f"{consumer}.secret_id"), f"secret ID file of {consumer}"))
+    value = kv_value(api, token, f"external/{name}")
+    if value is None:
+        raise BootstrapError(f"external secret {name} is empty in OpenBao: the launcher's intake (make host-up) stores it before the images are pulled")
+    if not form_ok(declared[name].check, value):
+        raise BootstrapError(f"the value stored for external secret {name} is not in the form of its check")
+    return {"changed": False, "value": value}
+
+
+def generated_secret(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
+    """Keep a secret that the host makes for itself in OpenBao, and write it from there to the file that its container reads.
+
+    While the path ``secret/data/services/<name>`` is empty, the value is the file's text when the file exists (a host made before the secret moved to
+    OpenBao keeps its password) and a new random one otherwise. The admin login stores it. The file is then made to hold what OpenBao holds.
+    The value goes to no result or message."""
+    name = str(params["name"])
+    if GENERATED_NAME.fullmatch(name) is None:
+        raise BootstrapError(f"the name {name!r} of a generated secret is not folders and a name of lower case letters, digits and underscores")
+    secrets_directory, dest = Path(params["secrets_directory"]), Path(params["dest"])
+    owner = parse_owner(params["file_owner"], allow_root=True)
+    api = Api(params["address"])
+    token = api.login(ADMIN_ROLE, read_file(secret_file(secrets_directory, ADMIN_ID_FILE), "admin secret ID file"))
+    path = f"services/{name}"
+    value, stored = kv_value(api, token, path), True
+    if value is None:
+        stored = False
+        value = read_file(dest, f"password file {dest.name}") if dest.is_file() else secrets.token_urlsafe(SECRET_BYTES)
+        if value != value.strip():
+            raise BootstrapError(f"the file {dest.parent.name}/{dest.name} has whitespace at its start or its end, which its reader trims")
+        if not check_only:
+            kv_store(api, token, path, value)
+    changed = write_when_different(dest, value, owner, check_only=check_only)
+    return {"changed": changed or not stored}
+
+
 def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     secrets_directory = Path(params["secrets_directory"])
     entries = parse_entries(Path(params["services_file"]).read_text(), "service")
@@ -285,19 +461,20 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     tools = parse_names(Path(params["tools_file"]).read_text(), "tool")
     if missing := [tool for tool in tools if tool not in services]:
         raise BootstrapError(f"PostgreSQL tool {missing[0]!r} has no entry in the service list, so its password would never reach OpenBao")
+    external = external_paths(Path(params["external_secrets_file"]).read_text(), services) if params.get("external_secrets_file") else {}
     api = Api(params["address"])
     api.wait_ready(int(params["ready_deadline_seconds"]))
     token = api.login(ADMIN_ROLE, read_file(secret_file(secrets_directory, ADMIN_ID_FILE), "admin secret ID file"))
     ttl, max_ttl = int(params["token_ttl_seconds"]), int(params["token_max_ttl_seconds"])
     state = read_state(api, token, services, tools, secrets_directory)
-    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl)
+    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl, external)
     actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"], root_owner)
     if not check_only:
         for action in actions:
             if action.kind == "access":
                 set_access(secret_file(secrets_directory, f"{action.service}.secret_id"), owners[action.service])
             else:
-                apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl)
+                apply(api, token, action, secrets_directory, owners.get(action.service, root_owner), ttl, max_ttl, external)
     files = [
         {"path": str(path), "owner": f"{owner[0]}:{owner[1]}"} for path, owner in secret_files(secrets_directory, entries, admin_owner, root_owner).items()
     ]
@@ -312,18 +489,23 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
 def main() -> None:
     module = AnsibleModule(
         argument_spec={
-            "step": {"type": "str", "required": True, "choices": ["prepare", "reconcile"]},
+            "step": {"type": "str", "required": True, "choices": ["prepare", "reconcile", "read", "generated"]},
+            "consumer": {"type": "str"},
+            "name": {"type": "str"},
+            "dest": {"type": "path"},
             "secrets_directory": {"type": "path", "required": True},
             "unlock_key_file": {"type": "path"},
-            "file_owner": {"type": "str", "required": True},
+            "file_owner": {"type": "str"},
             "root_owner": {"type": "str", "default": "0:0"},
             "services_file": {"type": "path"},
             "tools_file": {"type": "path"},
+            "external_secrets_file": {"type": "path"},
             "address": {"type": "str"},
             "ready_deadline_seconds": {"type": "int", "default": 120},
             "token_ttl_seconds": {"type": "int", "default": 3600},
             "token_max_ttl_seconds": {"type": "int", "default": 86400},
         },
+        required_if=[("step", step, ("file_owner",)) for step in ("prepare", "reconcile", "generated")],
         supports_check_mode=True,
     )
     params = module.params
@@ -334,6 +516,11 @@ def main() -> None:
             created = prepare(Path(params["secrets_directory"]), unlock, owner, check_only=module.check_mode)
             files = [{"path": str(secret_file(Path(params["secrets_directory"]), ADMIN_ID_FILE)), "owner": params["file_owner"]}]
             module.exit_json(changed=created, created=[ADMIN_ID_FILE] if created else [], secret_files=files)
+        if params["step"] in ("read", "generated"):
+            needed = ("address", "name") + (("consumer", "external_secrets_file") if params["step"] == "read" else ("dest",))
+            if not all(params[key] for key in needed):
+                raise BootstrapError(f"the {params['step']} step needs {', '.join(needed)}")
+            module.exit_json(**(read_external(params) if params["step"] == "read" else generated_secret(params, check_only=module.check_mode)))
         if not all(params[key] for key in ("services_file", "tools_file", "address")):
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
         module.exit_json(**reconcile(params, check_only=module.check_mode))

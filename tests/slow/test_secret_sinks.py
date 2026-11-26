@@ -44,13 +44,14 @@ from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.openbao_stand_in import ADMIN_ROLE, Role, StandIn
 from tests.fast.secret_inputs import Marker, listed_names, make_marker, scan_text, scan_tree
 from tests.fast.traceback_support import raised_text
 from tests.slow.ansible_support import ROLES, SHARED_MODULE_UTILS, environment, shared_module
 
 PLAYBOOK_SECONDS = 180
 OWNER = f"{os.getuid()}:{os.getgid()}"
-LIBRARIES = [ROLES / name / "library" for name in ("compose_stack", "openbao", "airbyte", "secret_files")]
+LIBRARIES = [ROLES / name / "library" for name in ("compose_stack", "openbao", "airbyte")]
 TOOLS_FILE = ROOT / "compose" / "postgres_tools.txt"
 SERVICES_FILE = ROOT / "compose" / "openbao_services.txt"
 PYTHON = str(ROOT / ".venv" / "bin" / "python")
@@ -361,6 +362,8 @@ class OpenBaoStandIn:
     def route(self, method: str, path: str, body: dict[str, Any], listing: bool) -> tuple[int, dict[str, Any]]:
         if listing and path == "auth/approle/role":
             return 200, {"data": {"keys": sorted(self.roles)}}
+        if listing and path == "sys/policies/acl":
+            return 200, {"data": {"keys": sorted(self.policies)}}
         parts = path.split("/")
         if path.startswith("sys/policies/acl/"):
             name = parts[-1]
@@ -559,10 +562,11 @@ class FileSinks(unittest.TestCase):
     def test_the_grafana_password_the_owner_placed_is_kept_and_reaches_grafana_through_its_own_file_provider(self) -> None:
         marker = Marker("grafana password", make_marker("urlsafe").value)
         path = self.run_.place(marker, "grafana/admin.password")
-        result = self.run_.play([{"secret_file": {"path": str(path), "owner": OWNER}, "no_log": True}])
+        result = self.generated_play()
         output = result.stdout + result.stderr
         self.assertEqual(0, result.returncode, output[-3000:])
         self.assertEqual(marker.value + "\n", path.read_text(), "control: the owner's value was kept")
+        self.assertEqual(marker.value, self.bao_stored(), "control: the owner's value was taken into OpenBao and not replaced")
         self.assertEqual(0o400, path.stat().st_mode & 0o777)
         compose = cast("dict[str, Any]", load_yaml((ROOT / "compose" / "services" / "grafana.yml").read_text()))
         service = compose["services"]["grafana"]
@@ -580,6 +584,27 @@ class FileSinks(unittest.TestCase):
         self.assertEqual(marker.value, received, "control: the file that Grafana's provider reads, by the configuration and the mount, holds the owner's value")
         self.assertEqual([], self.run_.sinks([marker], output))
 
+    def generated_play(self) -> CompletedProcess[str]:
+        """The Grafana password task file against a stand-in OpenBao whose admin login is the run's own bootstrap secret ID file."""
+        folder = self.run_.secrets
+        (folder / "openbao").mkdir(parents=True, exist_ok=True)
+        (folder / "openbao" / "bootstrap.secret_id").write_text("admin-login-marker-for-the-grafana-play")
+        self.stored_in = StandIn(
+            {ADMIN_ROLE: Role("admin-login-marker-for-the-grafana-play", "admin-token", ("secret/data/services/*",), ("secret/data/services/*",))}
+        )
+        self.stored_in.__enter__()
+        self.addCleanup(self.stored_in.__exit__)
+        variables = {
+            "compose_stack_secrets_directory": str(folder),
+            "grafana_user": OWNER,
+            "openbao_address": self.stored_in.address,
+            "openbao_secrets_directory": str(folder),
+        }
+        return self.run_.play([{"ansible.builtin.include_tasks": str(ROLES / "compose_stack" / "tasks" / "grafana_password.yml")}], variables)
+
+    def bao_stored(self) -> str | None:
+        return self.stored_in.stored("services/grafana/admin_password")
+
     def grafana_play(self, content: str) -> tuple[int, str, Path]:
         folder = self.run_.secrets
         path = folder / "grafana" / "admin.password"
@@ -588,8 +613,7 @@ class FileSinks(unittest.TestCase):
             path.chmod(0o600)
         path.write_text(content)
         path.chmod(0o600)
-        variables = {"compose_stack_secrets_directory": str(folder), "grafana_user": OWNER}
-        result = self.run_.play([{"ansible.builtin.include_tasks": str(ROLES / "compose_stack" / "tasks" / "grafana_password.yml")}], variables)
+        result = self.generated_play()
         return result.returncode, result.stdout + result.stderr, path
 
     def test_a_grafana_password_with_leading_or_trailing_whitespace_is_refused_by_name_and_never_shown(self) -> None:
@@ -650,7 +674,7 @@ class EvidenceSinks(unittest.TestCase):
                 (folder / relative).parent.mkdir(parents=True, exist_ok=True)
                 (folder / relative).write_text(text)
             binding = root / "binding.json"
-            RunBinding(run_id, "c0ffee", "s3", "us-west-2", "example-project", "default", ["a", "b"], "verified").write(binding)
+            RunBinding(run_id, "c0ffee", "s3", "us-west-2", "example-project", "default", ["a", "b"], "verified").write(binding, state_root=root)
             with (
                 mock.patch.object(export, "ROOT", root),
                 mock.patch.object(export, "build_manifest", wraps=build_manifest) as built,

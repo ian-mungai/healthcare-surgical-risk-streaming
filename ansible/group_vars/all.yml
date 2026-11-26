@@ -58,6 +58,8 @@ compose_stack_secrets_directory: "{{ compose_stack_directory }}/secrets"
 compose_stack_tools_file: "{{ compose_stack_compose_directory }}/postgres_tools.txt"
 # One line for each service that reads a secret. A numeric user and group at the end of a line name the owner of that service's files.
 compose_stack_services_file: "{{ compose_stack_compose_directory }}/openbao_services.txt"
+# One line for each secret that a third party issues: its consumer, OpenBao path and form check. The launcher's intake writes the values (scripts/infra/host.py).
+compose_stack_external_secrets_file: "{{ compose_stack_compose_directory }}/external_secrets.txt"
 compose_stack_owner: root
 compose_stack_group: root
 compose_stack_postgres_port: 5432
@@ -103,10 +105,10 @@ compose_stack_start_deadline_seconds: 900
 compose_stack_health_deadline_seconds: 180
 compose_stack_pull_deadline_seconds: 1800
 compose_stack_provision_deadline_seconds: 120
-# The private Docker Hub repository's login for the pull: the account name and one file on the host that holds a read-only access token, owned by compose_stack_owner with
-# mode 0400. Both are set by the deploy that places the token; the role stops with a fixed message while either is missing, and it creates neither.
+# The private Docker Hub repository's login for the pull: the account name. The read-only access token is kept in the host's OpenBao (compose/external_secrets.txt:
+# dockerhub_read); the pull step reads it from there into a hidden result and hands it to the pull's shell on standard input, so no file holds it. The account name is
+# set by the deploy; the role stops with a fixed message while it is missing.
 compose_stack_registry_user: ""
-compose_stack_registry_token_file: "{{ compose_stack_secrets_directory }}/registry_token"
 # The parent of the pull's own Docker client configuration folders (mode 0700, owned by compose_stack_owner). The pull makes one fresh folder under it, holds the login in
 # that folder only and removes the folder; the parent is made when it is missing and is never removed or changed, and nothing else in it is read or changed.
 compose_stack_registry_config_directory: "{{ compose_stack_directory }}/registry_docker"

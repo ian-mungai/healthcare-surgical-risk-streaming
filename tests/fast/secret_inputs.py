@@ -252,7 +252,7 @@ INPUTS: tuple[SecretInput, ...] = (
         ("grafana/admin.password",),
         "urlsafe",
         "local",
-        "the file under the secrets folder; the secret_file module keeps an existing file",
+        "the file under the secrets folder, written from the host's OpenBao, which keeps the password (an existing file's password is taken into OpenBao once)",
         "Grafana's administrator sign-in, through the $__file{} provider in its mounted configuration (compose/monitoring/grafana/grafana.ini)",
         "the Grafana API accepts the marker for the administrator and refuses another password",
     ),

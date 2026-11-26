@@ -1,0 +1,17 @@
+# The second playbook of the host deployment, after the host playbook and the launcher's intake of the external secrets (scripts.infra.host): it logs in to Docker Hub with the
+# token that the host's OpenBao holds, pulls the project's images, starts the stack and installs Airbyte. The connection playbook follows the placement of the project
+# profile's access key.
+- name: Deploy the stack on the platform host
+  hosts: platform
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Pull the images, start the stack and make its topics and rules
+      ansible.builtin.include_role:
+        name: compose_stack
+        tasks_from: deploy.yml
+
+    - name: Install Airbyte on k3s
+      ansible.builtin.include_role:
+        name: airbyte

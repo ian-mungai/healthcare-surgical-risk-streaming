@@ -640,6 +640,7 @@ class HostUpTest(unittest.TestCase):
             "state_json",
             "wait_until_reachable",
             "run_ansible",
+            "place_external_secrets",
             "place_project_key",
             "instance_id",
             "platform_commit",
@@ -647,6 +648,9 @@ class HostUpTest(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
+            self.manager = mock.Mock()
+            for name in ("run_ansible", "place_external_secrets", "place_project_key"):
+                self.manager.attach_mock(calls[name], name)
             calls["save_plan"].return_value = 0
             calls["state_json"].return_value = heavy_state(11008) if state is None else state
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
@@ -692,14 +696,22 @@ class HostUpTest(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual(("s3", True), create.call_args.args[3:])
         calls["wait_until_reachable"].assert_called_once()
-        self.assertEqual(2, calls["run_ansible"].call_count)
+        self.assertEqual(3, calls["run_ansible"].call_count)
         self.assertEqual(
-            [("host.yml",), ("connection.yml",)],
+            [("host.yml",), ("stack.yml",), ("connection.yml",)],
             [item.args[3:] or ("host.yml",) for item in calls["run_ansible"].call_args_list],
-            "the host playbook first, the connection playbook second",
+            "the host playbook first, the stack playbook second, the connection playbook third",
         )
+        calls["place_external_secrets"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net", CONFIGURATION)
         calls["place_project_key"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net", "example_project_dev")
-        self.assertEqual(calls["run_ansible"].call_args_list[0].args[2], calls["run_ansible"].call_args_list[1].args[2])
+        for later in calls["run_ansible"].call_args_list[1:]:
+            self.assertEqual(calls["run_ansible"].call_args_list[0].args[2], later.args[2])
+        order = [name for name, _, _ in self.manager.mock_calls if name in ("run_ansible", "place_external_secrets", "place_project_key")]
+        self.assertEqual(
+            ["run_ansible", "place_external_secrets", "run_ansible", "place_project_key", "run_ansible"],
+            order,
+            "the intake between the two first playbooks, the key before the last",
+        )
         self.assertEqual(
             {
                 "workload_access_region": "us-west-2",
@@ -789,7 +801,8 @@ class HostUpTest(unittest.TestCase):
                 code, calls = self.run_up(path, planned={"apply.json": (9999, 60), "apply_check.json": (11008, 0)})
             self.assertEqual(0, code)
             self.assertEqual(
-                ["host.yml", "connection.yml"], [call.args[3] if len(call.args) > 3 else "host.yml" for call in calls["run_ansible"].call_args_list]
+                ["host.yml", "stack.yml", "connection.yml"],
+                [call.args[3] if len(call.args) > 3 else "host.yml" for call in calls["run_ansible"].call_args_list],
             )
             with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "9999"):
                 self.run_up(path, planned={"apply.json": (11008, 60), "apply_check.json": (9999, 0)})
@@ -833,7 +846,9 @@ class HostUpTest(unittest.TestCase):
                 self.run_up(path, planned={})
         self.calls["wait_until_reachable"].assert_not_called()
 
-    def test_the_steps_of_an_up_run_are_the_host_playbook_the_key_the_connection_playbook_and_the_inventory_in_that_order(self) -> None:
+    def test_the_steps_of_an_up_run_are_the_host_playbook_the_intake_the_stack_playbook_the_key_the_connection_playbook_and_the_inventory_in_that_order(
+        self,
+    ) -> None:
         order: list[str] = []
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
             path = binding_file(Path(scratch), backend="s3", provision_host=True)
@@ -842,6 +857,7 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(host, "run_ansible", side_effect=lambda run_id, address, variables, playbook="host.yml": order.append(f"ansible {playbook}"))
             )
+            stack.enter_context(mock.patch.object(host, "place_external_secrets", side_effect=lambda *arguments: order.append("intake")))
             stack.enter_context(mock.patch.object(host, "place_project_key", side_effect=lambda *arguments: order.append("key")))
             stack.enter_context(mock.patch.object(host, "write_inventory", side_effect=lambda binding: order.append("inventory")))
             for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
@@ -853,7 +869,7 @@ class HostUpTest(unittest.TestCase):
             host.platform_commit.return_value = "a" * 40  # type: ignore[attr-defined]
             with contextlib.redirect_stdout(io.StringIO()):
                 host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
-        self.assertEqual(["ansible host.yml", "key", "ansible connection.yml", "inventory"], order)
+        self.assertEqual(["ansible host.yml", "intake", "ansible stack.yml", "key", "ansible connection.yml", "inventory"], order)
 
     def test_a_failure_of_the_key_step_stops_the_run_before_the_connection_playbook_and_the_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
@@ -861,6 +877,7 @@ class HostUpTest(unittest.TestCase):
             write_plan_json(path.parent, "apply.json", 11008)
             stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
             run = stack.enter_context(mock.patch.object(host, "run_ansible"))
+            stack.enter_context(mock.patch.object(host, "place_external_secrets"))
             stack.enter_context(mock.patch.object(host, "place_project_key", side_effect=HostError("a fixed message")))
             inventory = stack.enter_context(mock.patch.object(host, "write_inventory"))
             for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
@@ -872,16 +889,39 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(HostError):
                 host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
-        self.assertEqual(1, run.call_count)
+        self.assertEqual(2, run.call_count, "the host playbook and the stack playbook ran, the connection playbook did not")
         inventory.assert_not_called()
 
-    def test_a_failure_of_the_host_playbook_leaves_the_key_step_unrun(self) -> None:
+    def test_a_refusal_of_the_intake_stops_the_run_before_the_stack_playbook_the_key_and_the_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            write_plan_json(path.parent, "apply.json", 11008)
+            stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
+            run = stack.enter_context(mock.patch.object(host, "run_ansible"))
+            stack.enter_context(mock.patch.object(host, "place_external_secrets", side_effect=HostError("a fixed message")))
+            key = stack.enter_context(mock.patch.object(host, "place_project_key"))
+            inventory = stack.enter_context(mock.patch.object(host, "write_inventory"))
+            for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
+                stack.enter_context(mock.patch.object(host, name))
+            host.wait_until_reachable.return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")  # type: ignore[attr-defined]
+            host.state_json.return_value = heavy_state(11008)  # type: ignore[attr-defined]
+            host.save_plan.return_value = 0  # type: ignore[attr-defined]
+            host.platform_commit.return_value = "a" * 40  # type: ignore[attr-defined]
+            stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(HostError):
+                host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
+        self.assertEqual(1, run.call_count, "only the host playbook ran")
+        key.assert_not_called()
+        inventory.assert_not_called()
+
+    def test_a_failure_of_the_host_playbook_leaves_the_intake_and_the_key_step_unrun(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
             path = binding_file(Path(scratch), backend="s3", provision_host=True)
             write_plan_json(path.parent, "apply.json", 11008)
             stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
             stack.enter_context(mock.patch.object(host, "run_ansible", side_effect=HostError("the Ansible host setup failed")))
             key = stack.enter_context(mock.patch.object(host, "place_project_key"))
+            intake = stack.enter_context(mock.patch.object(host, "place_external_secrets"))
             stack.enter_context(mock.patch.object(host, "write_inventory"))
             for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
                 stack.enter_context(mock.patch.object(host, name))
@@ -893,6 +933,7 @@ class HostUpTest(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(HostError):
                 host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
         key.assert_not_called()
+        intake.assert_not_called()
 
     def test_the_connection_run_keeps_its_own_output_file_and_names_its_playbook(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -955,7 +996,7 @@ class HostUpTest(unittest.TestCase):
         self.assertEqual(("s3", True), create.call_args.args[3:])
 
     def test_a_failed_write_of_the_ansible_output_after_exit_zero_still_writes_the_inventory_and_says_so(self) -> None:
-        names = ("save_plan", "write_inventory", "state_json", "wait_until_reachable", "instance_id", "place_project_key")
+        names = ("save_plan", "write_inventory", "state_json", "wait_until_reachable", "instance_id", "place_external_secrets", "place_project_key")
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
             path = binding_file(Path(scratch), backend="s3", provision_host=True)
             stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))

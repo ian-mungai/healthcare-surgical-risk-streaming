@@ -92,6 +92,7 @@ LAUNCHER_MARKED = {
 }
 MARKED = {
     "scripts.images.pins.PinError",
+    "scripts.infra.host.IntakeRefusal",
     "scripts.images.publish.PublishError",
     "infra.iam.scripts.manage_policies.KeyAdviceError",
     "scripts.stack.tags.RecordNotPublished",
@@ -130,6 +131,8 @@ ALLOWED_PARTS = frozenset(
         "ENV_FILE.name",
         "host_name",
         "kept",
+        "KEY_MESSAGES[problem].format(status=255, seconds=KEY_SEND_SECONDS)",
+        "INTAKE_POLICY_MESSAGES[problem].format(status=255, seconds=INTAKE_SEND_SECONDS)",
         "label",
         "len(peers)",
         "mismatch",

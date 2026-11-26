@@ -206,13 +206,17 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "scripts/infra/created.py": (
         "created_entries", "device_entries", "entry", "managed_resources", "merge_created", "module_resources", "run_inventory",
     ),
+    "scripts/infra/external_intake.py": (
+        "IntakeError", "ask", "declared_secrets", "helper", "keychain_token", "openbao_source", "prompt_source", "read", "reply_code", "run_intake",
+        "write_line",
+    ),
     "scripts/infra/host.py": (
-        "FixedHostError", "HostError", "NoPeerError", "Peer", "ansible_recap", "check_sudo_policy", "deploy_variables", "device_gone", "exported_key",
-        "gone", "heavy_memory_variables", "host_check", "host_peer", "host_start", "host_stop", "host_up", "instance_id", "instance_state",
-        "keep_host_keys_of", "main", "peer_online", "place_project_key", "planned_heavy_figure", "platform_commit", "record_tailscale_device",
-        "registry_user", "release_tailscale_device", "require_connected", "require_current_inputs", "require_instance", "run_ansible", "saved_plan",
-        "select_peer", "ssh_arguments", "ssh_output", "tailscale_device_id", "tailscale_status", "wait_for", "wait_until_reachable",
-        "workload_variables",
+        "FixedHostError", "HostError", "IntakeRefusal", "NoPeerError", "Peer", "ansible_recap", "ask_host", "check_sudo_policy", "deploy_variables",
+        "device_gone", "exported_key", "gone", "heavy_memory_variables", "host_check", "host_peer", "host_start", "host_stop", "host_up",
+        "instance_id", "instance_state", "keep_host_keys_of", "main", "peer_online", "place_external_secrets", "place_project_key",
+        "planned_heavy_figure", "platform_commit", "record_tailscale_device", "registry_user", "release_tailscale_device", "require_connected",
+        "require_current_inputs", "require_instance", "run_ansible", "saved_plan", "select_peer", "ssh_arguments", "ssh_output",
+        "sudo_policy_problem", "tailscale_device_id", "tailscale_status", "wait_for", "wait_until_reachable", "workload_variables",
     ),
     "scripts/infra/inventory.py": (
         "main", "write_inventory",
