@@ -583,7 +583,7 @@ class SourceProblemTest(unittest.TestCase):
         files = host_mode.image_source_files(dockerfile, tree, dockerignore) or {}
         self.assertNotIn("scripts/ingestion/cli.py", files)
         self.assertIn("scripts/ingestion/check.py", files)
-        self.assertEqual(171, len(files))
+        self.assertEqual(174, len(files))
         listing = "".join(f"{blob} {path}\n" for path, blob in sorted(files.items()))
         self.assertIsNone(source_problem(listing, tree, dockerfile, dockerignore))
         with_cli = listing + f"{committed_blobs['scripts/ingestion/cli.py']} scripts/ingestion/cli.py\n"
@@ -929,7 +929,7 @@ class ManifestSourceTest(unittest.TestCase):
             committed("show", "HEAD:spark/Dockerfile"), committed("ls-tree", "-r", "HEAD"), committed("show", "HEAD:spark/Dockerfile.dockerignore")
         )
         by_manifest = host_mode.image_source_files(dockerfile, tree, dockerignore)
-        self.assertEqual(171, len(by_git or {}))
+        self.assertEqual(174, len(by_git or {}))
         self.assertEqual(by_git, by_manifest)
         listing = "".join(f"{blob} {path}\n" for path, blob in sorted((by_manifest or {}).items()))
         self.assertIsNone(source_problem(listing, tree, dockerfile, dockerignore))

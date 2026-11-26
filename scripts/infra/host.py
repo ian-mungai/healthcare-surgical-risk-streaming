@@ -69,6 +69,8 @@ PLAYBOOKS = {
     "storage.yml": ("AIStor step", "ansible_storage_output.txt", STORAGE_TIMEOUT_SECONDS),
     "connection.yml": ("connection step", "ansible_connection_output.txt", CONNECTION_TIMEOUT_SECONDS),
 }
+# What the raw connection selects on each host, by the project's environment (``airbyte_connection_scope`` of ansible/group_vars/all.yml).
+CONNECTION_SCOPES = {"dev": "fixed_sample", "prod": "full_release"}
 KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
 # The remote command: the host's interpreter in isolated mode and the installed script. This command line is the one that sudo matches, and the sudoers drop-in
 # (the file named below, which the role installs and this program compares by its SHA-256) turns input recording off for it.
@@ -468,14 +470,16 @@ def registry_user(configuration: dict[str, str]) -> str:
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
     """The Ansible variables of the stack's host settings: the deployed commit (the stack's and the name of the runner folder), the warehouse location of the
-    configured bucket, the bucket that Airbyte's connection copies into, the bucket that the AIStor project user's policy reaches and the Docker Hub account
-    that the host pulls the project's images as. No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host
-    without Ansible."""
+    configured bucket, the bucket that Airbyte's connection copies into and what that connection selects, the bucket that the AIStor project user's policy
+    reaches and the Docker Hub account that the host pulls the project's images as. The dev host copies the fixed sample and only the prod host copies the full
+    release (owner, Nov 25 2026: "the full 84 day run will be production only. for development a sample should be enough"). No variable holds the AWS profile or
+    the key: the launcher reads the key itself and sends it to the host without Ansible."""
     return {
         "compose_stack_platform_commit": commit,
         "runner_checkout_commit": commit,
         "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
         "airbyte_landing_bucket": configuration["S3_BUCKET"],
+        "airbyte_connection_scope": CONNECTION_SCOPES[configuration["ENVIRONMENT"]],
         "aistor_bucket": configuration["S3_BUCKET"],
         "compose_stack_registry_user": registry_user(configuration),
     }

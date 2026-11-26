@@ -129,6 +129,7 @@ PROJECT_CLASSES = (
     "scripts.ingestion.manifest.PublishRefused",
     "scripts.ingestion.notice.ClosedError",
     "scripts.ingestion.notice.FixedTextError",
+    "scripts.ingestion.raw_copy.RawCopyError",
     "scripts.ingestion.record_catalog.CatalogError",
     "scripts.ingestion.record_copy.CopyChanged",
     "scripts.ingestion.record_copy.CopyError",

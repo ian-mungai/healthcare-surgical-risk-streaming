@@ -743,6 +743,7 @@ class HostUpTest(unittest.TestCase):
                 "airbyte_landing_bucket": "example-bucket",
                 "compose_stack_registry_user": "exampleaccount",
                 "aistor_bucket": "example-bucket",
+                "airbyte_connection_scope": "fixed_sample",
             },
             calls["run_ansible"].call_args_list[0].args[2],
         )
@@ -1323,6 +1324,7 @@ class DeployVariablesTest(unittest.TestCase):
                 "airbyte_landing_bucket": "example-bucket",
                 "compose_stack_registry_user": "exampleaccount",
                 "aistor_bucket": "example-bucket",
+                "airbyte_connection_scope": "fixed_sample",
             },
             host.deploy_variables(CONFIGURATION, "b" * 40),
         )
@@ -1370,6 +1372,10 @@ class DeployVariablesTest(unittest.TestCase):
             self.assertEqual(0, code, output)
             used = json.loads((stand_in.parent / "pull_config.json").read_text())["auths"]["https://index.docker.io/v1/"]["auth"]
             self.assertEqual(f"exampleaccount:{PullTest.TOKEN}", base64.b64decode(used).decode())
+
+    def test_the_dev_host_copies_the_fixed_sample_and_only_the_prod_host_copies_the_full_release(self) -> None:
+        self.assertEqual("fixed_sample", host.deploy_variables(CONFIGURATION | {"ENVIRONMENT": "dev"}, "b" * 40)["airbyte_connection_scope"])
+        self.assertEqual("full_release", host.deploy_variables(CONFIGURATION | {"ENVIRONMENT": "prod"}, "b" * 40)["airbyte_connection_scope"])
 
     def test_a_bucket_name_that_s3_refuses_stops_the_deploy_before_ansible_runs(self) -> None:
         with self.assertRaises(WarehouseError):

@@ -40,7 +40,7 @@ class HostPlaybookTest(unittest.TestCase):
         self.assertIn("runner_checkout", counted)
 
     def test_the_deploy_gives_the_role_the_commit_that_the_stack_is_deployed_from(self) -> None:
-        variables = host.deploy_variables({"S3_BUCKET": "example-bucket", "IMAGE_REPOSITORY": "exampleaccount/example_images"}, "d" * 40)
+        variables = host.deploy_variables({"S3_BUCKET": "example-bucket", "IMAGE_REPOSITORY": "exampleaccount/example_images", "ENVIRONMENT": "dev"}, "d" * 40)
         self.assertEqual("d" * 40, variables["runner_checkout_commit"])
         self.assertEqual(variables["compose_stack_platform_commit"], variables["runner_checkout_commit"])
 

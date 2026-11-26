@@ -15,12 +15,14 @@ from typing import Any
 import yaml
 
 from scripts.ingestion import table_checks as run
+from scripts.ingestion.record_run import SettingsError, project_store
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = ROOT / "orchestration" / "Dockerfile"
 DEFINITIONS = ROOT / "orchestration" / "surgical_risk" / "definitions.py"
 CODE_LOCATION = ROOT / "compose" / "services" / "dagster_code_location.yml"
 ENTRY = "orchestration/surgical_risk/table_checks.py"
+HOST_SETTINGS_TASKS = ROOT / "ansible" / "roles" / "compose_stack" / "tasks" / "render_environment.yml"
 CONTEXT_FOLDERS = {"stack_scripts": "scripts", "stack_spark": "spark"}
 IMAGE_APP = "/opt/dagster/app/"
 
@@ -154,6 +156,94 @@ class StagingVolumeTest(unittest.TestCase):
         self.assertIn("checks.STAGING_VOLUME", source)
         self.assertIn("checks.STAGING_DIRECTORY", source)
         self.assertNotIn("TABLE_CHECKS_STAGING", source)
+
+
+def required_names(source: str) -> set[str]:
+    """The names of the environment variables that a module insists on: each ``required("NAME")`` call of its own helper."""
+    return {
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "required"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+SAMPLE_VALUES = {
+    "compose_stack_warehouse_location": "s3://example-bucket/warehouse",
+    "workload_access_region": "us-west-2",
+}
+PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_]+)[^}]*\}\}")
+COMPOSE_DEFAULT = re.compile(r"\$\{[A-Z0-9_]+(?::?-([^}]*))?\}")
+
+
+def rendered_env_file(host_settings_tasks: str, name: str) -> dict[str, str]:
+    """The ``NAME=value`` lines that the deploy writes into the env file ``name``, with each template variable given a sample value. A file that no task writes
+    gives nothing, as the container gets nothing from it."""
+    found: dict[str, str] = {}
+    for task in yaml.safe_load(host_settings_tasks):
+        copy = task.get("ansible.builtin.copy") if isinstance(task, dict) else None
+        if not isinstance(copy, dict) or not str(copy.get("dest", "")).endswith(f"/{name}"):
+            continue
+        for line in str(copy.get("content", "")).splitlines():
+            key, separator, value = line.partition("=")
+            if separator and re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
+                found[key.strip()] = PLACEHOLDER.sub(lambda match: SAMPLE_VALUES.get(match.group(1), "sample"), value.strip())
+    return found
+
+
+def deployed_environment(code_location: dict[str, Any], host_settings_tasks: str) -> dict[str, str]:
+    """The environment that the code location container has, from the files its service loads: each ``env_file`` entry (rendered by the deploy) and its Compose
+    ``environment`` (a ``${NAME:-default}`` is its default), the ``environment`` last, as Compose lets it win."""
+    service = code_location["services"]["dagster_code_location"]
+    found: dict[str, str] = {}
+    for entry in service.get("env_file", []):
+        path = entry["path"] if isinstance(entry, dict) else entry
+        found.update(rendered_env_file(host_settings_tasks, Path(path).name))
+    for name, value in service["environment"].items():
+        found[name] = COMPOSE_DEFAULT.sub(lambda match: match.group(1) or "", str(value))
+    return found
+
+
+class EnvironmentWiringTest(unittest.TestCase):
+    """The job runs in the code location container, whose environment is what its service loads (its Compose ``environment`` and its ``env_file`` files, which
+    the deploy renders): a variable that the job insists on and the service does not load stops every run (it was ``AWS_PROFILE`` and ``S3_BUCKET``, which only
+    the owner's ``.env`` has)."""
+
+    def setUp(self) -> None:
+        self.document = yaml.safe_load(CODE_LOCATION.read_text())
+        self.tasks = HOST_SETTINGS_TASKS.read_text()
+        self.environment = deployed_environment(self.document, self.tasks)
+
+    def test_every_variable_the_job_insists_on_is_set_in_the_code_location(self) -> None:
+        self.assertEqual(set(), required_names((ROOT / ENTRY).read_text()) - set(self.environment))
+
+    def test_the_check_names_a_variable_that_the_deploy_does_not_set(self) -> None:
+        source = (ROOT / ENTRY).read_text().replace('required("NESSIE_URI")', 'required("S3_BUCKET")', 1)
+        self.assertEqual({"S3_BUCKET"}, required_names(source) - set(self.environment))
+
+    def test_the_store_of_the_job_is_made_from_the_environment_the_service_loads(self) -> None:
+        store = project_store(self.environment)
+        self.assertEqual("example-bucket", store.bucket)
+
+    def test_a_service_that_does_not_load_the_host_settings_file_gives_the_job_no_store(self) -> None:
+        planted = yaml.safe_load(CODE_LOCATION.read_text())
+        service = planted["services"]["dagster_code_location"]
+        service["env_file"] = [entry for entry in service["env_file"] if Path(entry["path"] if isinstance(entry, dict) else entry).name != "host.env"]
+        environment = deployed_environment(planted, self.tasks)
+        self.assertNotIn("WAREHOUSE_LOCATION", environment)
+        with self.assertRaises(SettingsError):
+            project_store(environment)
+
+    def test_the_job_takes_the_bucket_the_region_and_the_workload_profile_from_the_settings_the_deploy_sets(self) -> None:
+        source = (ROOT / ENTRY).read_text()
+        self.assertIn("project_store(os.environ)", source)
+        self.assertLessEqual({"WAREHOUSE_LOCATION", "AWS_REGION"}, set(self.environment))
+        self.assertNotIn('"AWS_PROFILE"', source)
+        self.assertNotIn('"S3_BUCKET"', source)
 
 
 if __name__ == "__main__":

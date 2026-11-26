@@ -469,7 +469,7 @@ class OrderTest(unittest.TestCase):
     def test_the_launcher_gives_the_bucket_the_policy_reaches(self) -> None:
         from scripts.infra import host
 
-        variables = host.deploy_variables({"S3_BUCKET": "example-project", "IMAGE_REPOSITORY": "exampleaccount/example_images"}, "c" * 40)
+        variables = host.deploy_variables({"S3_BUCKET": "example-project", "IMAGE_REPOSITORY": "exampleaccount/example_images", "ENVIRONMENT": "dev"}, "c" * 40)
         self.assertEqual("example-project", variables["aistor_bucket"])
 
 

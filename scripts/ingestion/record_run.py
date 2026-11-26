@@ -44,6 +44,7 @@ from scripts.ingestion.record_catalog import NessieCatalog
 from scripts.ingestion.record_copy import CopyError, S3CopyStore
 from scripts.ingestion.record_definitions import DefinitionError, Environment, check_environment
 from scripts.ingestion.record_load import Deadlines, LoadError, LoadResult, load_records
+from scripts.ingestion.store import S3Store
 from scripts.stack.nessie import NessieClient, NessieError
 
 DEFAULT_PROFILE = "default"
@@ -140,6 +141,14 @@ def warehouse(environment: Mapping[str, str]) -> tuple[str, str]:
     if found is None:
         raise SettingsError("the setting WAREHOUSE_LOCATION must be s3://<bucket>/<path>")
     return found.group(1), found.group(2)
+
+
+def project_store(environment: Mapping[str, str]) -> S3Store:
+    """The project's bucket as the code location reaches it, for a job that only reads the bucket: the bucket is the one of ``WAREHOUSE_LOCATION``, the
+    region is ``AWS_REGION`` and the profile is ``RECORD_AWS_PROFILE`` (``default``, the workload's own). None of the three is a setting of the owner's
+    ``.env``, which the container does not have."""
+    bucket, _ = warehouse(environment)
+    return S3Store(Aws(setting(environment, "RECORD_AWS_PROFILE", DEFAULT_PROFILE), setting(environment, "AWS_REGION")), bucket)
 
 
 def settings_from_environment(environment: Mapping[str, str]) -> RecordSettings:

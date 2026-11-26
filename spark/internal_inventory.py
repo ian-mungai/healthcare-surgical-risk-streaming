@@ -316,6 +316,13 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "scripts/ingestion/output_file.py": (
         "check_new_output", "publish_reserved", "remove_staging", "replace_owned_file", "write_new_file",
     ),
+    "scripts/ingestion/raw_copy.py": (
+        "Attempt", "HttpRawCopyApi", "JobLedger", "RawConnection", "RawCopyApi", "RawCopyError", "__init__", "attempts", "begin", "cancel",
+        "cancel_job", "cancel_owned", "check_destination", "check_selection", "command", "confirm_stopped", "connection_of", "entries",
+        "find_attempt_job", "first_format_row", "job_connection", "job_document", "job_ids", "job_record", "job_status", "jobs", "left", "main",
+        "open_api", "open_ledger", "path", "positive", "raw_connection", "read_budget", "read_status", "require_owned", "resolve", "rows",
+        "running_jobs", "save", "settle", "show", "start", "start_sync", "wait", "well_formed",
+    ),
     "scripts/ingestion/record_catalog.py": (
         "CatalogError", "NessieCatalog", "__init__", "catalog_error", "create_branch", "delete_branch", "descends_from", "has_recorded_manifest",
         "head", "history", "not_established", "page", "read_reference", "reference", "snapshot_ids", "table_keys",
@@ -339,8 +346,8 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "wait_for_job", "write_load_record", "write_record",
     ),
     "scripts/ingestion/record_run.py": (
-        "RecordSettings", "SettingsError", "api_address", "main", "nessie_address", "plain_http", "run_load", "seconds", "secret_file", "setting",
-        "settings_from_environment", "warehouse",
+        "RecordSettings", "SettingsError", "api_address", "main", "nessie_address", "plain_http", "project_store", "run_load", "seconds",
+        "secret_file", "setting", "settings_from_environment", "warehouse",
     ),
     "scripts/ingestion/record_state.py": (
         "RunState", "StateError", "__init__", "add", "discard", "document", "forget_branch", "keys", "read", "record_branch", "record_job", "save",

@@ -72,7 +72,7 @@ class PlantedDefectTest(unittest.TestCase):
 
 ROOT = DOCKERFILE.parents[1]
 IMAGE_APP = "/opt/dagster/app/"
-ENTRY_MODULES = ("scripts/ingestion/record_run.py", "orchestration/surgical_risk/record_load.py")
+ENTRY_MODULES = ("scripts/ingestion/record_run.py", "orchestration/surgical_risk/record_load.py", "scripts/ingestion/raw_copy.py")
 
 
 def module_file(name: str) -> str | None:
@@ -196,11 +196,19 @@ class RecordLoadImageTest(unittest.TestCase):
         self.assertIn("scripts/ingestion/record_load.py", needed)
         self.assertIn("scripts/sample/candidates.py", needed)
         self.assertIn("scripts/aws_cli.py", needed)
+        self.assertIn("scripts/ingestion/connection.py", needed)
         self.assertEqual([], sorted(needed - copied_from(DOCKERFILE.read_text(), "stack_scripts")))
 
     def test_the_release_pin_that_the_manifest_reader_opens_is_copied_to_where_the_code_looks(self) -> None:
         text = DOCKERFILE.read_text()
         self.assertIn(f"COPY --from=stack_fixtures release.json {IMAGE_APP}tests/fixtures/vitaldb/release.json", text)
+
+    def test_the_candidate_list_that_the_fixed_sample_selection_reads_is_copied_to_where_the_code_looks(self) -> None:
+        text = DOCKERFILE.read_text()
+        self.assertIn(f"COPY --from=stack_fixtures candidates.tsv {IMAGE_APP}tests/fixtures/vitaldb/candidates.tsv", text)
+
+    def test_the_raw_copy_is_copied_into_the_image_as_the_command_that_the_host_runs(self) -> None:
+        self.assertIn("scripts/ingestion/raw_copy.py", copied_from(DOCKERFILE.read_text(), "stack_scripts"))
 
     def test_a_missing_module_is_named_by_the_check(self) -> None:
         text = DOCKERFILE.read_text().replace("ingestion/record_state.py", "")

@@ -3,7 +3,8 @@
 The job's one op reads the ``<run ID>.load_record.json`` file that the load step wrote and calls ``scripts.ingestion.table_checks.run_table_checks``, which
 holds the order (the gate, the Nessie branch at its recorded hash, the staged verified bytes, the Spark job, the merge) and saves ``table_checks.json`` against
 the manifest's SHA-256 under ``results_root``. A failed check fails the run and merges nothing. The track list's pin comes from the tracked release file only.
-The environment names what differs between hosts: ``S3_BUCKET``, ``AWS_PROFILE`` and ``AWS_REGION`` for the landing prefix and ``NESSIE_URI``. The staged files
+The environment names what differs between hosts: ``WAREHOUSE_LOCATION`` (the project's bucket), ``AWS_REGION`` and the workload's profile (``default``, or
+``RECORD_AWS_PROFILE``) for the landing prefix, as the record load reads them, and ``NESSIE_URI``. The staged files
 are in the Docker volume ``table_check_staging`` of the Compose project, mounted here at ``STAGING_DIRECTORY`` and read-only for the Spark job. The job uses
 the in-process executor.
 """
@@ -13,10 +14,9 @@ from pathlib import Path
 
 from dagster import Config, Definitions, Failure, OpExecutionContext, in_process_executor, job, op
 
-from scripts.aws_cli import Aws
 from scripts.ingestion import table_checks as checks
 from scripts.ingestion.record_load import current_load_record_text
-from scripts.ingestion.store import S3Store
+from scripts.ingestion.record_run import SettingsError, project_store
 from scripts.stack.groups import settings_from_environment
 from scripts.stack.nessie import NessieClient
 from spark.table_checks import EMPTY_FORM
@@ -47,7 +47,7 @@ def table_checks_step(context: OpExecutionContext, config: TableChecksConfig) ->
     try:
         record = checks.parse_load_record(current_load_record_text(Path(config.load_record)))
         pin = checks.read_track_pin()
-        store = S3Store(Aws(required("AWS_PROFILE"), required("AWS_REGION")), required("S3_BUCKET"))
+        store = project_store(os.environ)
         settings = settings_from_environment()
         runner = checks.compose_runner(
             settings,
@@ -67,7 +67,7 @@ def table_checks_step(context: OpExecutionContext, config: TableChecksConfig) ->
         )
     except OSError as error:
         raise Failure(description=f"the table checks could not run: a file could not be read or written ({type(error).__name__})") from None
-    except checks.TableChecksError as error:
+    except (checks.TableChecksError, SettingsError) as error:
         raise Failure(description=f"the table checks could not run: {error}") from None
     tables = (outcome.document.get("checked") or {}).get("tables", [])
     failed = [f"{table['table']}: {check['name']}" for table in tables for check in table["checks"] if not check["passed"]]

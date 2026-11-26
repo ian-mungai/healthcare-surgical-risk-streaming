@@ -227,7 +227,8 @@ airbyte_destination_s3_digest: sha256:877e299d77182c7cb2c833c9e4fe7ccc6849487fb1
 # The project's bucket that the raw connection lands in. The deployment's variables give it, as for the workload access region; an empty value is refused.
 airbyte_landing_bucket: ""
 # What the connection selects: full_release (the two tables and the 6,388 case files of the pin) or fixed_sample (the development candidate cases and the two tables, a part of the
-# release). Changing it repairs the source's selection and nothing else, and the files already copied stay copied.
+# release). Changing it repairs the source's selection and nothing else, and the files already copied stay copied. The launcher (scripts.infra.host) overrides this default
+# from the project's environment: the dev host takes fixed_sample and the prod host takes full_release.
 airbyte_connection_scope: full_release
 # The folder of the platform's scripts on the host, and the script that places the project profile's access key. The launcher pipes the key to it on standard input (the
 # owner's exception to the short-lived rule); the key never passes through Ansible.
