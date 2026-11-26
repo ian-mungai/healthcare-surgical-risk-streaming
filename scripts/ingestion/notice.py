@@ -193,6 +193,7 @@ class Code(StrEnum):
     FINDING_KEY = "{key}: {cause}"
     FINDING_POSITION = "selected file {position}: {cause}"
     PROGRESS = "checked {count} of {total} files"
+    CHECK_FAULT_KIND = "faults of kind {cause}: {count}"
     CHECK_FAILED = "check failed: {count} faults in {total} selected files; no manifest may be published"
     CHECK_PASSED = "check passed: {count} of {total} selected files verified; result {digest}"
     NOT_PASSED = "the check did not pass"

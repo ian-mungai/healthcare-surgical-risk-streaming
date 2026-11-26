@@ -1,6 +1,7 @@
 """Run the ingestion checks from the shell under the project profile in ``.env``.
 
-``check``: stream every selected landed object version and compare it with the pinned checksum list; write the result file and exit 1 on any fault.
+``check``: stream every selected landed object version and compare it with the pinned checksum list; write the result file and exit 1 on any fault. A failed
+check writes a line for each fault, then a line for each kind of fault with its count, which names no file, then its summary.
 
 ``.venv/bin/python -m scripts.ingestion.cli check --selection S.json --checksum-list SHA256SUMS.txt --pairings pairings.json --result result.json``
 
@@ -32,6 +33,7 @@ import json
 import posixpath
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from scripts.aws_cli import RAW_ERRORS, Aws, AwsError, AwsTimeout
@@ -40,7 +42,7 @@ from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX, load_pairing_records, pairings_from_metadata
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
-from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.notice import Cause, ClosedError, Code, Notice, Subject, render
 from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.selection import Selection, pinned_release
 from scripts.ingestion.store import S3Store
@@ -106,7 +108,10 @@ def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
     result = run_check(store, selection, read_input_bytes(arguments.checksum_list, Subject.CHECKSUM_LIST), pairings, show_progress)
     write_private(arguments.result, result.to_json())
     if not result.passed:
-        return refuse(*(finding.notice for finding in result.findings), Notice(Code.CHECK_FAILED, count=len(result.findings), total=result.file_count))
+        found = Counter(finding.cause for finding in result.findings)
+        kinds = (Notice(Code.CHECK_FAULT_KIND, cause=cause, count=found[cause]) for cause in Cause if found[cause])
+        failed = Notice(Code.CHECK_FAILED, count=len(result.findings), total=result.file_count)
+        return refuse(*(finding.notice for finding in result.findings), *kinds, failed)
     say(Notice(Code.CHECK_PASSED, count=len(result.files), total=result.file_count, digest=result.result_sha256))
     return 0
 
