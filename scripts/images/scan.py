@@ -10,11 +10,11 @@ version of the package.
 decision. The gate never reads ``pending``. The file is outside every image's sources, so a change in it changes no image tag.
 
 Everything that is not a complete report is refused and is never read as a clean image: a missing or unreadable file, another format or tool, an object that
-holds a key twice (a second, empty list of results would hide the first), a run without invocations that all report ``executionSuccessful`` as true, and a
-result that does not name exactly one package and at least one location. Only an ID, a package URL and an artifact path that match their forms are ever
-shown.
+holds a key twice (a second, empty list of results would hide the first), a scan whose exit status is not the number 0, a run whose invocations, when it holds
+the key, do not all report ``executionSuccessful`` as true, and a result that does not name exactly one package and at least one location. Only an ID, a
+package URL and an artifact path that match their forms are ever shown.
 
-Known conflict (open, Nov 25 2026): the Docker Scout 1.28.0 reports that were read on that day hold no ``invocations`` at all, so this gate refuses them.
+The reports of Docker Scout 1.28.0 hold no ``invocations`` (read on Nov 25 2026), so for them the exit status of the scan alone says that it completed.
 """
 
 from __future__ import annotations
@@ -111,14 +111,19 @@ def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return found
 
 
-def require_success(run: dict[str, Any]) -> None:
-    invocations = run.get("invocations")
+def require_success(run: dict[str, Any], exit_status: object) -> None:
+    """The scan completed: its exit status is the number 0, and a run that holds invocations says so in every one of them, of which there is at least one."""
+    if type(exit_status) is not int or exit_status != 0:
+        raise ScanError("the scan did not end with the exit status 0")
+    if "invocations" not in run:
+        return
+    invocations = run["invocations"]
     if not (isinstance(invocations, list) and invocations and all(isinstance(one, dict) and one.get("executionSuccessful") is True for one in invocations)):
         raise ScanError("the scan report does not say that its execution succeeded")
 
 
-def read_report(text: str) -> frozenset[Finding]:
-    """The findings of a complete SARIF 2.1.0 report of Docker Scout."""
+def read_report(text: str, exit_status: object) -> frozenset[Finding]:
+    """The findings of a complete SARIF 2.1.0 report of Docker Scout, from a scan that ended with ``exit_status``."""
     try:
         document = json.loads(text, object_pairs_hook=unique_keys)
         version = document["version"]
@@ -131,7 +136,7 @@ def read_report(text: str) -> frozenset[Finding]:
         raise ScanError("the scan report is not one complete SARIF run") from error
     if version != "2.1.0" or tool != "docker scout" or not isinstance(results, list):
         raise ScanError("the scan report is not a SARIF 2.1.0 report of docker scout with a list of results")
-    require_success(run)
+    require_success(run, exit_status)
     return frozenset(reported(result) for result in results)
 
 

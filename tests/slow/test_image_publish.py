@@ -53,7 +53,7 @@ if args[:2] == ["scout", "cves"]:
         sys.exit(int((here / ("scan_fails_" + image)).read_text()))
     if not (here / ("no_report_" + image)).exists():
         planted = here / ("report_" + image)
-        run = {{"tool": {{"driver": {{"name": "docker scout"}}}}, "invocations": [{{"executionSuccessful": True}}], "results": []}}
+        run = {{"tool": {{"driver": {{"name": "docker scout"}}}}, "results": []}}
         clean = {{"version": "2.1.0", "runs": [run]}}
         Path(args[args.index("--output") + 1]).write_text(planted.read_text() if planted.exists() else json.dumps(clean))
     sys.exit(0)
@@ -450,7 +450,8 @@ class ScanGateTest(Case):
 
     def plant_report(self, image: str, results: list[dict[str, Any]], invocations: list[dict[str, Any]] | None = None) -> None:
         run: dict[str, Any] = {"tool": {"driver": {"name": "docker scout"}}, "results": results}
-        run["invocations"] = [{"executionSuccessful": True}] if invocations is None else invocations
+        if invocations is not None:
+            run["invocations"] = invocations
         (self.bin / f"report_{image}").write_text(json.dumps({"version": "2.1.0", "runs": [run]}))
 
     def refusal(self) -> PublishError:
@@ -517,7 +518,16 @@ class ScanGateTest(Case):
                 self.assert_nothing_pushed_or_pinned()
                 (self.bin / marker).unlink()
 
-    def test_a_clean_report_of_an_execution_that_did_not_succeed_or_that_does_not_say_so_pushes_nothing(self) -> None:
+    def test_a_clean_real_shaped_report_without_invocations_pushes_only_when_the_scan_exits_with_0(self) -> None:
+        self.plant_report("tool", [])
+        self.assertNotIn("invocations", (self.bin / "report_tool").read_text())
+        (self.bin / "scan_fails_tool").write_text("1")
+        self.assertIn("tool: the scan failed with the exit status 1", str(self.refusal()))
+        self.assert_nothing_pushed_or_pinned()
+        (self.bin / "scan_fails_tool").unlink()
+        self.assertEqual(["app: pushed and pinned", "tool: pushed and pinned"], self.run_publish())
+
+    def test_a_clean_report_whose_invocations_do_not_all_say_that_the_execution_succeeded_pushes_nothing(self) -> None:
         cases: dict[str, list[dict[str, Any]]] = {"failed": [{"executionSuccessful": False}], "no invocation": [], "no statement": [{}]}
         for label, invocations in cases.items():
             with self.subTest(case=label):
@@ -529,7 +539,7 @@ class ScanGateTest(Case):
         self.plant("tool", "CVE-2026-1111")
         path = self.bin / "report_tool"
         text = path.read_text()
-        changed = text.replace('], "invocations": ', '], "results": [], "invocations": ')
+        changed = text.removesuffix("}]}") + ', "results": []}]}'
         self.assertNotEqual(text, changed)
         path.write_text(changed)
         self.assertIn("tool: the scan report holds a key twice in one object", str(self.refusal()))

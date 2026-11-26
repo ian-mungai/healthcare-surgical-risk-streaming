@@ -209,7 +209,7 @@ def refused_findings(settings: Settings, name: str, tag: str, accepted: frozense
             f"{name}: the scan failed with the exit status {code} of docker: check that docker scout works and is signed in on this computer", code
         )
     try:
-        found = scan.read_report(report.read_text())
+        found = scan.read_report(report.read_text(), code)
     except (OSError, UnicodeDecodeError) as error:
         raise PublishError(f"{name}: the scan wrote no readable report") from error
     except scan.ScanError as error:

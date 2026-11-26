@@ -34,8 +34,27 @@ def result(cve: str = "CVE-2026-1111", purl: str = NETTY, uris: tuple[str, ...] 
 
 
 def report(*results: dict[str, Any]) -> dict[str, Any]:
-    run = {"tool": {"driver": {"name": "docker scout", "rules": []}}, "invocations": [{"executionSuccessful": True}], "results": list(results)}
-    return {"version": "2.1.0", "runs": [run]}
+    """A report as Docker Scout 1.28.0 writes it: the schema, the version and one run of a tool and its results, with no invocations."""
+    driver = {
+        "fullName": "Docker Scout",
+        "informationUri": "https://docker.com/products/docker-scout",
+        "name": "docker scout",
+        "rules": [],
+        "version": "1.28.0",
+    }
+    schema = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json"
+    return {"version": "2.1.0", "$schema": schema, "runs": [{"tool": {"driver": driver}, "results": list(results)}]}
+
+
+def stated(document: dict[str, Any], invocations: object) -> str:
+    """The text of a report whose one run holds these invocations."""
+    document["runs"][0]["invocations"] = invocations
+    return json.dumps(document)
+
+
+def read(text: str) -> frozenset[Finding]:
+    """The findings of a report that a scan with the exit status 0 wrote."""
+    return scan.read_report(text, 0)
 
 
 def accepted_text(*entries: str) -> str:
@@ -56,13 +75,13 @@ def entry(
 class ReportTest(unittest.TestCase):
     def test_each_result_is_one_finding_of_its_cve_and_its_package_without_qualifiers_and_with_percent_codes_read(self) -> None:
         debian = "pkg:deb/debian/zlib@1%3A1.3.dfsg%2Breally1.3.1-1?os_distro=trixie&os_name=debian&os_version=13"
-        found = scan.read_report(json.dumps(report(result(), result("GHSA-6v7p-g79w-8964", debian), result())))
+        found = read(json.dumps(report(result(), result("GHSA-6v7p-g79w-8964", debian), result())))
         zlib = Finding("GHSA-6v7p-g79w-8964", "pkg:deb/debian/zlib@1:1.3.dfsg+really1.3.1-1", (JAR,))
         self.assertEqual({Finding("CVE-2026-1111", NETTY, (JAR,)), zlib}, found)
 
     def test_the_artifacts_are_each_location_once_and_a_library_inside_a_jar_is_located_at_the_jar(self) -> None:
         uris = (OTHER_JAR + ":io.netty:netty-handler", JAR, JAR + ":io.netty:netty-handler", "/var/lib/dpkg/info/libzstd1:amd64.md5sums", "/usr/bin/[")
-        (found,) = scan.read_report(json.dumps(report(result(uris=uris))))
+        (found,) = read(json.dumps(report(result(uris=uris))))
         self.assertEqual((JAR, OTHER_JAR, "/usr/bin/[", "/var/lib/dpkg/info/libzstd1:amd64.md5sums"), found.artifacts)
 
     def test_a_result_that_does_not_say_where_the_package_is_refuses_the_report(self) -> None:
@@ -82,14 +101,14 @@ class ReportTest(unittest.TestCase):
             changed = result()
             changed["locations"] = locations
             with self.subTest(case=name), self.assertRaisesRegex(ScanError, "location|in its form"):
-                scan.read_report(json.dumps(report(changed)))
+                read(json.dumps(report(changed)))
         missing = result()
         del missing["locations"]
         with self.assertRaisesRegex(ScanError, "location"):
-            scan.read_report(json.dumps(report(missing)))
+            read(json.dumps(report(missing)))
 
     def test_a_report_with_no_result_holds_no_finding(self) -> None:
-        self.assertEqual(frozenset(), scan.read_report(json.dumps(report())))
+        self.assertEqual(frozenset(), read(json.dumps(report())))
 
     def test_anything_that_is_not_a_complete_scout_report_is_refused_and_never_read_as_clean(self) -> None:
         no_package = result()
@@ -119,15 +138,38 @@ class ReportTest(unittest.TestCase):
         }
         for name, text in cases.items():
             with self.subTest(report=name), self.assertRaises(ScanError):
-                scan.read_report(text)
+                read(text)
 
 
 class CompletionTest(unittest.TestCase):
-    def refused(self, text: str) -> None:
-        with self.assertRaises(ScanError):
-            scan.read_report(text)
+    def refused(self, text: str, status: object = 0) -> None:
+        with self.assertRaisesRegex(ScanError, "does not say that its execution succeeded|exit status"):
+            scan.read_report(text, status)
 
-    def test_a_run_passes_only_when_every_invocation_says_that_its_execution_succeeded(self) -> None:
+    def test_a_real_shaped_report_without_invocations_passes_on_the_exit_status_0_and_is_refused_on_1(self) -> None:
+        for results in ((), (result(),)):
+            with self.subTest(results=len(results)):
+                text = json.dumps(report(*results))
+                self.assertNotIn("invocations", text)
+                self.assertEqual(len(results), len(scan.read_report(text, 0)))
+                self.refused(text, 1)
+
+    def test_only_the_exit_status_0_counts_and_a_status_that_cannot_be_read_refuses(self) -> None:
+        cases: dict[str, object] = {
+            "another failure": 2,
+            "killed by a signal": -9,
+            "no status": None,
+            "the text 0": "0",
+            "the number 0.0": 0.0,
+            "false": False,
+        }
+        good = [{"executionSuccessful": True}]
+        for name, status in cases.items():
+            for text in (json.dumps(report()), stated(report(), good)):
+                with self.subTest(case=name, invocations="invocations" in text):
+                    self.refused(text, status)
+
+    def test_a_run_with_invocations_passes_only_when_every_one_says_that_its_execution_succeeded(self) -> None:
         good = {"executionSuccessful": True}
         cases: dict[str, Any] = {
             "no invocation in the list": [],
@@ -143,21 +185,11 @@ class CompletionTest(unittest.TestCase):
         for name, invocations in cases.items():
             for results in ((), (result(),)):
                 with self.subTest(case=name, results=len(results)):
-                    document = report(*results)
-                    document["runs"][0]["invocations"] = invocations
-                    self.refused(json.dumps(document))
-        two = report()
-        two["runs"][0]["invocations"] = [good, good]
-        self.assertEqual(frozenset(), scan.read_report(json.dumps(two)))
-
-    def test_a_run_without_invocations_is_refused_which_is_the_shape_that_scout_1_28_0_wrote_on_nov_25_2026(self) -> None:
-        """The reports that were read then held no invocations at all, so the gate refuses what that version writes until the owner decides otherwise."""
-        document = report()
-        del document["runs"][0]["invocations"]
-        self.refused(json.dumps(document))
+                    self.refused(stated(report(*results), invocations))
+        self.assertEqual(frozenset(), read(stated(report(), [good, good])))
 
     def test_a_key_that_one_object_holds_twice_is_refused_because_the_last_value_would_hide_the_first(self) -> None:
-        text = json.dumps(report())
+        text = stated(report(), [{"executionSuccessful": True}])
         finding = json.dumps([result()])
         cases = {
             "two result lists, the last one empty": text.replace('"results": []', f'"results": {finding}, "results": []'),
@@ -169,7 +201,7 @@ class CompletionTest(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertNotIn(changed, (text, json.dumps(report(result()))), "the case changed the report")
                 with self.assertRaisesRegex(ScanError, "a key twice"):
-                    scan.read_report(changed)
+                    read(changed)
 
 
 class AcceptedListTest(unittest.TestCase):
