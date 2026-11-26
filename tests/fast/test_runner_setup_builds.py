@@ -393,20 +393,35 @@ class WrapperCommands(unittest.TestCase):
         self.assertEqual(2, len(set(folders)))
         self.assertFalse(any(os.path.exists(folder) for folder in folders))
 
-    def test_the_hypotension_wrapper_runs_the_job_that_it_is_given_with_the_result_option(self) -> None:
+    def hypotension_stack(self, listing: tuple[int, str, str]) -> tuple[Any, ModuleType, list[list[str]], list[list[str]]]:
+        """The hypotension runner's ``Stack`` on a stand-in engine: ``listing`` answers each read of the one Spark slot, and the module's own process runner,
+        which would reach the real Docker command, fails the test. Returns the stack, the module, the launched commands and the slot's reads."""
         module = runner("silver_hypotension")
         folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wrapper_")))
         stack = module.Stack(folder, "p-wrapper-test", folder, SimpleNamespace(commands=[]), [])
         commands: list[list[str]] = []
+        reads: list[list[str]] = []
 
         def discard(command: str, arguments: list[str], **_: Any) -> int:
             commands.append([command, *arguments])
             return 0
 
-        with mock.patch.object(module, "run_discarding_output", discard):
-            for job in ("silver_hypotension", "silver_signals"):
-                stack.silver(job, "build", "b", base="trunk")
+        def engine(command: list[str], *_: Any, **__: Any) -> tuple[int, str, str]:
+            self.assertEqual(["docker", "container", "ls"], command[:3], "the wrapper asked the engine for more than the slot")
+            reads.append(command)
+            return listing
+
+        self.enterContext(mock.patch.object(module, "run_discarding_output", discard))
+        self.enterContext(mock.patch.object(module, "run_command", side_effect=AssertionError("the test reached the real process runner")))
+        stack.run = engine
+        return stack, module, commands, reads
+
+    def test_the_hypotension_wrapper_runs_the_job_that_it_is_given_with_the_result_option(self) -> None:
+        stack, _, commands, reads = self.hypotension_stack((0, "", ""))
+        for job in ("silver_hypotension", "silver_signals"):
+            stack.silver(job, "build", "b", base="trunk")
         self.assertEqual(2, len(commands))
+        self.assertGreaterEqual(len(reads), 4, "the slot is read before and after each launch")
         for job, command in zip(("silver_hypotension", "silver_signals"), commands, strict=True):
             with self.subTest(job=job):
                 self.assertEqual(f"spark.jobs.{job}", command[command.index("-m") + 1])
@@ -414,6 +429,13 @@ class WrapperCommands(unittest.TestCase):
                 self.assertEqual("/result/result.json", command[command.index("--result") + 1])
                 self.assertEqual(1, sum(1 for word in command if word.endswith(":/result")))
                 self.assertEqual("trunk", command[command.index("--base") + 1])
+
+    def test_the_hypotension_wrapper_launches_nothing_when_the_spark_slot_cannot_be_read(self) -> None:
+        stack, module, commands, reads = self.hypotension_stack((1, "", ""))
+        with self.assertRaisesRegex(module.SlotError, "cannot be read: docker exited 1"):
+            stack.silver("silver_hypotension", "build", "b", base="trunk")
+        self.assertEqual([], commands)
+        self.assertEqual(1, len(reads))
 
 
 class LabelsCalls(unittest.TestCase):
