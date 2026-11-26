@@ -178,7 +178,7 @@ findings:
     artifact: /opt/spark/jars/spark-network-common_2.13-4.1.4.jar
     cve: CVE-2026-102554
     package: pkg:maven/com.google.guava/guava@33.4.8-jre
-    reason: "Shaded inside hadoop-client-runtime-3.5.0.jar and spark-network-common_2.13-4.1.4.jar. No Hadoop or Spark release holds 33.7.2 (Hadoop 3.5.0 has 33.4.8, Spark 4.3.0 has 33.6.0). The image's own Guava jar is 33.7.2. Fixed version of the library: 33.7.2."
+    reason: "Shaded inside spark-network-common_2.13-4.1.4.jar. The image stays on Spark 4.1.4 because Iceberg 1.12.0 supports Spark only up to 4.1. A later Spark would not fix it: 4.2.1 and 4.3.0 use Guava 33.6.0, which is affected. The image's own Guava jar is 33.7.2. Sources read Nov 26 2026. Fixed version of the library: 33.7.2."
     date: "2026-11-25"
   - image: spark
     artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
@@ -226,7 +226,7 @@ findings:
     artifact: /opt/spark/jars/spark-core_2.13-4.1.4.jar
     cve: CVE-2026-10050
     package: pkg:maven/org.eclipse.jetty/jetty-security@11.0.26
-    reason: "Shaded inside spark-core_2.13-4.1.4.jar. 4.1.4 is the newest Spark 4.1 release, and the fixed Jetty 11.0 version is not on Maven Central, whose newest 11.0 release is 11.0.26. Fixed version of the library: 11.0.31."
+    reason: "Shaded inside spark-core_2.13-4.1.4.jar. The image stays on Spark 4.1.4 because Iceberg 1.12.0 supports Spark only up to 4.1. A later Spark would not fix it: 4.2.1 and 4.3.0 shade Jetty 12.1.8, which is affected (12.1.10 fixes it). The fixed 11.0.31 is not on Maven Central, whose newest 11.0 release is 11.0.26. Sources read Nov 26 2026. Fixed version of the library: 11.0.31."
     date: "2026-11-25"
   - image: spark
     artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
