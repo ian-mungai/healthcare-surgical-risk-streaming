@@ -1,17 +1,20 @@
 """The publish command builds each image from the tracked files of HEAD, pushes it when the pin file lacks its tag and pins the digest that the push reported.
 
-Docker is a stand-in program that logs its arguments, so no image is built and no registry is reached. The repository is a temporary one. The stand-in knows
-three commands, ``buildx build``, ``scout cves`` and ``push``. Its scan writes the report that a case planted for the image, or a report with no finding.
-Any other command (a read of the registry) is logged and fails, and the cases prove that none is ever run.
+Docker and Trivy are stand-in programs that log their arguments, so no image is built, no database is downloaded and no registry is reached. The repository
+is a temporary one. The Docker stand-in knows three commands, ``buildx build``, ``scout cves`` and ``push``. Any other command (a read of the registry) is
+logged and fails, and the cases prove that none is ever run. The Trivy stand-in knows ``image``, as a scan or as a download of one database. Each scan
+writes the report that a case planted for the image, or a report with no finding.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -20,7 +23,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from scripts.images import pins, publish
+from scripts.images import pins, publish, scan, trivy_scan
 from scripts.images.publish import PublishError, Settings
 from tests.fast.git_fixture import git_in
 
@@ -45,6 +48,8 @@ if args[:2] == ["buildx", "build"]:
     paths = [args[-1]] + [a.split("=", 2)[2] for a in args if a.startswith("--build-context=")]
     with (here / "contexts.log").open("a") as out:
         out.write(json.dumps({{"paths": {{p: files(p) for p in paths}}, "args": args}}) + "\\n")
+    if (here / "build_empties").exists():
+        Path((here / "build_empties").read_text()).write_bytes(b"")
     sys.exit(0)
 if args[:2] == ["scout", "cves"]:
     image = args[-1].rsplit(":", 1)[1].split("-")[0]
@@ -76,6 +81,49 @@ if args[:1] == ["push"]:
     sys.exit(0)
 sys.exit(3)
 """
+TRIVY_STAND_IN = f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+args = sys.argv[1:]
+with (here / "calls.log").open("a") as log:
+    log.write("trivy " + " ".join(args) + "\\n")
+options = dict(a.split("=", 1) for a in args if a.startswith("--") and "=" in a)
+cache = Path(options["--cache-dir"])
+for flag, repository, folder, name in (
+    ("--download-db-only", "--db-repository", "db", "trivy.db"),
+    ("--download-java-db-only", "--java-db-repository", "java-db", "trivy-java.db"),
+):
+    if flag in args:
+        if (here / ("download_fails_" + folder)).exists():
+            sys.stderr.write("{CANARY_TEXT} download failed\\n")
+            sys.exit(1)
+        if not (here / ("download_writes_nothing_" + folder)).exists():
+            (cache / folder).mkdir(parents=True, exist_ok=True)
+            (cache / folder / name).write_text(options[repository])
+            (cache / folder / "metadata.json").write_text("{{}}")
+        sys.exit(0)
+tag = args[-1]
+image = tag.rsplit(":", 1)[1].split("-")[0]
+seen = {{"cwd": os.getcwd(), "files": sorted(os.listdir()), "settings": sorted(n for n in os.environ if n.upper().startswith("TRIVY"))}}
+seen["config"] = Path(options["--config"]).read_text()
+seen["modules"] = os.listdir(options["--module-dir"])
+with (here / "trivy.log").open("a") as out:
+    out.write(json.dumps(seen) + "\\n")
+if (here / ("trivy_fails_" + image)).exists():
+    sys.stderr.write("{CANARY_TEXT} scan failed\\n")
+    sys.exit(int((here / ("trivy_fails_" + image)).read_text()))
+if not (here / ("no_trivy_report_" + image)).exists():
+    planted = here / ("trivy_report_" + image)
+    clean = {{"SchemaVersion": 2, "Trivy": {{"Version": "0.76.2"}}, "ArtifactName": "TAG", "ArtifactType": "container_image"}}
+    clean["Metadata"] = {{"OS": {{"Family": "debian", "Name": "13.7"}}}}
+    clean["Results"] = [{{"Target": "TAG (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Packages": [{{"Name": "base"}}]}}]
+    text = planted.read_text() if planted.exists() else json.dumps(clean)
+    Path(options["--output"]).write_text(text.replace("TAG", tag))
+sys.exit(0)
+"""
+DB_PINS = f"db: example.invalid/db@sha256:{'1' * 64}\njava_db: example.invalid/java-db@sha256:{'2' * 64}\n"
 PUSH = "push --platform linux/amd64 "
 IMAGES = [
     {
@@ -91,8 +139,6 @@ IMAGES = [
 
 
 def digest_of(tag: str) -> str:
-    import hashlib
-
     return "sha256:" + hashlib.sha256(tag.encode()).hexdigest()
 
 
@@ -119,6 +165,19 @@ class Case(unittest.TestCase):
             self.write(relative, text)
         self.accepted_file = base / "accepted_findings.yml"
         self.accepted_file.write_text("findings: []\n")
+        self.trivy = self.bin / "trivy"
+        self.trivy.write_text(TRIVY_STAND_IN)
+        self.trivy.chmod(0o755)
+        self.database_file = base / "trivy_databases.yml"
+        self.database_file.write_text(DB_PINS)
+        self.cache = base / "trivy_cache"
+        self.databases = self.cache / (trivy_scan.folder_prefix(trivy_scan.load_databases(self.database_file)) + "fixture")
+        record = {}
+        for relative in trivy_scan.DATABASE_FILES:
+            (self.databases / relative).parent.mkdir(parents=True, exist_ok=True)
+            (self.databases / relative).write_text("{}")
+            record[relative] = {"size": 2, "sha256": hashlib.sha256(b"{}").hexdigest()}
+        (self.databases / trivy_scan.COMPLETE).write_text(json.dumps(record))
         self.git("init", "--quiet", "--initial-branch", "main")
         self.git("config", "user.name", "Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
@@ -149,6 +208,9 @@ class Case(unittest.TestCase):
             "pin_file": self.pin_file,
             "images": IMAGES,
             "accepted_file": self.accepted_file,
+            "trivy": str(self.trivy),
+            "trivy_databases": self.database_file,
+            "trivy_cache": self.cache,
         }
         return Settings(**{**values, **more})  # type: ignore[arg-type]
 
@@ -275,9 +337,9 @@ class PushTest(Case):
         found = pins.load(self.pin_file)
         for name in ("app", "tool"):
             self.assertEqual(f"{REPOSITORY}@{digest_of(found[name]['tag'])}", found[name]["digest"])
-        allowed = re.compile(rf"buildx build |scout cves |{re.escape(PUSH)}")
+        allowed = re.compile(rf"buildx build |scout cves |trivy image |{re.escape(PUSH)}")
         self.assertEqual(
-            [], [line for line in self.calls() if not allowed.match(line)], "the registry is never read: only a build, a scan of the local image and a push run"
+            [], [line for line in self.calls() if not allowed.match(line)], "the registry is never read: only a build, scans of the local image and a push run"
         )
         self.assertEqual(
             [PUSH + found["app"]["tag"], PUSH + found["tool"]["tag"]], self.pushes(), "each push asks for the one linux/amd64 manifest, not an index"
@@ -463,14 +525,121 @@ class ScanGateTest(Case):
         self.assertEqual([], self.pushes())
         self.assertEqual("images: {}\n", self.pin_file.read_text())
 
-    def test_every_built_image_is_scanned_before_the_first_push_and_each_scan_is_of_the_local_tag(self) -> None:
+    def test_every_built_image_is_scanned_by_both_scanners_before_the_first_push_and_each_scan_is_of_the_local_tag(self) -> None:
         self.run_publish()
         found = pins.load(self.pin_file)
         kinds = [line.split()[0] for line in self.calls()]
-        self.assertEqual(["buildx", "scout", "buildx", "scout", "push", "push"], kinds)
+        self.assertEqual(["buildx", "scout", "trivy", "buildx", "scout", "trivy", "push", "push"], kinds)
         scans = [line for line in self.calls() if line.startswith("scout ")]
         self.assertEqual([f"local://{found[name]['tag']}" for name in ("app", "tool")], [line.split()[-1] for line in scans])
         self.assertTrue(all(line.startswith("scout cves --platform linux/amd64 --only-fixed --format sarif --output ") for line in scans))
+        second = [line.split() for line in self.calls() if line.startswith("trivy ")]
+        self.assertEqual([found[name]["tag"] for name in ("app", "tool")], [line[-1] for line in second])
+        for line in second:
+            for option in ("--image-src=docker", "--severity=HIGH,CRITICAL", "--ignore-unfixed", "--skip-db-update", "--skip-java-db-update"):
+                self.assertIn(option, line)
+            self.assertIn(f"--cache-dir={self.databases}", line)
+
+    def test_trivy_runs_in_a_new_folder_with_an_empty_configuration_and_no_trivy_setting_of_the_caller(self) -> None:
+        with mock.patch.dict(os.environ, {"TRIVY_SEVERITY": "CRITICAL", "TRIVY_IGNOREFILE": "/x"}):
+            self.run_publish()
+        seen = [json.loads(line) for line in (self.bin / "trivy.log").read_text().splitlines()]
+        self.assertEqual(2, len(seen))
+        for run in seen:
+            self.assertEqual(([], "", [], ["modules", "trivy.yaml"]), (run["settings"], run["config"], run["modules"], run["files"]))
+            self.assertNotEqual(str(self.repo), run["cwd"])
+        self.assertNotEqual(seen[0]["cwd"], seen[1]["cwd"])
+
+    def plant_trivy(self, image: str, cve: str = "CVE-2026-1111", path: str | None = HOLDER.lstrip("/"), package: str = FINDING_PACKAGE) -> None:
+        found: dict[str, Any] = {"VulnerabilityID": cve, "PkgIdentifier": {"PURL": package}, "Severity": "HIGH"}
+        if path is not None:
+            found["PkgPath"] = path
+        os_result = {"Target": "TAG (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Packages": [{"Name": "base"}]}
+        library = {"Target": "Java", "Class": "lang-pkgs", "Type": "jar", "Packages": [{"Name": "netty"}], "Vulnerabilities": [found]}
+        document = {"SchemaVersion": 2, "Trivy": {"Version": "0.76.2"}, "ArtifactName": "TAG", "ArtifactType": "container_image"}
+        document.update(Metadata={"OS": {"Family": "debian", "Name": "13.7"}}, Results=[os_result, library])
+        (self.bin / f"trivy_report_{image}").write_text(json.dumps(document))
+
+    def test_a_finding_that_only_trivy_reports_stops_the_push_of_every_image(self) -> None:
+        self.plant_trivy("tool")
+        error = self.refusal()
+        self.assertEqual((f"tool: Trivy: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), error.findings)
+        self.assertIn("nothing was pushed", str(error))
+        self.assert_nothing_pushed_or_pinned()
+
+    def test_one_entry_for_the_image_artifact_id_and_package_accepts_the_finding_from_both_scanners_and_nothing_wider(self) -> None:
+        self.plant("tool", "CVE-2026-1111")
+        self.plant_trivy("tool")
+        both = (f"tool: Docker Scout: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}", f"tool: Trivy: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}")
+        self.assertEqual(both, self.refusal().findings)
+        self.assert_nothing_pushed_or_pinned()
+        self.accepted_file.write_text("findings:\n" + accepted_entry())
+        self.plant_trivy("tool", path=HOLDER.lstrip("/") + "/BOOT-INF/lib/netty-handler-4.2.7.jar")
+        self.assertEqual((f"tool: Trivy: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}/BOOT-INF/lib/netty-handler-4.2.7.jar",), self.refusal().findings)
+        self.plant_trivy("tool", path=None)
+        self.assertEqual((f"tool: Trivy: CVE-2026-1111 {FINDING_PACKAGE} in {trivy_scan.NO_PATH}",), self.refusal().findings)
+        self.assert_nothing_pushed_or_pinned()
+        self.plant_trivy("tool")
+        self.assertEqual(["app: pushed and pinned", "tool: pushed and pinned"], self.run_publish())
+
+    def test_a_trivy_scan_that_fails_or_writes_no_report_or_an_incomplete_one_pushes_nothing_and_shows_no_output_of_trivy(self) -> None:
+        cases = (
+            ("trivy_fails_tool", "3", "tool: the Trivy scan failed with the exit status 3"),
+            ("no_trivy_report_tool", "", "tool: the Trivy scan wrote no readable report"),
+            ("trivy_report_tool", '{"SchemaVersion": 2}', "tool: Trivy: the report is not one complete report of the pinned Trivy"),
+            ("trivy_report_tool", '{"Results": [], "Results": []}', "tool: Trivy: the scan report holds a key twice in one object"),
+        )
+        for marker, content, message in cases:
+            with self.subTest(case=message):
+                (self.bin / marker).write_text(content)
+                text = str(self.refusal())
+                self.assertIn(message, text)
+                self.assertNotIn(CANARY_TEXT, text)
+                self.assert_nothing_pushed_or_pinned()
+                (self.bin / marker).unlink()
+
+    def test_databases_that_are_not_downloaded_stop_the_command_before_any_build(self) -> None:
+        for relative in (*trivy_scan.DATABASE_FILES, trivy_scan.COMPLETE):
+            with self.subTest(missing=relative):
+                path = self.databases / relative
+                content = path.read_text()
+                path.unlink()
+                self.assertIn("run make trivy-db", str(self.refusal()))
+                self.assertEqual([], self.calls())
+                path.write_text(content)
+
+    def test_a_database_file_that_is_emptied_during_the_build_stops_the_command_before_trivy_scans(self) -> None:
+        (self.bin / "build_empties").write_text(str(self.databases / "java-db" / "trivy-java.db"))
+        self.assertIn("run make trivy-db", str(self.refusal()))
+        self.assertEqual([], [line for line in self.calls() if line.startswith("trivy ")])
+        self.assert_nothing_pushed_or_pinned()
+
+    def test_a_trivy_report_with_a_null_package_record_or_an_os_family_that_is_a_list_pushes_nothing(self) -> None:
+        clean = {"SchemaVersion": 2, "Trivy": {"Version": "0.76.2"}, "ArtifactName": "TAG", "ArtifactType": "container_image"}
+        listed = {"Target": "TAG (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Packages": [{"Name": "base"}]}
+        debian = {"OS": {"Family": "debian", "Name": "13.7"}}
+        cases = (
+            ({**clean, "Metadata": debian, "Results": [{**listed, "Packages": [None]}]}, "list of checked packages"),
+            ({**clean, "Metadata": {"OS": {"Family": ["debian"], "Name": "13.7"}}, "Results": [listed]}, "operating system"),
+        )
+        for document, message in cases:
+            with self.subTest(case=message):
+                (self.bin / "trivy_report_tool").write_text(json.dumps(document))
+                self.assertIn(message, str(self.refusal()))
+                self.assert_nothing_pushed_or_pinned()
+
+    def test_new_pins_ask_for_their_own_download_and_unreadable_pins_stop_the_command_before_any_docker_call(self) -> None:
+        self.database_file.write_text(DB_PINS.replace("1" * 64, "3" * 64))
+        self.assertIn("run make trivy-db", str(self.refusal()))
+        self.database_file.write_text("db: example.invalid/db:2\n")
+        self.assertIn("database pins", str(self.refusal()))
+        self.assertEqual([], self.calls())
+
+    def test_a_run_with_every_image_pinned_needs_no_database(self) -> None:
+        self.run_publish()
+        for relative in trivy_scan.DATABASE_FILES:
+            (self.databases / relative).unlink()
+        self.assertEqual(["app: already pinned", "tool: already pinned"], self.run_publish())
 
     def test_a_finding_in_the_last_image_stops_the_push_of_every_image_and_each_finding_of_each_image_is_named(self) -> None:
         for planted in (["tool"], ["app", "tool"]):
@@ -478,7 +647,7 @@ class ScanGateTest(Case):
                 for image in planted:
                     self.plant(image, "CVE-2026-1111")
                 error = self.refusal()
-                self.assertEqual(tuple(f"{image}: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}" for image in planted), error.findings)
+                self.assertEqual(tuple(f"{image}: Docker Scout: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}" for image in planted), error.findings)
                 self.assertIn("nothing was pushed", str(error))
                 self.assert_nothing_pushed_or_pinned()
 
@@ -492,7 +661,7 @@ class ScanGateTest(Case):
         for label, other in others.items():
             with self.subTest(case=label):
                 self.accepted_file.write_text("findings:\n" + other)
-                self.assertEqual((f"tool: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), self.refusal().findings)
+                self.assertEqual((f"tool: Docker Scout: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), self.refusal().findings)
                 self.assert_nothing_pushed_or_pinned()
         self.accepted_file.write_text("findings:\n" + accepted_entry())
         self.assertEqual(["app: pushed and pinned", "tool: pushed and pinned"], self.run_publish())
@@ -500,7 +669,7 @@ class ScanGateTest(Case):
     def test_an_entry_that_is_only_pending_lets_nothing_pass(self) -> None:
         self.plant("tool", "CVE-2026-1111")
         self.accepted_file.write_text("findings: []\npending:\n" + accepted_entry())
-        self.assertEqual((f"tool: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), self.refusal().findings)
+        self.assertEqual((f"tool: Docker Scout: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), self.refusal().findings)
         self.assert_nothing_pushed_or_pinned()
 
     def test_a_scan_that_fails_or_writes_no_report_or_an_incomplete_one_pushes_nothing_and_shows_no_output_of_docker(self) -> None:
@@ -568,7 +737,7 @@ class ScanGateTest(Case):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.assertEqual(1, publish.main([], self.settings()))
         self.assertEqual("", out.getvalue())
-        self.assertIn(f"publish: app: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}\n", err.getvalue())
+        self.assertIn(f"publish: app: Docker Scout: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}\n", err.getvalue())
         self.assertNotIn(CANARY_TEXT, err.getvalue())
 
 
@@ -579,6 +748,14 @@ class MissingToolTest(Case):
             code = publish.main([], settings=self.settings(docker=str(self.bin / "no_such_docker")))
         self.assertEqual(1, code)
         self.assertEqual("publish: docker could not be started: it is not installed, not on the path or not executable\n", err.getvalue())
+
+    def test_a_missing_trivy_is_a_fixed_message_and_pushes_nothing(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = publish.main([], settings=self.settings(trivy=str(self.bin / "no_such_trivy")))
+        self.assertEqual(1, code)
+        self.assertEqual("publish: trivy could not be started: it is not installed, not on the path or not executable: run make setup\n", err.getvalue())
+        self.assertEqual([], self.pushes())
 
     def test_a_missing_git_is_a_fixed_message_and_not_a_traceback(self) -> None:
         err = io.StringIO()
@@ -595,6 +772,60 @@ class MissingToolTest(Case):
         self.assertEqual(1, code)
         self.assertEqual("publish: the pin file could not be written\n", err.getvalue())
         self.assertEqual(before, self.pin_file.read_text())
+
+
+class DatabaseDownloadTest(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        shutil.rmtree(self.databases)
+
+    def downloaded(self) -> Path:
+        return trivy_scan.require_databases(self.cache, trivy_scan.load_databases(self.database_file))
+
+    def fetch(self) -> bool:
+        return trivy_scan.fetch_databases(str(self.trivy), self.cache, trivy_scan.load_databases(self.database_file))
+
+    def test_both_databases_are_downloaded_by_their_pinned_digests_once_into_the_folder_of_the_pins(self) -> None:
+        self.assertTrue(self.fetch())
+        folder = self.downloaded()
+        self.assertEqual(f"example.invalid/db@sha256:{'1' * 64}", (folder / "db" / "trivy.db").read_text())
+        self.assertEqual(f"example.invalid/java-db@sha256:{'2' * 64}", (folder / "java-db" / "trivy-java.db").read_text())
+        self.assertEqual(2, len(self.calls()))
+        self.assertFalse(self.fetch(), "a second run downloads nothing")
+        self.assertEqual(2, len(self.calls()))
+        self.assertEqual([folder.name], os.listdir(self.cache))
+
+    def test_a_download_that_fails_or_writes_nothing_leaves_no_folder_and_a_retry_downloads_both_again(self) -> None:
+        for marker in ("download_fails_db", "download_fails_java-db", "download_writes_nothing_db", "download_writes_nothing_java-db"):
+            with self.subTest(case=marker):
+                (self.bin / marker).write_text("")
+                with self.assertRaises(scan.ScanError) as raised:
+                    self.fetch()
+                self.assertNotIn(CANARY_TEXT, str(raised.exception))
+                self.assertEqual([], os.listdir(self.cache))
+                (self.bin / marker).unlink()
+        self.assertTrue(self.fetch())
+
+    def test_a_folder_that_a_killed_download_left_is_never_read_and_the_next_download_completes_beside_it(self) -> None:
+        left = self.cache / (self.databases.name.removesuffix("fixture") + "0killed")
+        (left / "db").mkdir(parents=True)
+        (left / "db" / "trivy.db").write_text("half")
+        with self.assertRaisesRegex(scan.ScanError, "run make trivy-db"):
+            self.downloaded()
+        self.assertTrue(self.fetch())
+        self.assertNotEqual(left, self.downloaded())
+
+    def test_the_command_downloads_the_pins_it_is_given_and_prints_only_fixed_text(self) -> None:
+        for expected in ("the pinned Trivy databases are downloaded\n", "the pinned Trivy databases are already downloaded\n"):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(0, trivy_scan.main([], str(self.trivy), self.cache, self.database_file))
+            self.assertEqual((expected, ""), (out.getvalue(), err.getvalue()))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(1, trivy_scan.main([], str(self.bin / "no_such_trivy"), self.cache / "other", self.database_file))
+            self.assertEqual(2, trivy_scan.main(["--now"], str(self.trivy), self.cache, self.database_file))
+        self.assertIn("run make setup", err.getvalue())
 
 
 class OutputTest(Case):

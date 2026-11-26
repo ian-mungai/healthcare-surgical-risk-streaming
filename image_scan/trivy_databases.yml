@@ -1,0 +1,5 @@
+# The databases that Trivy, the second scanner of the publisher's gate (scripts/images/trivy_scan.py), reads, each pinned by the digest of its manifest, so that
+# the same pins give the same findings. make trivy-db downloads them into .tools/trivy_db. A pinned database holds nothing published after its date. The README
+# says how to refresh the pins. Read from mirror.gcr.io on Nov 26 2026: the vulnerability database of 13:14 UTC and the Java database of 00:58 UTC that day.
+db: mirror.gcr.io/aquasec/trivy-db@sha256:12eb51ca2504774d83eaba2368336a977b381e01351ccf96211bba7b0fffefa9
+java_db: mirror.gcr.io/aquasec/trivy-java-db@sha256:bf71d72f059a5a7d69bb53bd92c17b298986cbe3aa1cd710ad7b3008dba34678

@@ -16,14 +16,16 @@ no host pulls it.
 Accepted limit (owner, Nov 25 2026): two publishes at the same time can replace the digest of a pinned tag, because each reads the pin file before the other has
 written it. The command takes no lock. Trigger to revisit: more than one person or process publishes. Today only the owner publishes, by hand.
 
-Scan gate: every image that the run builds is scanned with Docker Scout before any image is pushed (``scripts.images.scan``). One fixable finding that the
-committed list ``image_scan/accepted_findings.yml`` does not name, in any of them, refuses the whole push, and so does a scan that fails or writes no
-complete report. The refusal names each such finding of each image. An image whose tag the pin file already holds is not pushed and is not scanned again, so
-a finding published after its push shows only at a scan run by hand or when its sources change.
+Scan gate: every image that the run builds is scanned with Docker Scout (``scripts.images.scan``) and with the pinned Trivy and its pinned databases
+(``scripts.images.trivy_scan``) before any image is pushed. One finding of either scanner that the committed list ``image_scan/accepted_findings.yml`` does
+not name, in any of the images, refuses the whole push, and so does a scan that fails or writes no complete report. The refusal names each such finding of
+each image and the scanner that reported it. An image to build needs the pinned databases (``make trivy-db``) before its build, and their files are checked
+again before its Trivy scan. An image whose tag the pin file already holds is not pushed and is not scanned again, so a finding published after its push shows
+only at a scan run by hand or when its sources change.
 
 The command relies on the ``docker login`` that this computer already has, which Docker Scout uses too. It reads, prints and writes no token, and every
-message is fixed text: no output of Docker or Git is ever shown. The one exception is a refused finding's vulnerability ID, package URL and artifact paths,
-each shown only when it matches its form.
+message is fixed text: no output of Docker, Trivy or Git is ever shown. The one exception is a refused finding's vulnerability ID, package URL and artifact
+paths, each shown only when it matches its form.
 """
 
 from __future__ import annotations
@@ -40,10 +42,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.images import pins, scan
+from scripts.images import pins, scan, trivy_scan
 from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ENV_FILE, ConfigurationError, load_configuration
+from scripts.quality import install_tools
 
 PLATFORM = "linux/amd64"
 GIT_SECONDS = 120
@@ -72,6 +75,9 @@ class Settings:
     pin_file: Path
     images: list[dict[str, Any]]
     accepted_file: Path = scan.ACCEPTED_FILE
+    trivy: str = str(install_tools.TRIVY.path)
+    trivy_databases: Path = trivy_scan.DATABASE_FILE
+    trivy_cache: Path = trivy_scan.CACHE
 
 
 def default_settings(env_file: Path = ENV_FILE) -> Settings:
@@ -188,20 +194,15 @@ def push_image(settings: Settings, name: str, tag: str) -> str:
     return pushed_digest(name, tag, out)
 
 
-def prepare_image(settings: Settings, image: dict[str, Any], found: dict[str, dict[str, str]], scratch: Path) -> str | None:
-    """Build the image and return its tag. A tag that the pin file holds keeps its pin: nothing is built and None comes back."""
-    name = image["name"]
-    folder = scratch / name
+def new_tag(settings: Settings, image: dict[str, Any], found: dict[str, dict[str, str]], folder: Path) -> str | None:
+    """Stage the image in ``folder`` and return its tag. A tag that the pin file holds keeps its pin: None comes back."""
     folder.mkdir()
     tag = image_tag(settings, image, stage(settings, image, folder))
-    if found.get(name, {}).get("tag") == tag:
-        return None
-    build_image(settings, image, folder, tag)
-    return tag
+    return None if found.get(image["name"], {}).get("tag") == tag else tag
 
 
-def refused_findings(settings: Settings, name: str, tag: str, accepted: frozenset[scan.Accepted], scratch: Path) -> list[scan.Finding]:
-    """Scan the built image into a new report and return its fixable findings that the accepted list does not name for this image and their artifacts."""
+def scout_findings(settings: Settings, name: str, tag: str, scratch: Path) -> frozenset[scan.Finding]:
+    """Scan the built image with Docker Scout into a new report and return its findings."""
     report = scratch / f"{name}.sarif"
     code, _, _ = docker(settings, scan.scan_arguments(tag, report), SCAN_SECONDS, "docker scout cves")
     if code != 0:
@@ -209,30 +210,59 @@ def refused_findings(settings: Settings, name: str, tag: str, accepted: frozense
             f"{name}: the scan failed with the exit status {code} of docker: check that docker scout works and is signed in on this computer", code
         )
     try:
-        found = scan.read_report(report.read_text(), code)
+        return scan.read_report(report.read_text(), code)
     except (OSError, UnicodeDecodeError) as error:
         raise PublishError(f"{name}: the scan wrote no readable report") from error
     except scan.ScanError as error:
         raise PublishError(f"{name}: {error}") from error
-    return scan.unaccepted(name, found, accepted)
 
 
-def build_and_scan(settings: Settings, found: dict[str, dict[str, str]], accepted: frozenset[scan.Accepted], scratch: Path) -> dict[str, str]:
-    """Build and scan every image whose tag the pin file lacks, and return each one's tag by its name. Every image is scanned before the refusal, so that
-    it names every finding at once."""
+def trivy_findings(settings: Settings, name: str, tag: str, databases: Path, scratch: Path) -> frozenset[scan.Finding]:
+    """Scan the built image with Trivy and the pinned databases in ``databases`` into a new report and return its findings. The databases are checked here,
+    just before the scan, because a build can take long and a damaged file would give a clean report."""
+    if not trivy_scan.intact(databases):
+        raise PublishError(f"{name}: a pinned Trivy database file is not as its download wrote it: run make trivy-db")
+    work = trivy_scan.workspace(scratch / f"{name}.trivy")
+    report = scratch / f"{name}.trivy.json"
+    try:
+        code = trivy_scan.run_trivy(settings.trivy, trivy_scan.scan_arguments(tag, report, databases, work), work, SCAN_SECONDS, "trivy image")
+    except scan.ScanError as error:
+        raise PublishError(str(error)) from error
+    if code != 0:
+        raise PublishError(f"{name}: the Trivy scan failed with the exit status {code}", code)
+    try:
+        return trivy_scan.read_report(report.read_text(), code, tag)
+    except (OSError, UnicodeDecodeError) as error:
+        raise PublishError(f"{name}: the Trivy scan wrote no readable report") from error
+    except scan.ScanError as error:
+        raise PublishError(f"{name}: Trivy: {error}") from error
+
+
+def build_and_scan(
+    settings: Settings, found: dict[str, dict[str, str]], accepted: frozenset[scan.Accepted], databases: trivy_scan.Databases, scratch: Path
+) -> dict[str, str]:
+    """Build every image whose tag the pin file lacks, scan it with both scanners and return each one's tag by its name. Every image is scanned before the
+    refusal, so that it names every finding at once."""
     built: dict[str, str] = {}
     refused: list[str] = []
     for image in settings.images:
-        tag = prepare_image(settings, image, found, scratch)
+        name = image["name"]
+        tag = new_tag(settings, image, found, scratch / name)
         if tag is None:
             continue
-        name = image["name"]
+        try:
+            folder = trivy_scan.require_databases(settings.trivy_cache, databases)
+        except scan.ScanError as error:
+            raise PublishError(str(error)) from error
+        build_image(settings, image, scratch / name, tag)
         built[name] = tag
-        refused += [f"{name}: {scan.shown(finding)}" for finding in refused_findings(settings, name, tag, accepted, scratch)]
+        reports = (("Docker Scout", scout_findings(settings, name, tag, scratch)), ("Trivy", trivy_findings(settings, name, tag, folder, scratch)))
+        for scanner, findings in reports:
+            refused += [f"{name}: {scanner}: {scan.shown(finding)}" for finding in scan.unaccepted(name, findings, accepted)]
     if refused:
         raise PublishError(
-            "nothing was pushed: the scan found fixable findings that image_scan/accepted_findings.yml does not name: fix each one, or accept one that no "
-            "release can fix with its reason and date",
+            "nothing was pushed: a scan found findings that image_scan/accepted_findings.yml does not name: fix each one, or accept one that no release can "
+            "fix with its reason and date",
             findings=tuple(refused),
         )
     return built
@@ -245,6 +275,7 @@ def publish(settings: Settings) -> list[str]:
     try:
         found = pins.load(settings.pin_file)
         accepted = scan.load_accepted(settings.accepted_file)
+        databases = trivy_scan.load_databases(settings.trivy_databases)
     except (pins.PinError, scan.ScanError) as error:
         raise PublishError(str(error)) from error
     if any(not value["digest"].startswith(settings.repository + "@") for value in found.values()):
@@ -252,7 +283,7 @@ def publish(settings: Settings) -> list[str]:
     resolved = dict(found)
     messages: list[str] = []
     with tempfile.TemporaryDirectory(prefix="images_") as scratch:
-        built = build_and_scan(settings, found, accepted, Path(scratch))
+        built = build_and_scan(settings, found, accepted, databases, Path(scratch))
         for image in settings.images:
             name = image["name"]
             if name not in built:
