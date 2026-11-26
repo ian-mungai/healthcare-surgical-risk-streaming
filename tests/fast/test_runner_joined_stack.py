@@ -199,9 +199,17 @@ def nothing_left(*arguments: str) -> tuple[int, str]:
     return 0, ""
 
 
+class HeldRead:
+    """A read that the sampler is still making: it ends, with ``outcome`` raised, only when ``release`` is set."""
+
+    def __init__(self, outcome: BaseException) -> None:
+        self.release = threading.Event()
+        self.outcome = outcome
+
+
 class Stats:
     """The ``docker stats`` command of the memory sampler. It answers the planted reads in their order, an exception being raised, and then complete samples.
-    ``answered`` is set at the first read after the planted ones, when the sampler has finished each of them."""
+    ``answered`` is set at the first read after the planted ones, or at a held one, when the sampler has finished each read before it."""
 
     def __init__(self, *reads: Any) -> None:
         self.reads = list(reads)
@@ -222,6 +230,10 @@ class Stats:
             self.answered.set()
             return self.sample()
         planted = self.reads.pop(0)
+        if isinstance(planted, HeldRead):
+            self.answered.set()
+            planted.release.wait(30)
+            planted = planted.outcome
         if isinstance(planted, BaseException):
             raise planted
         answer: CompletedProcess[str] = planted
@@ -259,9 +271,18 @@ class JoinedStackCleanup(unittest.TestCase):
         step: BaseException | None = None,
         sampler: threading.Thread | None = None,
         stats: Stats | None = None,
+        held: HeldRead | None = None,
+        ends_at_last_join: bool = False,
+        after_reads: BaseException | None = None,
     ) -> int:
-        """With ``stats`` the runner's own sampler runs, its ``docker stats`` command answered by it, and the first deploy ends after its planted reads."""
+        """With ``stats`` the runner's own sampler runs, its ``docker stats`` command answered by it, and the first deploy ends after its planted reads, with
+        ``after_reads`` raised when given. ``held`` is the read of ``stats`` that outlasts the runner's wait; with ``ends_at_last_join`` it ends when the
+        cleanup asks the sampler to stop, which is the second stop of the run."""
         real_run = self.runner.Run
+        runs: list[Any] = []
+        if held is not None:
+            self.addCleanup(lambda: [run.sampler.join(5) for run in runs])
+            self.addCleanup(held.release.set)
 
         def make_run(record: Any, log: list[str], scratch: Path, *others: object) -> Any:
             self.scratch.append(scratch)
@@ -273,6 +294,18 @@ class JoinedStackCleanup(unittest.TestCase):
             if stats is None:
                 run.start_sampling = lambda: None
             run.peaks, run.failed_reads, run.grafana_mib = {}, [], None
+            runs.append(run)
+            if held is not None and ends_at_last_join:
+                stop = run.stop_sampling
+                stops: list[None] = []
+
+                def stop_sampling() -> bool:
+                    stops.append(None)
+                    if len(stops) == 2:
+                        held.release.set()
+                    return bool(stop())
+
+                run.stop_sampling = stop_sampling
             return run
 
         def first_deploy(run: Any) -> bool:
@@ -283,13 +316,15 @@ class JoinedStackCleanup(unittest.TestCase):
                 while not stats.answered.wait(0.01) and run.sampler.is_alive() and time.monotonic() < deadline:
                     pass
                 self.assertTrue(stats.answered.is_set() or not run.sampler.is_alive(), "the sampler made its planted reads or ended")
+            if after_reads is not None:
+                raise after_reads
             return False
 
         replaced: dict[str, Any] = {
             "Run": make_run,
             "first_deploy": first_deploy,
             "peak_memory": self.peaks_evaluated.append,
-            "COMMAND_SECONDS": 0.2 if sampler is not None else self.runner.COMMAND_SECONDS,
+            "COMMAND_SECONDS": 0.2 if sampler is not None or held is not None else self.runner.COMMAND_SECONDS,
             "require_pinned_images": lambda docker: None,
             "recorded_state": lambda root: ("0" * 40, "0" * 64),
             "fill_landed_cache": lambda folder, cases: {},
@@ -316,6 +351,16 @@ class JoinedStackCleanup(unittest.TestCase):
     def failed(document: dict[str, Any]) -> str:
         return "\n".join(f"{item['case']}: {item['observed']}" for item in document["observations"] if not item["passed"])
 
+    @staticmethod
+    def read_checks(document: dict[str, Any]) -> list[bool]:
+        return [item["passed"] for item in document["observations"] if item["case"] == "memory samples read without a failure"]
+
+    def again(self) -> None:
+        """Clear what the run before this one left, for the next case of a table."""
+        self.root.joinpath("runs").exists() and shutil.rmtree(self.root / "runs")
+        self.scratch.clear()
+        self.peaks_evaluated.clear()
+
     def test_a_sampler_that_misses_its_deadline_fails_the_run_before_the_memory_peaks_are_evaluated(self) -> None:
         self.assertEqual(1, self.main(ProjectDocker(), sampler=self.sampler(ends=False)))
         document = self.saved()
@@ -323,7 +368,38 @@ class JoinedStackCleanup(unittest.TestCase):
         self.assertEqual([], self.peaks_evaluated, "peaks that the sampler can still change are not evaluated")
         self.assertIn("memory sampling ended before the peaks: the sampler is still running", self.failed(document))
         self.assertIn("sampling stopped: stopped: False", self.failed(document))
+        self.assertIn("memory samples read without a failure: incomplete: the sampler is still running", self.failed(document))
+        self.assertEqual([False], self.read_checks(document))
         self.assertRegex(document["cleanup"], r"^cleanup failed \(sampling stopped\b")
+
+    def test_a_read_that_fails_while_the_cleanup_waits_for_the_sampler_fails_the_check_of_the_reads(self) -> None:
+        held = HeldRead(TimeoutExpired("docker", 120))
+        self.assertEqual(1, self.main(nothing_left, stats=Stats(Stats.sample(), held), held=held, ends_at_last_join=True))
+        document = self.saved()
+        failed = self.failed(document)
+        self.assertIn("memory sampling ended before the peaks: the sampler is still running", failed)
+        self.assertIn("memory samples read without a failure: 1 failed reads", failed)
+        self.assertIn("TimeoutExpired", failed)
+        self.assertNotIn("incomplete", failed)
+        self.assertNotIn("sampling stopped", failed, "the cleanup's wait saw the sampler end")
+        self.assertEqual([False], self.read_checks(document))
+        self.assertEqual([], self.peaks_evaluated)
+
+    def test_a_read_that_never_ends_leaves_the_check_of_the_reads_failed_as_incomplete(self) -> None:
+        held = HeldRead(OSError("planted"))
+        self.assertEqual(1, self.main(nothing_left, stats=Stats(Stats.sample(), held), held=held))
+        document = self.saved()
+        self.assertIn("memory samples read without a failure: incomplete: the sampler is still running", self.failed(document))
+        self.assertEqual([False], self.read_checks(document))
+        self.assertEqual([], self.peaks_evaluated)
+
+    def test_a_failed_read_of_a_run_that_an_error_stops_is_still_in_the_check_of_the_reads(self) -> None:
+        stats = Stats(Stats.sample(), OSError("planted read"), Stats.sample())
+        self.assertEqual(1, self.main(nothing_left, stats=stats, after_reads=RuntimeError("planted case")))
+        document = self.saved()
+        self.assertIn("run: stopped by RuntimeError", self.failed(document))
+        self.assertIn("memory samples read without a failure: 1 failed reads", self.failed(document))
+        self.assertEqual([False], self.read_checks(document))
 
     def test_a_sampler_that_ends_in_time_lets_the_memory_peaks_be_evaluated_and_is_a_clean_stop(self) -> None:
         self.main(ProjectDocker(), sampler=self.sampler(ends=True))
@@ -338,11 +414,18 @@ class JoinedStackCleanup(unittest.TestCase):
             ("a command that cannot start", OSError("planted"), "OSError: planted"),
             ("an exit that is not zero", Stats.completed(1, "", "Cannot connect to the Docker daemon"), "exit 1: Cannot connect to the Docker daemon"),
             ("a figure that is no number", Stats.completed(0, "p2_join3_test-kafka-1\t1.2.3MiB / 1GiB\n"), "ValueError"),
+            ("no figure for a container", Stats.completed(0, "p2_join3_test-kafka-1\tN/A / 1GiB\n"), "p2_join3_test-kafka-1: 'N/A / 1GiB'"),
+            ("a dash for a container", Stats.completed(0, "p2_join3_test-kafka-1\t-- / --\n"), "p2_join3_test-kafka-1: '-- / --'"),
+            ("a unit that is not known", Stats.completed(0, "p2_join3_test-kafka-1\t5PiB / 9PiB\n"), "p2_join3_test-kafka-1: '5PiB / 9PiB'"),
+            ("a row with no usage", Stats.completed(0, "p2_join3_test-kafka-1\n"), "p2_join3_test-kafka-1: ''"),
+            (
+                "one container without a figure beside one with it",
+                Stats.completed(0, "p2_join3_test-postgres-1\t64MiB / 1GiB\np2_join3_test-kafka-1\tN/A / 1GiB\n"),
+                "p2_join3_test-kafka-1: 'N/A / 1GiB'",
+            ),
         ):
             with self.subTest(words):
-                self.root.joinpath("runs").exists() and shutil.rmtree(self.root / "runs")
-                self.scratch.clear()
-                self.peaks_evaluated.clear()
+                self.again()
                 stats = Stats(Stats.sample(), read, read, Stats.sample())
                 self.assertEqual(1, self.main(nothing_left, stats=stats))
                 document = self.saved()
@@ -355,11 +438,12 @@ class JoinedStackCleanup(unittest.TestCase):
                 self.assertEqual([], stats.reads, "the sampler reads on after a failed read")
 
     def test_sampling_with_no_failed_read_lets_the_memory_peaks_be_evaluated_and_the_run_passes(self) -> None:
-        self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), Stats.sample())))
+        other = Stats.completed(0, "another_project-kafka-1\tN/A / 1GiB\np2_join3_test-kafka-1\t512MiB / 1GiB\n")
+        self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), other)))
         document = self.saved()
         self.assertEqual("", self.failed(document))
         self.assertEqual([{"kafka": 512.0}], [run.peaks for run in self.peaks_evaluated])
-        self.assertIn("memory samples read without a failure", [item["case"] for item in document["observations"]])
+        self.assertEqual([True], self.read_checks(document))
 
     def test_a_listing_that_times_out_while_a_container_remains_is_a_cleanup_failure_and_the_record_is_saved(self) -> None:
         docker = ProjectDocker(("volume ls", 2))
