@@ -31,10 +31,18 @@ REMOVED_JARS = (
     "netty-codec-native-quic-",
     "netty-codec-http3-",
 )
+# Netty's modules come from one release, with the netty-tcnative release that its POM names: a module left at another release keeps that release's findings.
+NETTY_VERSION = "4.2.20.Final"
+TCNATIVE_VERSION = "2.0.85.Final"
+NETTY_MODULES = (
+    *("netty-buffer", "netty-codec", "netty-codec-base", "netty-codec-compression", "netty-codec-dns", "netty-codec-http", "netty-codec-http2"),
+    *("netty-codec-marshalling", "netty-codec-protobuf", "netty-codec-socks", "netty-common", "netty-handler", "netty-handler-proxy", "netty-resolver"),
+    *("netty-resolver-dns", "netty-transport", "netty-transport-classes-epoll", "netty-transport-classes-io_uring", "netty-transport-classes-kqueue"),
+    *("netty-transport-native-unix-common", "netty-transport-native-epoll", "netty-transport-native-io_uring"),
+    *("netty-tcnative-classes", "netty-tcnative-boringssl-static"),
+)
 # Each replaced library with the lowest version that the findings of Nov 25 2026 name as fixed.
 FIXED_JARS = {
-    "netty-handler": "4.2.17",
-    "netty-codec-http": "4.2.17",
     "jackson-core": "2.21.7",
     "jackson-databind": "2.21.7",
     "log4j-core": "2.25.5",
@@ -96,6 +104,17 @@ class SparkJarTest(unittest.TestCase):
                 self.assertGreaterEqual(version_key(found[0].group(1)), version_key(lowest))
         for line in downloads:
             self.assertRegex(line, r"^ADD --checksum=sha256:(\$\{\w+\}|[0-9a-f]{64}) https://|^ADD --checksum=sha256:\$\{\w+\} \$\{")
+
+
+class NettyTest(unittest.TestCase):
+    def test_the_whole_netty_set_is_added_from_one_release_with_the_tcnative_release_that_it_names(self) -> None:
+        form = re.compile(r"https://repo1\.maven\.org/maven2/io/netty/([^/]+)/([^/]+)/\1-\2(?:-linux-x86_64)?\.jar ")
+        lines = [line for line in final_stage(DOCKERFILES["spark"]) if "/io/netty/" in line]
+        matches = [form.search(line) for line in lines]
+        self.assertNotIn(None, matches, "each Netty jar is added by its Maven Central address")
+        found = {match.group(1): match.group(2) for match in matches if match}
+        self.assertEqual(len(found), len(lines), "no module is added twice")
+        self.assertEqual({name: TCNATIVE_VERSION if name.startswith("netty-tcnative-") else NETTY_VERSION for name in NETTY_MODULES}, found)
 
 
 class ComposePluginTest(unittest.TestCase):
