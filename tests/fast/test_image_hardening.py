@@ -51,7 +51,8 @@ FIXED_JARS = {
     "snappy-java": "1.1.10.9",
     "lz4-java": "1.8.1",
     "parquet-jackson": "1.18.2",
-    "hadoop-client-runtime": "3.4.3",
+    "hadoop-client-api": "3.5.0",
+    "hadoop-client-runtime": "3.5.0",
 }
 
 
@@ -104,6 +105,14 @@ class SparkJarTest(unittest.TestCase):
                 self.assertGreaterEqual(version_key(found[0].group(1)), version_key(lowest))
         for line in downloads:
             self.assertRegex(line, r"^ADD --checksum=sha256:(\$\{\w+\}|[0-9a-f]{64}) https://|^ADD --checksum=sha256:\$\{\w+\} \$\{")
+
+
+class HadoopTest(unittest.TestCase):
+    def test_the_two_hadoop_client_jars_come_from_one_release(self) -> None:
+        form = re.compile(r"/org/apache/hadoop/(hadoop-client-(?:api|runtime))/([^/]+)/\1-\2\.jar ")
+        found = [match.groups() for line in final_stage(DOCKERFILES["spark"]) if (match := form.search(line))]
+        self.assertEqual(["hadoop-client-api", "hadoop-client-runtime"], sorted(name for name, _ in found))
+        self.assertEqual(1, len({version for _, version in found}), "the runtime jar is built against the api jar of its own release")
 
 
 class NettyTest(unittest.TestCase):

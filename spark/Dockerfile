@@ -68,7 +68,8 @@ RUN apt-get update && apt-get upgrade --yes --no-install-recommends && rm -rf /v
 # and the bill of materials of 4.2.20.Final name. It is a security release (https://netty.io/news/2026/11/02/4-2-20-Final.html) and it holds the fix of
 # GHSA-pvjx-v7vp-62vq (netty-codec-http up to 4.2.17.Final, fixed from 4.2.18.Final). Each Netty jar matched the SHA-1 and the SHA-256 that Maven Central publishes.
 # lz4-java moved to the group at.yawk.lz4 (org.lz4:lz4-java 1.8.1 is only a relocation to it) and keeps its Java packages. parquet-jackson holds only Parquet's
-# relocated copy of Jackson, so it is replaced alone and the other Parquet jars stay at Spark's 1.16.0.
+# relocated copy of Jackson, so it is replaced alone and the other Parquet jars stay at Spark's 1.16.0. Hadoop's two client jars are 3.5.0, its newest release on
+# Nov 25 2026, with the same compile dependencies as 3.4.3; Maven Central publishes only their SHA-1, which each file matched.
 ADD --checksum=sha256:794136fc6be78e44a286c2b1420a182e135c6d06eb8c397030c1551ee50acccd https://repo1.maven.org/maven2/io/netty/netty-buffer/4.2.20.Final/netty-buffer-4.2.20.Final.jar /opt/spark/jars/
 ADD --checksum=sha256:f6616d7c26c6198c7fa3d94e20a1a0d17e8ef9fc2433de792f4009cf38b00c15 https://repo1.maven.org/maven2/io/netty/netty-codec/4.2.20.Final/netty-codec-4.2.20.Final.jar /opt/spark/jars/
 ADD --checksum=sha256:5a66da26b86d7eecedd9e0d8fe0e22ef1733bbf873e476cb9b860afbed22210c https://repo1.maven.org/maven2/io/netty/netty-codec-base/4.2.20.Final/netty-codec-base-4.2.20.Final.jar /opt/spark/jars/
@@ -109,8 +110,8 @@ ADD --checksum=sha256:1f659b0a84518c28b3cc94a143d6139e5e49ec711ae5d942442e7b1e7f
 ADD --checksum=sha256:35228628442e4b9797681c7cbd3b26594f6da3379159dbd0cb07094ed3aece0d https://repo1.maven.org/maven2/org/xerial/snappy/snappy-java/1.1.10.9/snappy-java-1.1.10.9.jar /opt/spark/jars/
 ADD --checksum=sha256:58c8e0b813960d2a248e050c353baea73139b48a2ffc55382d42c69707e17325 https://repo1.maven.org/maven2/at/yawk/lz4/lz4-java/1.11.4/lz4-java-1.11.4.jar /opt/spark/jars/
 ADD --checksum=sha256:dc20428b547c6376ae7dfa20c30a62c326b7e4ed4915ba5370ae7d7b0859408d https://repo1.maven.org/maven2/org/apache/parquet/parquet-jackson/1.18.2/parquet-jackson-1.18.2.jar /opt/spark/jars/
-ADD --checksum=sha256:6443332781f26a7199009d9517cd1eb013fbf54ca1c9759a2a9e487542b1d52a https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/3.4.3/hadoop-client-api-3.4.3.jar /opt/spark/jars/
-ADD --checksum=sha256:bd20267b0555766ae84697dd888f074ca326d8e2ec3c0008928a6ac2966c67de https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/3.4.3/hadoop-client-runtime-3.4.3.jar /opt/spark/jars/
+ADD --checksum=sha256:cc59446ec9ebaceae56fdb8d8c21477766dc5d426325642151c796bec5c4e6b7 https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/3.5.0/hadoop-client-api-3.5.0.jar /opt/spark/jars/
+ADD --checksum=sha256:b7db3e60c5df1cd37c2995b3e0142e57487260706834e5325bbe0a5e683eedf1 https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/3.5.0/hadoop-client-runtime-3.5.0.jar /opt/spark/jars/
 ADD --checksum=sha256:${ICEBERG_RUNTIME_SHA256} https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_${SCALA_VERSION}/${ICEBERG_VERSION}/iceberg-spark-runtime-4.1_${SCALA_VERSION}-${ICEBERG_VERSION}.jar /opt/spark/jars/
 ADD --checksum=sha256:${ICEBERG_AWS_BUNDLE_SHA256} https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar /opt/spark/jars/
 ADD --checksum=sha256:${SPARK_KAFKA_SHA256} https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_${SCALA_VERSION}/${SPARK_VERSION}/spark-sql-kafka-0-10_${SCALA_VERSION}-${SPARK_VERSION}.jar /opt/spark/jars/
