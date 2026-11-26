@@ -19,6 +19,17 @@ The check holds that the project user is enabled, holds exactly the project poli
 document equals the desired one; it then lists the project's bucket as the project user with the sign-in that OpenBao keeps. The audit identity is held to the
 same exact form.
 
+THE SIGN-IN BEFORE THE BUCKET EXISTS. ``make storage-up`` makes the bucket as the project user, after the deploy, so the listing of a host's first deploys finds
+no bucket. For that, ``mc ls --json`` of the pinned AIStor client (on the host with the server ``RELEASE.2026-09-19T17-05-25Z``) exits with 1 and one JSON error
+with no S3 code, whose message is "Unable to list bucket. Bucket `<bucket>` does not exist.". The sign-in call alone counts that answer as a sign-in, and only
+as that exact message about the module's own bucket; a code in the answer decides it instead, and every other form fails. It shows that the sign-in was
+accepted because the client says it only when the server answered ``NoSuchBucket`` (``bucketStat`` of ``cmd/client-s3.go`` lines 2301-2309 of
+github.com/minio/mc, commit 77f82e18; ``BucketExists`` of ``api-stat.go`` lines 29-57 of github.com/minio/minio-go, commit d33b8ad6), which the server answers
+only after it has checked who asks and what the policy allows (``HeadBucketHandler`` of ``cmd/bucket-handlers.go`` lines 1660-1672 of github.com/minio/minio,
+commit 7aac2a2c). Those are the public sources; the message itself is the AIStor client's. A listing at the server's root needs no bucket but does not serve:
+the project policy has no ``s3:ListAllMyBuckets`` and is not widened for it, and without that action the server answers ``AccessDenied`` when it has no bucket
+to show (``ListBucketsHandler``, lines 318-402 of the same file).
+
 THE RAW USER READ. ``mc admin user info`` also fetches each group's description (``GetGroupDescription``, which needs ``admin:GetGroup``;
 ``cmd/admin-user-info.go`` lines 67-91 of github.com/minio/mc), so a user in an added group made the check fail with a bare ``AccessDenied`` that named no
 group. The check sends the one admin request ``GET /minio/admin/v3/user-info?accessKey=<user>`` itself, with the AIStor container's own curl (its health
@@ -84,6 +95,8 @@ NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
 # an unknown access key is written in two parts: a scan keeps the field name of an exported credential out of every deployment file.
 SIGN_IN_REFUSALS = {"Invalid" + "Access" + "KeyId", "SignatureDoesNotMatch"}
 SIGNED_IN_CODES = {"NoSuchBucket"}
+# The pinned client's answer to a listing of a bucket that does not exist holds no S3 code, so its message is matched whole (the docstring says why it counts).
+NO_BUCKET_MESSAGE = "Unable to list bucket. Bucket `{}` does not exist."
 EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 APPROVAL = "--aistor-repair on the one run of python -m scripts.infra.host up"
 PUBLISH = "write the project user's sign-in to OpenBao"
@@ -257,17 +270,34 @@ def parse_user_info(text: str, user: str | None = None) -> tuple[str, list[str],
     return status, [policy.strip() for policy in held.split(",") if policy.strip()], [str(group) for group in names]
 
 
-def error_code(result: Result) -> str | None:
-    """The code of the JSON error in a failed answer (``error.cause.error.Code``), or None when the call did not fail or the answer holds no such code."""
+def json_error(result: Result) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """A failed answer's JSON error and its ``cause.error`` (empty when the answer has none), or None when the call did not fail or the answer has another
+    form."""
     if result.status == 0:
         return None
     try:
         found = answer_of(result.output)
     except BootstrapError:
         return None
-    cause = ((found.get("error") or {}).get("cause") or {}).get("error") or {}
-    code = cause.get("Code") if isinstance(cause, dict) else None
-    return code if found.get("status") == "error" and isinstance(code, str) else None
+    error = found.get("error")
+    if found.get("status") != "error" or not isinstance(error, dict):
+        return None
+    cause = error.get("cause", {})
+    inner = cause.get("error", {}) if isinstance(cause, dict) else None
+    return (error, inner) if isinstance(inner, dict) else None
+
+
+def error_code(result: Result) -> str | None:
+    """The code of the JSON error in a failed answer (``error.cause.error.Code``), or None when the call did not fail or the answer holds no such code."""
+    found = json_error(result)
+    code = found[1].get("Code") if found else None
+    return code if isinstance(code, str) else None
+
+
+def says_no_bucket(result: Result, bucket: str) -> bool:
+    """Whether the answer is the client's statement that this bucket does not exist: exit status 1 and a JSON error with no code whose message names it."""
+    found = json_error(result)
+    return result.status == 1 and found is not None and "Code" not in found[1] and found[0].get("message") == NO_BUCKET_MESSAGE.format(bucket)
 
 
 def is_absent(result: Result, code: str) -> bool:
@@ -291,8 +321,9 @@ def verdict(result: Result, who: str) -> bool:
 
 
 def signed_in(runner: Runner, user: str, bucket: str, password: str) -> bool:
-    """Whether the project user signs in with this password: a listing of the project's bucket as that user."""
-    return verdict(runner(Call("sign_in", (user, bucket), password + "\n")), "the project user")
+    """Whether the project user signs in with this password: a listing of the project's bucket as that user, which may not exist yet."""
+    result = runner(Call("sign_in", (user, bucket), password + "\n"))
+    return says_no_bucket(result, bucket) or verdict(result, "the project user")
 
 
 def audit_read(runner: Runner, user: str, password: str, *words: str) -> Result:

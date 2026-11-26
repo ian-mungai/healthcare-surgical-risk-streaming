@@ -120,6 +120,13 @@ def error_answer(code: str) -> Any:
     return bootstrap.Result(1, json.dumps({"status": "error", "error": {"cause": {"error": {"Code": code, "Message": "text"}}}}))
 
 
+def no_bucket_answer(bucket: str, status: int = 1, **error: Any) -> Any:
+    """The answer of ``mc ls --json`` for a bucket that does not exist, as the pinned AIStor client gave it on the host: a message and no S3 code."""
+    return bootstrap.Result(
+        status, json.dumps({"status": "error", "error": {"message": f"Unable to list bucket. Bucket `{bucket}` does not exist."} | error}) + "\n"
+    )
+
+
 @dataclass
 class Server:
     """A stand-in for the calls of the module: it keeps the policies, the users, each user's policies, groups, status and password, as AIStor would.
@@ -208,7 +215,7 @@ class Server:
             return error_answer(AUTH_ERROR)
         if not user["policies"]:
             return error_answer("AccessDenied")
-        return bootstrap.Result(0, "") if self.bucket_exists else error_answer("NoSuchBucket")
+        return bootstrap.Result(0, "") if self.bucket_exists else no_bucket_answer(words[1])
 
     def allows(self, user: dict[str, Any], action: str) -> bool:
         """Whether one of the policies that the user holds allows the action, as AIStor decides an admin call."""
@@ -955,6 +962,20 @@ class LiveCheckTest(unittest.TestCase):
         self.assertEqual([], world.run())
         self.assertEqual([], world.server.root_calls())
 
+    def test_a_missing_bucket_hides_no_refused_sign_in_and_no_user_without_a_policy(self) -> None:
+        cases: list[tuple[str, Callable[[Any], object]]] = [
+            ("another password", lambda server: server.users[USER].update(password=OTHER_VALUE)),
+            ("no policy", lambda server: server.users[USER].update(policies=[])),
+        ]
+        for label, change in cases:
+            with self.subTest(label):
+                world = deployed()
+                world.server.bucket_exists = False
+                change(world.server)
+                with self.assertRaises(bootstrap.BootstrapError):
+                    world.run()
+                self.assertEqual([], world.server.root_calls())
+
     def test_a_refused_sign_in_of_the_project_user_fails_closed_without_root(self) -> None:
         world = deployed()
         world.server.users[USER]["password"] = OTHER_VALUE
@@ -1095,6 +1116,76 @@ class RootOnlyOnceTest(unittest.TestCase):
         self.assertIn("AccessDenied", str(caught.exception))
         self.assertFalse(world.marker.exists)
         self.assertEqual(([], []), (world.bao.written, world.audit_bao.written))
+
+
+class MissingBucketTest(unittest.TestCase):
+    """The first deploy of a host runs before ``make storage-up`` makes the bucket. The client's answer for that holds no S3 code."""
+
+    def answered(self, result: Any) -> Any:
+        return bootstrap.signed_in(lambda call: result, USER, BUCKET, PROJECT_VALUE)
+
+    def refused_as_unknown(self, result: Any) -> None:
+        with self.assertRaises(bootstrap.BootstrapError) as caught:
+            self.answered(result)
+        message = str(caught.exception)
+        for text in (BUCKET, PROJECT_VALUE, "does not exist", "leaked"):
+            self.assertNotIn(text, message)
+
+    def test_the_first_bootstrap_of_a_host_without_the_bucket_finishes_keeps_both_sign_ins_and_writes_the_marker(self) -> None:
+        world = World()
+        world.server.bucket_exists = False
+        self.assertEqual(FIRST_ACTIONS, world.run())
+        self.assertEqual((1, 1, 1), (len(world.bao.written), len(world.audit_bao.written), world.marker.writes))
+        self.assertEqual([], world.run(), "the next deploy, still without the bucket, matches")
+
+    def test_the_clients_answer_for_the_projects_missing_bucket_is_a_sign_in(self) -> None:
+        self.assertIs(True, self.answered(no_bucket_answer(BUCKET)))
+        cause = {"message": f"Bucket `{BUCKET}` does not exist.", "error": {"Bucket": BUCKET}}
+        for extra in ({"cause": cause, "type": "error"}, {"cause": {"message": "text"}}):
+            with self.subTest(extra=extra):
+                self.assertIs(True, self.answered(no_bucket_answer(BUCKET, **extra)))
+
+    def test_a_code_in_the_answer_decides_it_whatever_the_message_says(self) -> None:
+        def coded(code: Any) -> Any:
+            return no_bucket_answer(BUCKET, cause={"error": {"Code": code}})
+
+        for code in ("InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            with self.subTest(code=code):
+                self.assertIs(False, self.answered(coded(code)))
+        for other in ("AccessDenied", "InternalError", "", None, 404):
+            with self.subTest(code=other):
+                self.refused_as_unknown(coded(other))
+
+    def test_any_other_form_that_speaks_of_a_missing_bucket_is_not_a_sign_in(self) -> None:
+        message = f"Unable to list bucket. Bucket `{BUCKET}` does not exist."
+        good = no_bucket_answer(BUCKET).output
+        documents: list[tuple[str, Any]] = [
+            ("another bucket", no_bucket_answer("another-bucket")),
+            ("a bucket whose name holds the project's", no_bucket_answer(BUCKET + "-copy")),
+            ("another exit status", no_bucket_answer(BUCKET, status=137)),
+            ("text before the message", no_bucket_answer(BUCKET, message="leaked " + message)),
+            ("text after the message", no_bucket_answer(BUCKET, message=message + " Access Denied.")),
+            ("another message", no_bucket_answer(BUCKET, message=f"Bucket `{BUCKET}` does not exist.")),
+            ("a message that is no text", no_bucket_answer(BUCKET, message=[message])),
+            ("a status of success", bootstrap.Result(1, good.replace('"status": "error"', '"status": "success"'))),
+            ("no status", bootstrap.Result(1, json.dumps({"error": {"message": message}}))),
+            ("the message outside the error", bootstrap.Result(1, json.dumps({"status": "error", "message": message}))),
+            ("an error that is no object", bootstrap.Result(1, json.dumps({"status": "error", "error": message}))),
+            ("a cause that is no object", no_bucket_answer(BUCKET, cause=message)),
+            ("a cause's error that is no object", no_bucket_answer(BUCKET, cause={"error": "InvalidAccessKeyId"})),
+            ("a second line", bootstrap.Result(1, good + good)),
+            ("a line before the answer", bootstrap.Result(1, "leaked\n" + good)),
+            ("the words alone", bootstrap.Result(1, message)),
+        ]
+        for label, result in documents:
+            with self.subTest(label):
+                self.refused_as_unknown(result)
+
+    def test_the_missing_bucket_answer_is_no_sign_in_of_the_audit_identity_and_no_answer_to_its_reads(self) -> None:
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.audit_signed_in(lambda call: no_bucket_answer(BUCKET), AUDIT_USER, AUDIT_VALUE)
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.checked(no_bucket_answer(BUCKET), "read the policy")
 
 
 class SignInTest(unittest.TestCase):
