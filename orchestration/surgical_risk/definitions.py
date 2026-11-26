@@ -21,7 +21,7 @@ from scripts.ingestion.folder import list_files
 
 from . import housekeeping, lineage_sample, record_load, table_checks
 from .concurrency import HEAVY_TAG_KEY, HEAVY_TAG_VALUE, heavy_memory_mib
-from .groups import GroupResource
+from .groups import GroupResource, stop_service_group
 from .run_records import run_folder_sensors
 
 # The figure above which a job is heavy is read when the code location loads: a missing or invalid one fails the load with its reason, not a later launch.
@@ -65,7 +65,7 @@ def group_probe(context: OpExecutionContext, config: GroupProbeConfig, group: Gr
 # held like a heavy job, one at a time. A job with a fixed group takes its tag from that group instead: ``tags=job_tags("<job>")``, with the job in JOB_GROUPS.
 @job(resource_defs={"group": GroupResource.configure_at_launch()}, executor_def=in_process_executor, tags={HEAVY_TAG_KEY: HEAVY_TAG_VALUE})
 def group_probe_job() -> None:
-    group_probe()
+    stop_service_group(after=group_probe())
 
 
 @sensor(job=ping_job, minimum_interval_seconds=5, default_status=DefaultSensorStatus.RUNNING)
