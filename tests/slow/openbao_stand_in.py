@@ -4,7 +4,8 @@ It serves AppRole login and the KV version 2 data and metadata paths on a loopba
 writable paths for each role. A role made with ``policy_names`` is judged by the real policy texts in ``StandIn.policies`` instead (the rules of the form
 ``path "<glob>" { capabilities = [...] }``), and the server then also keeps policies and AppRoles that the reconcile step writes through the API, so a test
 can run it against a host whose first start wrote an older admin policy. A test can make the next call that matches a method and a path prefix drop its
-connection (``drop_next``) or store another text than the one it was sent (``tamper_next_write``). It holds only the markers that a test gives it.
+connection (``drop_next``), store another text than the one it was sent (``tamper_next_write``) or give every call of one method and path another reply
+(``replies``). It holds only the markers that a test gives it.
 Each KV write keeps the ``sha256`` field that it was sent beside the value; a stored version that was seeded by a test without one reads back with the
 digest of its text, unless its name is in ``bare`` (then the read has no digest, like a version that an older writer made).
 """
@@ -72,6 +73,8 @@ class StandIn:
         self.failures: list[list[Any]] = []
         self.tamper_digests: list[str] = []
         self.ignore_deletes = False
+        # By method and path with its query: the status and the document that stand for the server's own reply.
+        self.replies: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
 
@@ -136,6 +139,8 @@ class StandIn:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
                 outer.calls.append((method, path))
+                if (method, self.path) in outer.replies:
+                    return self.answer(*outer.replies[(method, self.path)])
                 for drop in list(outer.drops):
                     if drop[0] == method and path.startswith(drop[1]):
                         if drop[2] > 0:

@@ -164,12 +164,12 @@ class RetiredGrantTest(ExistingHostCase):
 
     def test_the_deploy_drops_every_external_grant_of_a_policy_whose_service_left_the_list_and_keeps_its_other_rules(self) -> None:
         result = self.deploy()
-        self.assertIn("drop the external grants of policy service_gone", result["actions"])
+        self.assertIn("drop the external grants of the policy of a service that left the list", result["actions"])
         self.assertEqual(bootstrap.policy_text("gone"), self.server.policies["service_gone"])
 
     def test_the_role_the_secret_ids_and_the_data_of_that_service_stay_and_it_is_reported_unlisted(self) -> None:
         result = self.deploy()
-        self.assertEqual(["gone"], result["unlisted"])
+        self.assertEqual(1, result["unlisted"])
         self.assertEqual({**bootstrap.role_settings("gone", TTL, MAX_TTL)}, self.server.approle["gone"])
         self.assertEqual({"old-secret-id-of-gone"}, self.server.secret_ids["gone"])
         self.assertEqual(["password of gone"], self.server.versions["services/gone/postgres"])

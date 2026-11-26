@@ -126,7 +126,7 @@ class BootstrapTaskTest(unittest.TestCase):
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
 
-    def play(self) -> tuple[int, str]:
+    def play(self, ready_deadline_seconds: int = 10) -> tuple[int, str]:
         owner = f"{os.getuid()}:{os.getgid()}"
         variables: dict[str, Any] = {
             "openbao_secrets_directory": str(self.secrets),
@@ -137,7 +137,7 @@ class BootstrapTaskTest(unittest.TestCase):
             "openbao_address": self.server.address,
             "openbao_user": owner,
             "secret_files_root_owner": owner,
-            "openbao_ready_deadline_seconds": 10,
+            "openbao_ready_deadline_seconds": ready_deadline_seconds,
             "openbao_token_ttl_seconds": 3600,
             "openbao_token_max_ttl_seconds": 86400,
         }
@@ -182,6 +182,35 @@ class BootstrapTaskTest(unittest.TestCase):
         self.assertNotEqual(0, code, output)
         self.assertIn("PostgreSQL tool 'ghost_tool' has no entry in the service list", output)
         self.assert_no_secret(output)
+
+    # A value in the shape of a secret, as a server could put it in a reply field that the visible output reads.
+    SHAPED = "hvs.synthetic-secret-shaped-marker-0123456789"
+
+    def test_a_seal_status_that_holds_something_else_than_booleans_is_not_printed(self) -> None:
+        self.server.replies[("GET", "/v1/sys/seal-status")] = (200, {"initialized": True, "sealed": {"client_token": self.SHAPED}})
+        code, output = self.play(ready_deadline_seconds=1)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("did not become ready within 1 seconds (last answer: HTTP 200, a malformed seal status)", output)
+        self.assertNotIn(self.SHAPED, output)
+
+    def test_the_roles_and_retired_policies_that_the_server_lists_are_counted_or_unnamed_in_the_report(self) -> None:
+        self.server.policies[f"service_{self.SHAPED}"] = 'path "secret/data/external/dockerhub_read" { capabilities = ["read"] }\n'
+        self.server.approle[self.SHAPED] = {}
+        code, output = self.play()
+        self.assertEqual(0, code, output)
+        self.assertIn("drop the external grants of the policy of a service that left the list", output)
+        self.assertRegex(output, r'"unlisted": 1\b')
+        self.assertNotIn(self.SHAPED, output)
+        self.assertEqual("", self.server.policies[f"service_{self.SHAPED}"], "the grant of the retired policy is still dropped")
+
+    def test_a_list_reply_that_holds_something_else_than_names_is_refused_without_it(self) -> None:
+        for path in ("/v1/auth/approle/role?list=true", "/v1/sys/policies/acl?list=true"):
+            with self.subTest(path=path):
+                self.server.replies = {("GET", path): (200, {"data": {"keys": [{"client_token": self.SHAPED}]}})}
+                code, output = self.play()
+                self.assertNotEqual(0, code, output)
+                self.assertIn(f"GET {path.removeprefix('/v1/')}: a malformed reply", output)
+                self.assertNotIn(self.SHAPED, output)
 
     def test_a_failure_that_the_step_did_not_word_is_not_printed(self) -> None:
         """A crash of the hidden module can carry any text, a secret too, so only the module's own refusals are shown."""

@@ -13,6 +13,10 @@ the step reports none. It reports every secret file with its owner, for the role
 unlisted, never removed; its policy loses every external grant, and its other rules stay. A refused request is reported by its method, its path and its status
 only: an answer can repeat a secret that the request carried.
 
+The playbook prints the actions, the count of unlisted roles and the refusal, so nothing of a server's reply goes into them but a validated Boolean, an HTTP
+status code and the name of a listed service. A role or a policy that the service list does not hold is never named, and a reply of another form than the one
+that is read gives a fixed text.
+
 ``step: read`` returns one external secret (``compose/external_secrets.txt``) from OpenBao in its result, after the consumer logs in with its own AppRole,
 and writes no file: the pull of the images reads the Docker Hub token that way and hands it to one task's standard input. The calling task hides its result.
 ``step: generated`` keeps a secret that the host makes for itself (the Grafana administrator password): made once, stored in OpenBao while its path is empty
@@ -57,6 +61,9 @@ ADMIN_ID_FILE = "bootstrap.secret_id"
 # The one secret of the AIStor client service: ``secret/services/<service>/aistor``, written by the AIStor step after the sign-in was verified.
 CLIENT_PATH = "aistor"
 SECRET_BYTES = 32
+# What stands for the policy of a service that left the list: its name comes from the server's reply, so no action or message repeats it.
+RETIRED_PATH = "sys/policies/acl/<a service that left the list>"
+RETIRED_ACTION = "drop the external grants of the policy of a service that left the list"
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
 # The form of a token that goes into a header: the characters of OpenBao's tokens and of a bearer token (RFC 6750, b64token), and nothing else. A control
@@ -177,7 +184,7 @@ def plan(
             actions.append(Action("password", service, f"write the PostgreSQL password of {service}"))
     for service, stored in state.retired.items():
         if without_external(stored) != stored:
-            actions.append(Action("retire", service, f"drop the external grants of policy {policy_name(service)}", without_external(stored)))
+            actions.append(Action("retire", service, RETIRED_ACTION, without_external(stored)))
     return actions
 
 
@@ -222,7 +229,10 @@ class Api:
         self.host = parts.hostname
         self.port = parts.port or 80
 
-    def call(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+    def call(
+        self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None, shown: str | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """One request. ``shown`` stands for the path in a message, for a path that holds a name from a server's reply."""
         if token and TOKEN_FORM.fullmatch(token) is None:
             raise BootstrapError("the token that OpenBao gave is not a valid token")
         connection = http.client.HTTPConnection(self.host, self.port, timeout=HTTP_SECONDS)
@@ -232,23 +242,23 @@ class Api:
             connection.request(method, f"/v1/{path}", json.dumps(body) if body is not None else None, headers)
             response = connection.getresponse()
             raw = response.read().decode(errors="replace")
-        except (OSError, http.client.HTTPException) as error:
+        except (OSError, http.client.HTTPException, UnicodeError) as error:
             failure = type(error).__name__
         finally:
             connection.close()
         if failure is not None:
             # Raised outside the handler, so the library's text (which can repeat the request) is not chained to the message.
-            raise BootstrapError(f"{method} {path}: no answer from {self.address} ({failure})")
+            raise BootstrapError(f"{method} {shown or path}: no answer from {self.address} ({failure})")
         try:
             document = json.loads(raw) if raw else {}
         except ValueError:
             document = {}
         return response.status, document if isinstance(document, dict) else {}
 
-    def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        status, document = self.call(method, path, token, body)
+    def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None, shown: str | None = None) -> dict[str, Any]:
+        status, document = self.call(method, path, token, body, shown)
         if status not in (200, 204):
-            raise BootstrapError(f"{method} {path}: HTTP {status}")
+            raise BootstrapError(f"{method} {shown or path}: HTTP {status}")
         return document
 
     def wait_ready(self, deadline_seconds: int) -> None:
@@ -258,7 +268,7 @@ class Api:
         while True:
             try:
                 status, document = self.call("GET", "sys/seal-status")
-                last = f"HTTP {status}, initialized {document.get('initialized')}, sealed {document.get('sealed')}"
+                last = f"HTTP {status}, {seal_words(document)}"
                 if status == 200 and document.get("initialized") is True and document.get("sealed") is False:
                     return
             except (BootstrapError, SecretFileError) as error:
@@ -275,6 +285,23 @@ class Api:
         if status != 200 or not token:
             raise BootstrapError(f"the login of role {role} was refused (HTTP {status}): the secret ID in its file is not one that OpenBao holds for the role")
         return str(token)
+
+
+def seal_words(document: Mapping[str, Any]) -> str:
+    """What a seal status says, for a message: its two flags when both are Booleans, and a fixed text for any other reply."""
+    initialized, sealed = document.get("initialized"), document.get("sealed")
+    if type(initialized) is not bool or type(sealed) is not bool:
+        return "a malformed seal status"
+    return f"initialized {initialized}, sealed {sealed}"
+
+
+def listed_names(document: Mapping[str, Any], request: str) -> list[str]:
+    """The names of a list reply. A reply that is no list of texts is refused with a fixed text."""
+    data = document.get("data")
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+        raise BootstrapError(f"{request}: a malformed reply")
+    return keys
 
 
 def read_state(api: Api, token: str, services: list[str], tools: list[str], secrets_directory: Path) -> State:
@@ -306,13 +333,13 @@ def read_state(api: Api, token: str, services: list[str], tools: list[str], secr
     status, document = api.call("GET", "sys/policies/acl?list=true", token)
     if status != 200:
         raise BootstrapError(f"GET sys/policies/acl (list): HTTP {status}")
-    for key in sorted(str(item) for item in (document.get("data") or {}).get("keys") or []):
+    for key in sorted(listed_names(document, "GET sys/policies/acl?list=true")):
         service = key.removeprefix("service_")
         if not key.startswith("service_") or service in services:
             continue
-        status, document = api.call("GET", f"sys/policies/acl/{key}", token)
+        status, document = api.call("GET", f"sys/policies/acl/{key}", token, shown=RETIRED_PATH)
         if status not in (200, 404):
-            raise BootstrapError(f"GET sys/policies/acl/{key}: HTTP {status}")
+            raise BootstrapError(f"GET {RETIRED_PATH}: HTTP {status}")
         state.retired[service] = str((document.get("data") or {}).get("policy") or "") if status == 200 else ""
     return state
 
@@ -330,7 +357,7 @@ def apply(
 ) -> None:
     service = action.service
     if action.kind == "retire":
-        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": action.policy})
+        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": action.policy}, shown=RETIRED_PATH)
     elif action.kind == "policy":
         api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": service_policy(service, client_service, external)})
     elif action.kind == "role":
@@ -345,12 +372,12 @@ def apply(
         api.must("POST", f"secret/data/services/{service}/postgres", token, {"data": {"password": password}})
 
 
-def unlisted_roles(api: Api, token: str, services: list[str]) -> list[str]:
+def unlisted_role_count(api: Api, token: str, services: list[str]) -> int:
+    """How many roles the server holds that the service list does not. They are counted and never named."""
     status, document = api.call("GET", "auth/approle/role?list=true", token)
     if status != 200:
-        return []
-    keys = [str(key) for key in (document.get("data") or {}).get("keys") or []]
-    return sorted(key for key in keys if key != ADMIN_ROLE and key not in services)
+        return 0
+    return len({key for key in listed_names(document, "GET auth/approle/role?list=true") if key != ADMIN_ROLE and key not in services})
 
 
 def secret_files(secrets_directory: Path, entries: list[Entry], admin_owner: tuple[int, int], root_owner: tuple[int, int]) -> dict[Path, tuple[int, int]]:
@@ -504,7 +531,7 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     return {
         "changed": bool(actions),
         "actions": [action.description for action in actions],
-        "unlisted": unlisted_roles(api, token, services),
+        "unlisted": unlisted_role_count(api, token, services),
         "secret_files": files,
     }
 
