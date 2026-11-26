@@ -10,8 +10,11 @@ Failure modes covered here:
 - A secret in the command line or the environment of such a container is not found, or the unlock key is allowed in another read than OpenBao's environment.
 - ``docker top`` fails, names no process or answers with something that is no process number, and the empty or partial read passes. A text that is no
   number reaches the host's shell.
-- A process that is still there and cannot be read passes, a process that is gone fails the read, every process is gone and the empty read passes, or a
-  process that no read reported is not read again.
+- A process of either listing that no read read passes: one that is gone, one that is there and cannot be read, or one that only the second listing names
+  and that is never read, so a secret in it is not searched. A process that no read reported is not read again.
+- Two containers of one Compose service (a one-off beside a retained one) are taken for one, so only one of them is inspected and its processes read. A
+  retained stopped container, which has no process, fails the sweep or hides a service that has no running container. A line of the container listing that
+  is not understood is dropped and the sweep passes.
 - The public address is asked of the instance metadata, which the host's metadata guard drops, so the access test cannot read it. EC2 is asked with the
   project profile for the instance that the host names as itself.
 - The instance ID or the answer of EC2 cannot be read or is not one IPv4 address, and the access test passes with nothing probed.
@@ -54,11 +57,19 @@ class FakeHost:
     def __init__(self, tree: Path, containers: dict[str, list[str]]) -> None:
         self.tree = tree
         self.containers = containers
+        self.rows = [(service, f"id_{service}", "running") for service in containers]
+        self.pids = {f"id_{service}": list(numbers) for service, numbers in containers.items()}
+        self.health_by_id: dict[str, str] = {}
+        self.listing_extra = ""
         self.sent: list[list[str]] = []
         self.process_reads: list[list[str]] = []
         self.top_reply: Callable[[str, int], tuple[int, str]] | None = None
         self.tops: dict[str, int] = {}
         self.silent: set[str] = set()
+
+    def add(self, service: str, container: str, numbers: list[str], state: str = "running") -> None:
+        self.rows.append((service, container, state))
+        self.pids[container] = numbers
 
     def process(self, number: str, command_line: str | None = "server", environment: str | None = "PATH=/usr/bin") -> None:
         """A process of the fake folder. A file given as None is a folder, so the process is there and that file cannot be read."""
@@ -76,20 +87,24 @@ class FakeHost:
         self.sent.append(list(args))
         if args[:2] == ["docker", "compose"]:
             if "ps" in args:
-                return 0, "".join(f"{service} id_{service}\n" for service in self.containers), ""
+                return 0, "".join(f"{service} {container} {state}\n" for service, container, state in self.rows) + self.listing_extra, ""
             if "exec" in args:
                 service = next(word for word in args[args.index("exec") :] if word in self.containers)
                 if service == SHELL_LESS:
                     return 127, 'OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH', ""
                 return 0, "", ""
             return 0, "text of the project\n", ""
+        if args[:4] == ["docker", "inspect", "--format", "{{.State.Health.Status}}"]:
+            return 0, f"{self.health_by_id.get(args[4], 'healthy')}\n", ""
         if args[:2] == TOP_FORM:
-            service = args[2].removeprefix("id_")
-            call = self.tops[service] = self.tops.get(service, 0) + 1
+            container = args[2]
+            call = self.tops[container] = self.tops.get(container, 0) + 1
             if self.top_reply is not None:
-                code, text = self.top_reply(service, call)
-                return code, text, ""
-            return 0, "".join(f"{line}\n" for line in ["PID", *self.containers[service]]), ""
+                code, listed = self.top_reply(container.removeprefix("id_"), call)
+                return code, listed, ""
+            if next(state for _, known, state in self.rows if known == container) != "running":
+                return 1, "", "Error response from daemon: container is not running"
+            return 0, "".join(f"{line}\n" for line in ["PID", *self.pids[container]]), ""
         if args[:2] == ["sh", "-c"] and len(args) > 5 and ('"$p/environ"' in args[2] or '"$p/cmdline"' in args[2]):
             self.process_reads.append(list(args))
             result = run_command("sh", ["-c", args[2], args[3], str(self.tree), *args[5:]], timeout=30, keep_newlines=True)
@@ -135,7 +150,7 @@ class ContainerProcesses(HostCase):
             self.assertGreater(sizes[f"command lines of {service}"], 0, service)
             self.assertGreater(sizes[f"environment of {service}"], 0, service)
         self.assertEqual(host.entered(), [])
-        self.assertEqual(set(host.tops), {SHELL_LESS, "openbao"})
+        self.assertEqual(set(host.tops), {f"id_{SHELL_LESS}", "id_openbao"})
 
     def test_a_secret_in_the_environment_or_the_command_line_of_the_shell_less_container_is_found(self) -> None:
         for keyword, read in (("loki_environment", "environment"), ("line", "command lines")):
@@ -182,15 +197,56 @@ class ContainerProcesses(HostCase):
         host.top_reply = lambda service, call: (0, "PID\n101\n") if call == 1 else (1, "")
         self.assertNotEqual(self.read(stack)[0], 0)
 
-    def test_a_process_that_is_gone_is_skipped_and_one_that_cannot_be_read_fails(self) -> None:
+    def test_a_process_that_is_gone_before_its_read_fails_the_read_whether_the_second_listing_still_names_it_or_not(self) -> None:
+        for second in ("PID\n101\n102\n", "PID\n101\n"):
+            with self.subTest(second=second):
+                for entry in self.tree.iterdir():
+                    shutil.rmtree(entry)
+                host, stack = self.host(loki=["101", "102"])
+                host.process("101", environment="KEPT=one")
+                host.top_reply = lambda service, call, second=second: (0, "PID\n101\n102\n" if call == 1 else second)
+                code, out = self.read(stack)
+                self.assertNotEqual(code, 0)
+                self.assertIn("KEPT=one", out)
+
+    def test_a_process_that_only_the_second_listing_names_is_read_and_its_secret_is_found(self) -> None:
+        marker = Marker("canary", make_marker("urlsafe").value)
+        host, stack = self.host(loki=["101"])
+        host.process("101")
+        host.process("102", environment=f"LATE={marker.value}")
+        host.top_reply = lambda service, call: (0, "PID\n101\n" if call == 1 else "PID\n101\n102\n")
+        stack.markers.append(marker)
+        code, out = self.read(stack)
+        self.assertEqual((code, "LATE=" in out), (0, True))
+        self.assertTrue(any("canary" in leak for leak in stack.leaks))
+        self.assertEqual([args[5:] for args in host.process_reads], [["101"], ["102"]])
+
+    def test_a_process_that_only_the_second_listing_names_and_that_is_gone_fails_the_read(self) -> None:
+        host, stack = self.host(loki=["101"])
+        host.process("101")
+        host.top_reply = lambda service, call: (0, "PID\n101\n" if call == 1 else "PID\n101\n102\n")
+        self.assertNotEqual(self.read(stack)[0], 0)
+
+    def test_a_process_that_cannot_be_read_fails(self) -> None:
         host, stack = self.host(loki=["101", "102"])
         host.process("101", environment="KEPT=one")
-        code, out = self.read(stack)
-        self.assertEqual((code, "KEPT=one" in out), (0, True))
         host.process("102", environment=None)
         code, out = self.read(stack)
         self.assertNotEqual(code, 0)
         self.assertIn("KEPT=one", out)
+
+    def test_a_process_that_no_second_read_reports_fails_beside_one_that_was_read(self) -> None:
+        host, stack = self.host(loki=["101", "102"])
+        host.process("101")
+        host.process("102")
+        original = host.capture
+
+        def unreported(args: list[str], **options: Any) -> tuple[int, str, str]:
+            host.silent = {"102"}
+            return original(args, **options)
+
+        host.capture = unreported  # type: ignore[method-assign]
+        self.assertNotEqual(self.read(stack)[0], 0)
 
     def test_a_read_that_reaches_no_process_fails(self) -> None:
         _, stack = self.host(loki=["101", "102"])
@@ -217,6 +273,89 @@ class ContainerProcesses(HostCase):
 
         host.capture = unreported  # type: ignore[method-assign]
         self.assertNotEqual(self.read(stack)[0], 0)
+
+
+class ContainersByID(HostCase):
+    def twins(self, state: str = "running", first_environment: str = "PATH=/usr/bin") -> tuple[FakeHost, Any]:
+        """Two containers of one service: the one listed first holds process 301, the one listed later holds process 302."""
+        host, stack = self.host(spark_bronze=["301"])
+        host.add("spark_bronze", "id_later", ["302"] if state == "running" else [], state)
+        host.process("301", environment=first_environment)
+        host.process("302")
+        return host, stack
+
+    def inspected(self, host: FakeHost) -> list[str]:
+        return next(args[2:] for args in host.sent if args[:2] == ["docker", "inspect"])
+
+    def test_both_containers_of_one_service_are_inspected_and_their_processes_read(self) -> None:
+        host, stack = self.twins()
+        sizes, failed = self.module.collect_host(stack)
+        self.assertEqual(failed, [])
+        self.assertEqual(self.inspected(host), ["id_spark_bronze", "id_later"])
+        self.assertEqual(set(host.tops), {"id_spark_bronze", "id_later"})
+        self.assertEqual(sizes["container list"], 2)
+        for number in (1, 2):
+            self.assertGreater(sizes[f"command lines of spark_bronze (container {number})"], 0)
+            self.assertGreater(sizes[f"environment of spark_bronze (container {number})"], 0)
+
+    def test_a_secret_in_the_environment_of_the_container_listed_first_is_found(self) -> None:
+        marker = Marker("canary", make_marker("urlsafe").value)
+        _, stack = self.twins(first_environment=f"A={marker.value}")
+        stack.markers.append(marker)
+        self.module.collect_host(stack)
+        self.assertTrue(any("canary" in leak for leak in stack.leaks))
+
+    def test_a_retained_stopped_container_is_inspected_and_named_and_has_no_process_to_read(self) -> None:
+        for state in ("exited", "created", "dead"):
+            with self.subTest(state=state):
+                for entry in self.tree.iterdir():
+                    shutil.rmtree(entry)
+                host, stack = self.twins(state)
+                _, failed = self.module.collect_host(stack)
+                self.assertEqual((failed, stack.failures), ([], []))
+                self.assertEqual(self.inspected(host), ["id_spark_bronze", "id_later"])
+                self.assertEqual(set(host.tops), {"id_spark_bronze"})
+                self.assertEqual(stack.stopped, ["spark_bronze (container 2)"])
+
+    def test_a_container_in_a_state_that_is_not_stopped_is_read_and_a_failed_read_of_it_fails(self) -> None:
+        for state in ("removing", "unheard_of"):
+            with self.subTest(state=state):
+                for entry in self.tree.iterdir():
+                    shutil.rmtree(entry)
+                host, stack = self.twins(state)
+                _, failed = self.module.collect_host(stack)
+                self.assertIn("command lines of spark_bronze (container 2)", failed)
+
+    def test_a_line_of_the_listing_that_is_not_understood_fails_the_listing(self) -> None:
+        for line in ("grafana id_grafana\n", "grafana id_grafana running extra\n"):
+            with self.subTest(line=line):
+                for entry in self.tree.iterdir():
+                    shutil.rmtree(entry)
+                host, stack = self.twins()
+                host.listing_extra = line
+                self.assertIn("container list", self.module.collect_host(stack)[1])
+
+    def unhealthy(self, stack: Any) -> list[str]:
+        return list(self.module.unhealthy_consumers(stack, stack.container_list()[1]))
+
+    def test_a_healthy_consumer_beside_a_retained_stopped_container_is_up(self) -> None:
+        host, stack = self.twins("exited")
+        host.health_by_id = {"id_later": "unhealthy"}
+        self.assertEqual(self.unhealthy(stack), [])
+
+    def test_every_running_container_of_a_service_must_be_healthy(self) -> None:
+        for sick, label in (("id_spark_bronze", "spark_bronze (container 1)"), ("id_later", "spark_bronze (container 2)")):
+            with self.subTest(sick=sick):
+                for entry in self.tree.iterdir():
+                    shutil.rmtree(entry)
+                host, stack = self.twins()
+                host.health_by_id = {sick: "unhealthy"}
+                self.assertEqual(self.unhealthy(stack), [label])
+
+    def test_a_service_with_no_running_container_is_not_up(self) -> None:
+        host, stack = self.host(grafana=["301"])
+        host.rows = [("grafana", "id_grafana", "exited")]
+        self.assertEqual(self.unhealthy(stack), ["grafana: no running container"])
 
 
 class PublicAddress(HostCase):
