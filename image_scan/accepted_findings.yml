@@ -2,7 +2,8 @@
 # Each entry names the image, the artifact that holds the package (the path that the scan report gives, where a library inside a jar is located at the jar), the
 # vulnerability's ID, the package URL with its version, the reason that no release can fix it in this image and the date. A finding of Docker Scout or of Trivy
 # passes only when each of its artifacts has an entry for its image (scripts/images/trivy_scan.py says how a Trivy finding names its artifact and package).
-# Add an entry only for such a finding, and remove it when a release holds the fix.
+# Add an entry only for such a finding, and remove it when a release that this image can use holds the fix (for the two Iceberg-compatibility
+# exceptions below: once an Iceberg release supports Spark 4.2 or later and the image moves to it).
 # Accepted by the owner on Nov 26 2026 ("A"): every entry below is a library shaded inside the newest Hadoop or Iceberg jar or inside Spark 4.1.4's jars,
 # with no upstream release that holds the fixed library, except two: CVE-2024-6763 and CVE-2026-2332 in spark-core_2.13-4.1.4.jar, which Spark 4.2.1 and later
 # fix, accepted by the owner on Nov 26 2026 as an Iceberg-compatibility exception (Iceberg 1.12.0 supports Spark only up to 4.1). Each date is the day the entry
