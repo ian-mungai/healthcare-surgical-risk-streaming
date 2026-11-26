@@ -183,6 +183,29 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
     return names, open_ended
 
 
+def sibling_problems(source: Source, siblings: Mapping[str, str]) -> list[str]:
+    """One line for each import that a sibling file cannot answer. ``siblings`` maps the bare name by which they import each other to each one's path. A
+    sibling is a module and not a package, so it has no submodule; a name that a ``from`` import takes from it must be one that this read lists at its top
+    level, so a name that only a star import from outside the repository or a module ``__getattr__`` could give is refused. A file that is not there or is
+    not valid Python is left to ``closure``, which reports it."""
+    problems: list[str] = []
+    for file in sorted(siblings.values()):
+        text = source.read(file)
+        tree = parsed(text, file) if text is not None else None
+        if tree is None:
+            continue
+        for module, names in imported_names(tree, file):
+            sibling, _, below = (module or "").partition(".")
+            if sibling not in siblings:
+                continue
+            if below:
+                problems.append(f"{file}: {module} cannot be imported: the probe {sibling} is a module, not a package")
+                continue
+            held = exported_names(source, siblings[sibling].removesuffix(".py").replace("/", "."))[0]
+            problems += [f"{file}: the probe {sibling} has no name {name} at its top level" for name in names if name != "*" and name not in held]
+    return list(dict.fromkeys(problems))
+
+
 def closure(source: Source, entries: Sequence[str]) -> Closure:
     result = Closure()
     pending = list(entries)

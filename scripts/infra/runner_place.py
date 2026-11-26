@@ -19,11 +19,14 @@ does not hold, that is a plain file with one name (no link, no hard link), is te
 scanner (gitleaks) both pass over the bytes that are sent. The imports of every Python file, followed through the commit's own files, must resolve. For a
 file directly under ``tests/e2e/`` every package must be one that the commit's lock files pin. A probe runs in the replay or the Spark image, with its folder
 on the import path: the packages that it reaches through the repository's modules come from the image and are not asked of those lock files (they are the
-host environment's), another probe of the same call resolves by its name, and a package that a probe names itself must still be pinned. A ``.yml`` file is
-not read as Python. Nothing else is uploaded. The host's folder, and the runner folder above it, must be real folders (no link) and the commit's folder must
-hold the finished marker of the commit; every folder from there to the file is made when it is missing and refused when it is a link; each file is received
-into a file that ``mktemp`` makes in the destination folder and is then moved over its final name. A new deploy of another commit removes the folder and so
-every placed runner: place them again after it. A second deploy of the same commit keeps them.
+host environment's), another probe of the same call resolves by its name (a name taken from it must be at its top level, and it has no submodules), and a
+package that a probe names itself must still be pinned. A ``.yml`` file is not read as Python. Nothing else is uploaded.
+
+The host's folder, and the runner folder above it, must be real folders (no link) and the commit's folder must hold the finished marker of the commit; every
+folder from there to the file is made when it is missing and refused when it is a link; each file is received into a file that ``mktemp`` makes in the
+destination folder and is then moved over its final name. Before an earlier file is hashed again, the folders on the way to it pass the same check, and none
+is made. A new deploy of another commit removes the folder and so every placed runner: place them again after it. A second deploy of the same commit keeps
+them.
 
 Every wait has a deadline and fails with a message that names what did not happen.
 """
@@ -46,7 +49,7 @@ from typing import Any
 
 from scripts.infra import host, state_bootstrap
 from scripts.infra.host import FixedHostError, HostError
-from scripts.infra.runner_imports import LOADED_BY_PATH, OverlaySource, closure, locked_distributions, unlocked
+from scripts.infra.runner_imports import LOADED_BY_PATH, OverlaySource, closure, locked_distributions, sibling_problems, unlocked
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
@@ -276,8 +279,9 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
 
     The probes (the .py files of PROBE_FOLDER) are followed on their own. Their imports must resolve in the same way, but only the packages that a probe names
     itself are asked of the lock files: the repository's modules that it imports run with the image's packages. Another probe of this call resolves by its bare
-    name, for the probes only. What a file for the host reaches is checked in full, also when a probe of the same call reaches it too. A .yml file is not
-    Python and has no imports."""
+    name, for the probes only, against the text that is sent: a name that a probe takes from it must be defined or imported at its top level, and it has no
+    submodules. What a file for the host reaches is checked in full, also when a probe of the same call reaches it too. A .yml file is not Python and has no
+    imports."""
     source = CommitSource(commit, root, env)
     locks = []
     for name in lock_files(source):
@@ -291,7 +295,7 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
     overlay = OverlaySource(source, texts)
     on_host = closure(overlay, [*hosted, *(module for relative in hosted for module in LOADED_BY_PATH.get(relative, ()))])
     in_images = closure(overlay, sorted(probes))
-    siblings = {PurePosixPath(relative).stem for relative in probes}
+    siblings = {PurePosixPath(relative).stem: relative for relative in probes}
     taken = {name: set(files) for name, files in on_host.third_party.items()}
     for name, files in in_images.third_party.items():
         if name not in siblings and files & probes:
@@ -300,6 +304,7 @@ def check_imports(texts: Mapping[str, str], commit: str, root: Path = ROOT, env:
     problems = [
         *dict.fromkeys([*on_host.missing, *in_images.missing]),
         *dict.fromkeys([*on_host.unreadable, *in_images.unreadable]),
+        *sibling_problems(overlay, siblings),
         *(
             f"{name}: loads a module at run time that the import check cannot read"
             for name in sorted(d for d in dynamic if d.startswith("tests/e2e/") and d not in LOADED_BY_PATH)
@@ -331,17 +336,27 @@ def runner_folder_guard(commit: str, directory: str = RUNNER_DIRECTORY) -> str:
     )
 
 
+def parent_folders(relative: str) -> list[str]:
+    """The folders on the way to a runner file, from the first one below the commit's folder to the one that holds it."""
+    parts = relative.split("/")
+    return ["/".join(parts[:end]) for end in range(1, len(parts))]
+
+
+def folder_step(folder: str, when_missing: str) -> str:
+    """Stop with the fixed word when a folder on the way to a runner file is a link or is no folder; run ``when_missing`` when nothing is there."""
+    return (
+        f"p={shlex.quote(folder)}; "
+        f'if test -L "$p"; then echo {LINKED_WORD}; exit {LINKED_CODE}; fi; '
+        f'if test -e "$p"; then test -d "$p" || {{ echo {LINKED_WORD}; exit {LINKED_CODE}; }}; else {when_missing}; fi;'
+    )
+
+
 def remote_command(commit: str, relative: str, directory: str = RUNNER_DIRECTORY) -> str:
     """The one command that receives a file on its standard input: in the commit's finished folder only, into a file that ``mktemp`` makes in the destination
     folder with an unpredictable name and an exclusive create, then moved over the final name. Each folder on the way, from the first to the destination, is
     made by the SSH user for itself only when it is missing; one that is a link or is no folder, or a final name that is a folder, stops the command."""
     parent, name = relative.rsplit("/", 1)[0], shlex.quote(relative)
-    steps = " ".join(
-        f"p={shlex.quote('/'.join(relative.split('/')[: number + 1]))}; "
-        f'if test -L "$p"; then echo {LINKED_WORD}; exit {LINKED_CODE}; fi; '
-        f'if test -e "$p"; then test -d "$p" || {{ echo {LINKED_WORD}; exit {LINKED_CODE}; }}; else mkdir -- "$p"; fi;'
-        for number in range(parent.count("/") + 1)
-    )
+    steps = " ".join(folder_step(folder, 'mkdir -- "$p"') for folder in parent_folders(relative))
     return (
         f"{runner_folder_guard(commit, directory)}umask 077; {steps} "
         f'tmp=$(mktemp {shlex.quote(parent + "/.runner.XXXXXXXXXX")}); trap \'rm -f -- "$tmp"\' EXIT; cat > "$tmp"; '
@@ -354,10 +369,14 @@ def read_record_command(commit: str, directory: str = RUNNER_DIRECTORY) -> str:
 
 
 def verify_retained_command(commit: str, relatives: Sequence[str], directory: str = RUNNER_DIRECTORY) -> str:
-    """Hash each runner that the host's record keeps from an earlier call: stop with a fixed word when one is missing, is a link or is not a plain file."""
+    """Hash each runner that the host's record keeps from an earlier call. Before any hash, every folder on the way to each one passes the check that the
+    placement makes (nothing is made here). Stop with a fixed word when a folder is a link or is no folder, and with another when a runner is missing (with
+    its folder too), is a link or is not a plain file."""
     names = " ".join(shlex.quote(relative) for relative in relatives)
+    folders = dict.fromkeys(folder for relative in relatives for folder in parent_folders(relative))
+    steps = " ".join(folder_step(folder, ":") for folder in folders)
     return (
-        f"{runner_folder_guard(commit, directory)}for f in {names}; do "
+        f"{runner_folder_guard(commit, directory)}{steps} for f in {names}; do "
         f'if test -L "$f" || ! test -f "$f"; then echo {RETAINED_WORD}; exit {RETAINED_CODE}; fi; done; '
         f"sha256sum -- {names}"
     )
