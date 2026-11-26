@@ -33,7 +33,7 @@ import argparse
 import json
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -149,23 +149,25 @@ def landed_problems(entries: Sequence[CheckedFile], selection: Selection, pins: 
     return problems
 
 
-def landing_problems(listing: Sequence[ObjectVersion], entries: Sequence[CheckedFile]) -> list[Notice]:
+def landing_problems(listing: Sequence[ObjectVersion], entries: Sequence[CheckedFile], left_over: Collection[str] = ()) -> list[Notice]:
     """Why the current payloads of the landing prefix are not the manifest's: an extra current payload, or a bound key that is no current object.
 
     The listing is the full listing of the landing prefix. A key counts when its current version is not a delete marker. The metadata files that the copy
-    writes beside the payloads are no payloads.
+    writes beside the payloads are no payloads. Each sync of the copy lands its files under keys of its own, so a sync that was stopped leaves payloads that no
+    manifest binds: ``left_over`` names exactly those, as the caller read them after that sync ended, and any other unbound payload is still extra.
     """
     current = {item.key for item in listing if item.is_latest and not item.is_delete_marker and not item.key.endswith(METADATA_SUFFIX)}
     bound = {entry.key for entry in entries}
     problems = []
-    if current - bound:
-        problems.append(Notice(Code.PROBE_LANDING_EXTRA, count=len(current - bound)))
+    extra = current - bound - set(left_over)
+    if extra:
+        problems.append(Notice(Code.PROBE_LANDING_EXTRA, count=len(extra)))
     if bound - current:
         problems.append(Notice(Code.PROBE_LANDING_MISSING, count=len(bound - current)))
     return problems
 
 
-def verify_landed(store: ObjectStore, reference: ManifestRef, selection: Selection, pins: Pins) -> tuple[CheckedFile, ...]:
+def verify_landed(store: ObjectStore, reference: ManifestRef, selection: Selection, pins: Pins, left_over: Collection[str] = ()) -> tuple[CheckedFile, ...]:
     """The manifest entries of the probe once the passed manifest is confirmed and its payloads are the probe's. Raise before any payload is read.
 
     The manifest must be the published one of this selection: its selection digest, which covers the name, is the selection's. The gate then
@@ -174,7 +176,7 @@ def verify_landed(store: ObjectStore, reference: ManifestRef, selection: Selecti
     manifest = read_manifest(store, reference)
     if manifest.selection["selection_sha256"] != selection.selection_sha256:
         raise ProbeRefused(Notice(Code.PROBE_NOT_THIS))
-    problems = landing_problems(store.list_versions(LANDING_PREFIX), manifest.entries)
+    problems = landing_problems(store.list_versions(LANDING_PREFIX), manifest.entries, left_over)
     if problems:
         raise ProbeRefused(Notice(Code.PROBE_REFUSED), *problems)
     entries = verify_before_read(store, reference)

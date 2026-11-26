@@ -197,6 +197,21 @@ class VerifyLandedTest(unittest.TestCase):
         self.assertEqual(1, refused.exception.notices[1].count)
         self.assertEqual([], landed.store.payload_reads(LANDING_PREFIX))
 
+    def test_a_payload_that_the_caller_names_as_left_by_an_earlier_sync_is_no_extra_and_any_other_extra_is_still_refused(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        left = f"{LANDING_PREFIX}sync_98/{SOURCE_PREFIX}vital_files/0001.vital"
+        landed.store.put_object(left, b"left by the interrupted sync")
+        landed.store.reads.clear()
+        named = frozenset({left, f"{LANDING_PREFIX}sync_98/gone"})
+        self.assertEqual(len(SOURCE), len(verify_landed(landed.store, reference, landed.selection, synthetic_pins(landed), named)))
+        self.assertEqual([], landed.store.payload_reads(LANDING_PREFIX))
+        landed.store.put_object(f"{LANDING_PREFIX}sync_99/{SOURCE_PREFIX}vital_files/0099.vital", b"a payload that no sync of the caller wrote")
+        with self.assertRaises(ProbeRefused) as refused:
+            verify_landed(landed.store, reference, landed.selection, synthetic_pins(landed), named)
+        self.assertEqual([Code.PROBE_REFUSED, Code.PROBE_LANDING_EXTRA], codes(refused.exception.notices))
+        self.assertEqual(1, refused.exception.notices[1].count)
+
     def test_a_metadata_file_in_the_landing_prefix_is_no_payload(self) -> None:
         landed = landed_set()
         reference = published(landed)
