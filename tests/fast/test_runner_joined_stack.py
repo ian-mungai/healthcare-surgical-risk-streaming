@@ -14,13 +14,15 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import types
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from scripts.process import TimeoutExpired
+from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.stack.groups import LICENSED_SERVICES
 from scripts.stack.limits import load_limits
 from tests.fast.runner_import import ABSENT, E2E, import_runner, present
@@ -192,6 +194,40 @@ class ProjectDocker:
         return 0, listed.get(words, "") if self.asked.count(words) == 1 or words == "ps -aq" else ""
 
 
+def nothing_left(*arguments: str) -> tuple[int, str]:
+    """Docker's answers for a project that holds nothing, so its removal succeeds."""
+    return 0, ""
+
+
+class Stats:
+    """The ``docker stats`` command of the memory sampler. It answers the planted reads in their order, an exception being raised, and then complete samples.
+    ``answered`` is set at the first read after the planted ones, when the sampler has finished each of them."""
+
+    def __init__(self, *reads: Any) -> None:
+        self.reads = list(reads)
+        self.answered = threading.Event()
+
+    @staticmethod
+    def completed(code: int, out: str, error: str = "") -> CompletedProcess[str]:
+        return CompletedProcess(["docker", "stats"], code, out, error)
+
+    @classmethod
+    def sample(cls) -> CompletedProcess[str]:
+        return cls.completed(0, "p2_join3_test-kafka-1\t512MiB / 1GiB\n")
+
+    def __call__(self, program: str, arguments: list[str], **_: object) -> CompletedProcess[str]:
+        if (program, arguments[0]) != ("docker", "stats"):
+            raise AssertionError("no command of the computer runs in this test")
+        if not self.reads:
+            self.answered.set()
+            return self.sample()
+        planted = self.reads.pop(0)
+        if isinstance(planted, BaseException):
+            raise planted
+        answer: CompletedProcess[str] = planted
+        return answer
+
+
 @unittest.skipUnless(present("stack_joined"), ABSENT)
 class JoinedStackCleanup(unittest.TestCase):
     """The runner's own ``main`` with the images, the landed copy and Docker replaced. Whatever stops a step or the project's removal, the scratch folder is
@@ -217,7 +253,14 @@ class JoinedStackCleanup(unittest.TestCase):
             release.set()
         return thread
 
-    def main(self, docker: ProjectDocker, step: BaseException | None = None, sampler: threading.Thread | None = None) -> int:
+    def main(
+        self,
+        docker: Callable[..., tuple[int, str]],
+        step: BaseException | None = None,
+        sampler: threading.Thread | None = None,
+        stats: Stats | None = None,
+    ) -> int:
+        """With ``stats`` the runner's own sampler runs, its ``docker stats`` command answered by it, and the first deploy ends after its planted reads."""
         real_run = self.runner.Run
 
         def make_run(record: Any, log: list[str], scratch: Path, *others: object) -> Any:
@@ -226,13 +269,20 @@ class JoinedStackCleanup(unittest.TestCase):
             run = real_run.__new__(real_run)
             run.record, run.log, run.scratch, run.project, run.docker = record, log, scratch, "p2_join3_test", docker
             run.sampling, run.sampler = self.runner.threading.Event(), sampler
-            run.place_k3s_stand_ins = run.start_sampling = lambda: None
-            run.peaks, run.grafana_mib = {}, None
+            run.place_k3s_stand_ins = lambda: None
+            if stats is None:
+                run.start_sampling = lambda: None
+            run.peaks, run.failed_reads, run.grafana_mib = {}, [], None
             return run
 
         def first_deploy(run: Any) -> bool:
             if step is not None:
                 raise step
+            if stats is not None:
+                deadline = time.monotonic() + 5
+                while not stats.answered.wait(0.01) and run.sampler.is_alive() and time.monotonic() < deadline:
+                    pass
+                self.assertTrue(stats.answered.is_set() or not run.sampler.is_alive(), "the sampler made its planted reads or ended")
             return False
 
         replaced: dict[str, Any] = {
@@ -244,7 +294,8 @@ class JoinedStackCleanup(unittest.TestCase):
             "recorded_state": lambda root: ("0" * 40, "0" * 64),
             "fill_landed_cache": lambda folder, cases: {},
             "build_landed_copy": lambda paths, folder: (None, self.root / "manifest_reference.json"),
-            "run_command": mock.Mock(side_effect=AssertionError("no command of the computer runs in this test")),
+            "run_command": stats or mock.Mock(side_effect=AssertionError("no command of the computer runs in this test")),
+            "SAMPLE_SECONDS": 0.01 if stats is not None else self.runner.SAMPLE_SECONDS,
         }
         with (
             mock.patch.multiple(self.runner, **replaced),
@@ -280,6 +331,35 @@ class JoinedStackCleanup(unittest.TestCase):
         self.assertEqual(1, len(self.peaks_evaluated))
         self.assertNotIn("sampl", self.failed(document))
         self.assertIn("sampling stopped: True", document["cleanup"])
+
+    def test_a_stats_read_that_fails_after_a_complete_sample_fails_the_run_before_the_memory_peaks_are_evaluated(self) -> None:
+        for words, read, named in (
+            ("a deadline", TimeoutExpired("docker", 120), "TimeoutExpired"),
+            ("a command that cannot start", OSError("planted"), "OSError: planted"),
+            ("an exit that is not zero", Stats.completed(1, "", "Cannot connect to the Docker daemon"), "exit 1: Cannot connect to the Docker daemon"),
+            ("a figure that is no number", Stats.completed(0, "p2_join3_test-kafka-1\t1.2.3MiB / 1GiB\n"), "ValueError"),
+        ):
+            with self.subTest(words):
+                self.root.joinpath("runs").exists() and shutil.rmtree(self.root / "runs")
+                self.scratch.clear()
+                self.peaks_evaluated.clear()
+                stats = Stats(Stats.sample(), read, read, Stats.sample())
+                self.assertEqual(1, self.main(nothing_left, stats=stats))
+                document = self.saved()
+                self.assertEqual("fail", document["outcome"])
+                self.assertEqual([], self.peaks_evaluated, "peaks of a sampling with a failed read are not evaluated")
+                failed = self.failed(document)
+                self.assertIn("memory samples read without a failure: 2 failed reads", failed)
+                self.assertEqual(2, failed.count(named), "every failed read is recorded")
+                self.assertIn("the memory peaks are not evaluated", failed)
+                self.assertEqual([], stats.reads, "the sampler reads on after a failed read")
+
+    def test_sampling_with_no_failed_read_lets_the_memory_peaks_be_evaluated_and_the_run_passes(self) -> None:
+        self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), Stats.sample())))
+        document = self.saved()
+        self.assertEqual("", self.failed(document))
+        self.assertEqual([{"kafka": 512.0}], [run.peaks for run in self.peaks_evaluated])
+        self.assertIn("memory samples read without a failure", [item["case"] for item in document["observations"]])
 
     def test_a_listing_that_times_out_while_a_container_remains_is_a_cleanup_failure_and_the_record_is_saved(self) -> None:
         docker = ProjectDocker(("volume ls", 2))
