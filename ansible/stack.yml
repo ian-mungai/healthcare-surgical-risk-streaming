@@ -1,6 +1,6 @@
 # The second playbook of the host deployment, after the host playbook and the launcher's intake of the external secrets (scripts.infra.host): it logs in to Docker Hub with the
-# token that the host's OpenBao holds, pulls the project's images, starts the stack and installs Airbyte. The connection playbook follows the placement of the project
-# profile's access key.
+# token that the host's OpenBao holds, pulls the project's images, starts the stack and installs Airbyte. The AIStor step (storage.yml) follows it, and the connection playbook
+# follows the placement of the project profile's access key.
 - name: Deploy the stack on the platform host
   hosts: platform
   become: true

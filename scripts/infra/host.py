@@ -6,8 +6,8 @@ Run from the repository root under the project profile in ``.env``, through ``ma
 anything, it prints the changes and a confirmation code and stops for the owner's review.
 ``make host-up CONFIRM=<CODE>`` applies exactly the reviewed plan, waits for the instance, for its Tailscale peer and
 for SSH, runs the Ansible host setup (up to the host's OpenBao), gives that OpenBao the external secrets that it still lacks (the intake), runs the stack
-deployment, places the project profile's key, runs the connection step and writes the inventory. A run with nothing to change goes straight to those
-checks, so a second run changes nothing.
+deployment, places AIStor's licence and runs the AIStor step, places the project profile's key, runs the connection step and writes the inventory. A run with
+nothing to change goes straight to those checks, so a second run changes nothing.
 ``make host-stop`` stops the instance, keeps its disk and prints what still bills.
 ``make host-start`` starts it and waits until it answers over Tailscale.
 ``make host-runners-place RUNNERS="..."`` (``scripts/infra/runner_place.py``) places named Git-ignored runner files in the runner folder that the deploy made.
