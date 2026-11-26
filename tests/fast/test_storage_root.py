@@ -40,9 +40,9 @@ def provider_pin_problems(versions: str, lock: str) -> list[str]:
     if not re.search(rf'source\s*=\s*"{PROVIDER}"\s+version\s*=\s*"={" "}{re.escape(VERSION)}"', versions):
         found.append(f"versions.tf: {PROVIDER} must be pinned to exactly {VERSION}")
     if not re.search(
-        rf'provider "registry\.terraform\.io/{PROVIDER}" \{{\s+version\s*=\s*"{re.escape(VERSION)}"\s+constraints\s*=\s*"= {re.escape(VERSION)}"', lock
+        rf'provider "registry\.terraform\.io/{PROVIDER}" \{{\s+version\s*=\s*"{re.escape(VERSION)}"\s+constraints\s*=\s*"{re.escape(VERSION)}"', lock
     ):
-        found.append(f"the lock file must record {PROVIDER} {VERSION} with the constraint = {VERSION}")
+        found.append(f"the lock file must record {PROVIDER} {VERSION} with the normalized constraint {VERSION} (Terraform 1.16 refuses a leading equals sign)")
     return found
 
 
@@ -67,7 +67,7 @@ class StorageRootFilesTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(1, len(provider_pin_problems(planted, lock)))
         self.assertEqual(1, len(provider_pin_problems(versions, lock.replace(VERSION, "3.47.0"))))
-        self.assertEqual(1, len(provider_pin_problems(versions, lock.replace(f'"= {VERSION}"', f'"~> {VERSION}"'))))
+        self.assertEqual(1, len(provider_pin_problems(versions, lock.replace(f'constraints = "{VERSION}"', f'constraints = "~> {VERSION}"'))))
 
     def test_the_state_is_local_with_no_path_in_the_files_so_the_run_gives_it(self) -> None:
         versions = (STORAGE / "versions.tf").read_text()

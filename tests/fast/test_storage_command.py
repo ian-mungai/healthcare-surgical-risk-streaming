@@ -47,7 +47,7 @@ def secrets_directory() -> str:
 
 
 HASHES = '    "h1:Yg7vN8mCk1pQ0wXr3sT5uZ2aB4dE6fH8jL0nP2rS4tU=",\n    "zh:' + "0123456789abcdef" * 4 + '",\n    "zh:' + "fedcba9876543210" * 4 + '",\n'
-LOCK = 'provider "registry.terraform.io/aminueza/minio" {\n  version     = "3.46.2"\n  constraints = "= 3.46.2"\n  hashes = [\n' + HASHES + "  ]\n}\n"
+LOCK = 'provider "registry.terraform.io/aminueza/minio" {\n  version     = "3.46.2"\n  constraints = "3.46.2"\n  hashes = [\n' + HASHES + "  ]\n}\n"
 LOGIN_ID = "01234567-89ab-cdef-0123-456789abcdef"
 SESSION_VALUE = "hvs.example-token-0123456789"
 PROJECT_USER = "project_user"
