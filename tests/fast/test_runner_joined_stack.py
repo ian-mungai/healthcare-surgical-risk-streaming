@@ -7,13 +7,19 @@ their arguments and refuse a Spark group before any Docker call, so no Docker, s
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import re
+import shutil
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from scripts.process import TimeoutExpired
 from scripts.stack.groups import LICENSED_SERVICES
 from scripts.stack.limits import load_limits
 from tests.fast.runner_import import ABSENT, E2E, import_runner, present
@@ -164,6 +170,131 @@ class JoinedStackAdmission(unittest.TestCase):
                 run.docker = docker
                 self.assertIs(removed, run.remove_project())
                 self.assertEqual([], [words for words in asked if "rm" in words], "the words of a failed listing are no names to remove")
+
+
+class ProjectDocker:
+    """The Docker commands of the removal of a project that still holds a container. ``late`` names the calls that pass their deadline, each as the first two
+    words of the command and the number of that call among the commands with those words."""
+
+    def __init__(self, *late: tuple[str, int], failure: type[BaseException] | None = None) -> None:
+        self.late, self.failure = set(late), failure
+        self.asked: list[str] = []
+
+    def __call__(self, *arguments: str) -> tuple[int, str]:
+        words = " ".join(arguments[:2])
+        self.asked.append(words)
+        if (words, self.asked.count(words)) in self.late:
+            if self.failure is not None:
+                raise self.failure("planted")
+            raise TimeoutExpired("docker", 120)
+        listed = {"ps -aq": "a-container\n", "volume ls": "a-volume\n", "network ls": "a-network\n"}
+        return 0, listed.get(words, "") if self.asked.count(words) == 1 or words == "ps -aq" else ""
+
+
+@unittest.skipUnless(present("stack_joined"), ABSENT)
+class JoinedStackCleanup(unittest.TestCase):
+    """The runner's own ``main`` with the images, the landed copy and Docker replaced. Whatever stops a step or the project's removal, the scratch folder is
+    removed and the run's record is saved with the failure."""
+
+    def setUp(self) -> None:
+        self.runner: Any = import_runner("stack_joined")
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        (self.root / "manifest_reference.json").write_text("{}")
+        self.scratch: list[Path] = []
+
+    def main(self, docker: ProjectDocker, step: BaseException | None = None) -> int:
+        real_run = self.runner.Run
+
+        def make_run(record: Any, log: list[str], scratch: Path, *others: object) -> Any:
+            self.scratch.append(scratch)
+            self.addCleanup(shutil.rmtree, scratch, True)
+            run = real_run.__new__(real_run)
+            run.record, run.log, run.scratch, run.project, run.docker = record, log, scratch, "p2_join3_test", docker
+            run.sampling, run.sampler = self.runner.threading.Event(), None
+            run.place_k3s_stand_ins = run.start_sampling = lambda: None
+            run.peaks, run.grafana_mib = {}, None
+            return run
+
+        def first_deploy(run: Any) -> bool:
+            if step is not None:
+                raise step
+            return False
+
+        replaced: dict[str, Any] = {
+            "Run": make_run,
+            "first_deploy": first_deploy,
+            "peak_memory": lambda run: None,
+            "require_pinned_images": lambda docker: None,
+            "recorded_state": lambda root: ("0" * 40, "0" * 64),
+            "fill_landed_cache": lambda folder, cases: {},
+            "build_landed_copy": lambda paths, folder: (None, self.root / "manifest_reference.json"),
+            "run_command": mock.Mock(side_effect=AssertionError("no command of the computer runs in this test")),
+        }
+        with (
+            mock.patch.multiple(self.runner, **replaced),
+            mock.patch("tests.e2e.run_record.ROOT", self.root),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            return int(self.runner.main([]))
+
+    def saved(self) -> dict[str, Any]:
+        records = list((self.root / "runs").glob("*/record.json"))
+        self.assertEqual(1, len(records), "the run's record is saved once")
+        self.assertEqual([False], [scratch.exists() for scratch in self.scratch], "the scratch folder is removed")
+        document: dict[str, Any] = json.loads(records[0].read_text())
+        self.assertNotEqual("pending", document["cleanup"])
+        return document
+
+    @staticmethod
+    def failed(document: dict[str, Any]) -> str:
+        return "\n".join(f"{item['case']}: {item['observed']}" for item in document["observations"] if not item["passed"])
+
+    def test_a_listing_that_times_out_while_a_container_remains_is_a_cleanup_failure_and_the_record_is_saved(self) -> None:
+        docker = ProjectDocker(("volume ls", 2))
+        self.assertEqual(1, self.main(docker))
+        document = self.saved()
+        self.assertEqual("fail", document["outcome"])
+        self.assertTrue(document["cleanup"].startswith("cleanup failed"), document["cleanup"])
+        self.assertIn("timed out: volume ls", self.failed(document))
+        self.assertEqual(2, docker.asked.count("network ls"), "the listing after the one that timed out is still asked")
+
+    def test_a_command_of_the_removal_that_times_out_leaves_the_other_kinds_to_be_removed(self) -> None:
+        for words in ("ps -aq", "rm -f", "volume ls", "volume rm"):
+            with self.subTest(words=words):
+                docker = ProjectDocker((words, 1))
+                self.root.joinpath("runs").exists() and shutil.rmtree(self.root / "runs")
+                self.scratch.clear()
+                self.assertEqual(1, self.main(docker))
+                self.assertIn(f"timed out: {words}", self.failed(self.saved()))
+                self.assertIn("network rm", docker.asked)
+
+    def test_a_removal_that_raises_any_other_error_still_removes_the_scratch_folder_and_saves_the_record(self) -> None:
+        self.assertEqual(1, self.main(ProjectDocker(("ps -aq", 1), failure=ValueError)))
+        self.assertIn("ValueError stopped the step", self.failed(self.saved()))
+
+    def test_a_step_whose_command_times_out_is_a_failed_run_with_a_saved_record(self) -> None:
+        self.assertEqual(1, self.main(ProjectDocker(), TimeoutExpired("ansible-playbook", 3600)))
+        document = self.saved()
+        self.assertEqual("fail", document["outcome"])
+        self.assertIn("run: stopped by TimeoutExpired", self.failed(document))
+
+    def test_a_step_that_raises_an_unexpected_error_or_an_interrupt_still_saves_the_record_and_the_error_goes_on(self) -> None:
+        for error, outcome in ((KeyError("planted"), "fail"), (KeyboardInterrupt(), "blocked: interrupted")):
+            with self.subTest(error=type(error).__name__):
+                self.root.joinpath("runs").exists() and shutil.rmtree(self.root / "runs")
+                self.scratch.clear()
+                with self.assertRaises(type(error)):
+                    self.main(ProjectDocker(), error)
+                document = self.saved()
+                self.assertEqual(outcome, document["outcome"])
+                self.assertIn(f"run: stopped by {type(error).__name__}", self.failed(document))
+
+    def test_an_interrupt_during_the_removal_still_removes_the_scratch_folder_and_saves_a_blocked_record(self) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            self.main(ProjectDocker(("ps -aq", 1), failure=KeyboardInterrupt))
+        self.assertEqual("blocked: interrupted", self.saved()["outcome"])
 
 
 @unittest.skipUnless(present("stack_monitoring"), ABSENT)
