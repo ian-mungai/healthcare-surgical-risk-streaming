@@ -3,8 +3,9 @@
 Ansible's ``stat`` computes a SHA-1 of a readable file unless ``get_checksum`` is false, and the joined stack runner runs the deploy with ``-v``. The rule is
 closed: every ``stat`` task of every tracked playbook and task file (``.yml`` and ``.yaml``) sets both options to false, except the ones listed here, each of
 which reads no secret. A new ``stat`` task therefore sets both options or is added here by a change that a review sees. A task names the module as its key or
-through ``action`` or ``local_action``; its options count only as a mapping, so a ``stat`` that gives them as a text never passes. The verbose runs of the
-secret checks are in ``tests/slow``.
+through ``action`` or ``local_action``; its options count only as a mapping, so a ``stat`` that gives them as a text never passes. A mapping with a nested
+``args``, or with arguments in its ``module`` text, never passes either: Ansible lets both replace the options beside them. The task's own ``args`` keyword
+only adds options that the module's mapping does not set. The verbose runs of the secret checks are in ``tests/slow``.
 """
 
 from __future__ import annotations
@@ -61,7 +62,11 @@ def stat_tasks(text: str) -> list[tuple[str, Any]]:
 
 
 def computes_nothing(options: Any) -> bool:
-    return isinstance(options, dict) and options.get("get_checksum") is False and options.get("get_mime") is False
+    """True only for a mapping that sets both options to false and holds nothing that Ansible's parser lets replace them: no nested ``args``, and no text
+    after the module's name in ``module``."""
+    if not isinstance(options, dict) or "args" in options or len(str(options.get("module", "")).split()) > 1:
+        return False
+    return options.get("get_checksum") is False and options.get("get_mime") is False
 
 
 class SecretStatTest(unittest.TestCase):
@@ -119,6 +124,27 @@ class SecretStatTest(unittest.TestCase):
         for form, planted in self.planted_forms({"get_checksum": "false", "get_mime": "false"}):
             with self.subTest(planted=planted):
                 self.assertEqual([form == "mapping"], [computes_nothing(found) for _, found in stat_tasks(planted)])
+
+    def test_a_stat_with_arguments_in_its_module_text_or_in_a_nested_args_never_passes(self) -> None:
+        safe = "path: /x, get_checksum: false, get_mime: false"
+        override = "{get_checksum: true}"
+        values = [
+            (key, value)
+            for key in ("action", "local_action")
+            for value in (
+                f"{{module: stat get_checksum=true, {safe}}}",
+                f"{{module: ansible.builtin.stat get_mime=true, {safe}}}",
+                f"{{module: stat, {safe}, args: {override}}}",
+                f"{{module: stat, {safe}, args: get_checksum=true}}",
+                'stat path=/x get_checksum=false get_mime=false args="get_checksum=true"',
+                "stat path=/x get_checksum=true",
+            )
+        ]
+        values += [(module, f"{{{safe}, args: {override}}}") for module in ("ansible.builtin.stat", "ansible.legacy.stat", "stat")]
+        for key, value in values:
+            with self.subTest(key=key, value=value):
+                planted = f"- block:\n    - name: x\n      {key}: {value}\n      args: {{get_checksum: false, get_mime: false}}\n"
+                self.assertEqual([False], [computes_nothing(found) for _, found in stat_tasks(planted)])
 
     def test_another_module_through_action_or_local_action_is_not_a_stat_task(self) -> None:
         for value in ("ansible.builtin.command stat /x", "{module: ansible.builtin.command, cmd: stat /x}", "{path: /x}", "''"):
