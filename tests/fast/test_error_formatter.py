@@ -96,6 +96,7 @@ MARKED = {
     "scripts.infra.host.LicenceRefusal",
     "scripts.images.publish.PublishError",
     "scripts.images.scan.ScanError",
+    "scripts.stack.groups.GroupWaits",
     "infra.iam.scripts.manage_policies.KeyAdviceError",
     "scripts.stack.tags.RecordNotPublished",
     "spark.streaming.checkpoint.CheckpointFormatError",

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Protocol
 
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import describe_error
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ROOT
 from scripts.stack.admission import EXIT_WAIT, SUPPORTING_GROUP, AdmissionError, Decision, check_group, describe
@@ -87,7 +87,7 @@ class SparkGroupRefused(GroupError):
     """``group-up`` was asked to start a Spark group, which it never does."""
 
 
-class GroupWaits(GroupError):
+class GroupWaits(GroupError, FixedTextError):
     """The group does not fit in the available memory and the wait for memory ended. The message holds the admission check's four figures."""
 
 

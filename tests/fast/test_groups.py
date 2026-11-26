@@ -6,6 +6,8 @@ Each case changes one fact of a good setup and expects the result to follow from
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -27,6 +29,7 @@ from scripts.stack.groups import (
     describe_states,
     find_group,
     groups_of,
+    main,
     parse_inspect,
     profile_of,
     rendered_environment,
@@ -39,6 +42,7 @@ from scripts.stack.groups import (
 )
 from scripts.stack.limits import LIMITS_FILE, load_limits, parse_limits
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.test_groups_k3s import Cluster, control
 
 GOOD = """\
 host_reserve_mib: 4096
@@ -308,6 +312,29 @@ class StateReportTest(unittest.TestCase):
 
     def test_a_service_with_no_container_is_described_as_not_created(self) -> None:
         self.assertEqual("batch_worker: no container", describe_states([], missing=["batch_worker"]))
+
+
+class CommandMessageTest(unittest.TestCase):
+    """The command of a group that does not fit shows the admission check's four figures, not only the class of its refusal."""
+
+    def test_a_group_that_does_not_fit_exits_75_and_the_message_names_the_group_figure_and_the_available_figure(self) -> None:
+        cluster = Cluster()
+        for found in cluster.objects.values():
+            found.update(desired=0, ready=0)
+        kubernetes, _ = control(cluster)
+        limits = load_limits(LIMITS_FILE).services
+        group_mib = sum(entry.memory_limit_mib for entry in limits.values() if entry.group == "ingestion")
+        arguments = ["up", "ingestion", "--available-mib", "4100", "--compose-directory", str(ROOT / "compose"), "--project", "stack_project"]
+        with (
+            mock.patch("scripts.stack.groups.docker", return_value=""),
+            mock.patch("scripts.stack.groups_k3s.control_from_environment", return_value=kubernetes),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            code = main(arguments)
+        self.assertEqual(75, code)
+        for figure in ("reserve 4096 MiB", "supporting services ", f"group {group_mib} MiB", "available 4100 MiB"):
+            self.assertIn(figure, err.getvalue())
+        self.assertEqual({0}, {found["desired"] for found in cluster.objects.values()})
 
 
 if __name__ == "__main__":
