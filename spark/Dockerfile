@@ -62,14 +62,23 @@ ARG COMMONS_POOL_SHA256
 COPY --from=jre /opt/java/openjdk /opt/java/openjdk
 COPY --from=distribution /opt/spark /opt/spark
 # Debian's security and point-release updates that the base image does not hold yet, from one dated snapshot of both archives (snapshot.debian.org), so that a
-# rebuild installs the same packages. The three images name the same timestamp. A snapshot keeps the old Valid-Until date of its index files, so apt does not check
-# that date; it still checks their signatures. apt-get update exits with 0 when a download fails, so --error-on=any stops the build there.
+# rebuild installs the same packages. The three images run this same step. It stops unless the base image's sources are exactly its main, updates and security
+# suites, then writes the one source file that both apt commands read, and no other source. The upgrade starts only when the indexes that apt holds are those three
+# at the snapshot. The base image holds the CA certificates, so apt reads the snapshot over HTTPS and verifies the server: a signed index alone could be an older
+# one, because a snapshot keeps the old Valid-Until date of its index files and apt does not check that date (it still checks their signatures). apt-get update
+# exits with 0 when a download fails, so --error-on=any stops the build there.
 ARG DEBIAN_SNAPSHOT=20261125T230000Z
-RUN sed -i -E "s|^URIs: http://deb.debian.org/(debian(-security)?)$|URIs: http://snapshot.debian.org/archive/\1/${DEBIAN_SNAPSHOT}\nCheck-Valid-Until: no|" /etc/apt/sources.list.d/debian.sources \
-    && test "$(grep -c "^URIs: http://snapshot.debian.org/archive/debian.*/${DEBIAN_SNAPSHOT}$" /etc/apt/sources.list.d/debian.sources)" = 2 \
-    && ! grep -q deb.debian.org /etc/apt/sources.list.d/debian.sources \
-    && apt-get update --error-on=any -o Acquire::Retries=5 -o Acquire::http::Timeout=60 \
-    && apt-get upgrade --yes --no-install-recommends -o Acquire::Retries=5 -o Acquire::http::Timeout=60 \
+RUN list=/etc/apt/sources.list.d/debian.sources archive=https://snapshot.debian.org/archive \
+    && stanza() { printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' "$1" "$2"; } \
+    && test ! -e /etc/apt/sources.list && test "$(ls -A /etc/apt/sources.list.d/)" = debian.sources \
+    && test "$(grep -v '^#' "$list")" = "$(stanza http://deb.debian.org/debian 'trixie trixie-updates' && echo && stanza http://deb.debian.org/debian-security trixie-security)" \
+    && { stanza "$archive/debian/$DEBIAN_SNAPSHOT" 'trixie trixie-updates' && printf 'Check-Valid-Until: no\n\n' \
+        && stanza "$archive/debian-security/$DEBIAN_SNAPSHOT" trixie-security && echo 'Check-Valid-Until: no'; } > "$list" \
+    && set -- -o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 -o Acquire::https::Timeout=60 \
+    && apt-get update --error-on=any "$@" \
+    && test "$(apt-get indextargets "$@" --format '$(REPO_URI) $(RELEASE) $(COMPONENT)' 'Created-By: Packages' | LC_ALL=C sort -u)" \
+        = "$(printf "$archive/%s/$DEBIAN_SNAPSHOT/ %s main\n" debian-security trixie-security debian trixie debian trixie-updates)" \
+    && apt-get upgrade --yes --no-install-recommends "$@" \
     && rm -rf /var/lib/apt/lists/*
 # The replaced libraries, each at a release that fixes the findings of Nov 25 2026 and was at least two weeks old, in the major line of the jar that Spark 4.1.4
 # holds. Each checksum is of the file whose SHA-1 Maven Central publishes. Netty's modules are one set, 4.2.20.Final with netty-tcnative 2.0.85.Final, which the POM
