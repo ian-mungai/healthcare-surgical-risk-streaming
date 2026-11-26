@@ -22,8 +22,8 @@ complete report. The refusal names each such finding of each image. An image who
 a finding published after its push shows only at a scan run by hand or when its sources change.
 
 The command relies on the ``docker login`` that this computer already has, which Docker Scout uses too. It reads, prints and writes no token, and every
-message is fixed text: no output of Docker or Git is ever shown. The one exception is a refused finding's vulnerability ID and package URL, each shown only
-when it matches its form.
+message is fixed text: no output of Docker or Git is ever shown. The one exception is a refused finding's vulnerability ID, package URL and artifact paths,
+each shown only when it matches its form.
 """
 
 from __future__ import annotations
@@ -200,8 +200,8 @@ def prepare_image(settings: Settings, image: dict[str, Any], found: dict[str, di
     return tag
 
 
-def refused_findings(settings: Settings, name: str, tag: str, accepted: frozenset[scan.Finding], scratch: Path) -> list[scan.Finding]:
-    """Scan the built image into a new report and return its fixable findings that the accepted list does not name."""
+def refused_findings(settings: Settings, name: str, tag: str, accepted: frozenset[scan.Accepted], scratch: Path) -> list[scan.Finding]:
+    """Scan the built image into a new report and return its fixable findings that the accepted list does not name for this image and their artifacts."""
     report = scratch / f"{name}.sarif"
     code, _, _ = docker(settings, scan.scan_arguments(tag, report), SCAN_SECONDS, "docker scout cves")
     if code != 0:
@@ -214,10 +214,10 @@ def refused_findings(settings: Settings, name: str, tag: str, accepted: frozense
         raise PublishError(f"{name}: the scan wrote no readable report") from error
     except scan.ScanError as error:
         raise PublishError(f"{name}: {error}") from error
-    return scan.unaccepted(found, accepted)
+    return scan.unaccepted(name, found, accepted)
 
 
-def build_and_scan(settings: Settings, found: dict[str, dict[str, str]], accepted: frozenset[scan.Finding], scratch: Path) -> dict[str, str]:
+def build_and_scan(settings: Settings, found: dict[str, dict[str, str]], accepted: frozenset[scan.Accepted], scratch: Path) -> dict[str, str]:
     """Build and scan every image whose tag the pin file lacks, and return each one's tag by its name. Every image is scanned before the refusal, so that
     it names every finding at once."""
     built: dict[str, str] = {}
@@ -228,7 +228,7 @@ def build_and_scan(settings: Settings, found: dict[str, dict[str, str]], accepte
             continue
         name = image["name"]
         built[name] = tag
-        refused += [f"{name}: {finding.cve} {finding.package}" for finding in refused_findings(settings, name, tag, accepted, scratch)]
+        refused += [f"{name}: {scan.shown(finding)}" for finding in refused_findings(settings, name, tag, accepted, scratch)]
     if refused:
         raise PublishError(
             "nothing was pushed: the scan found fixable findings that image_scan/accepted_findings.yml does not name: fix each one, or accept one that no "

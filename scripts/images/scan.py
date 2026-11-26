@@ -1,13 +1,18 @@
 """The scan gate of the publisher: Docker Scout's report of an image's fixable findings, held against the committed list of accepted findings.
 
 The publisher scans each image that it built before it pushes any image. Docker Scout needs a Docker sign-in, which the computer that publishes already has
-for its push. A finding is the vulnerability's ID and the package URL with its version, without qualifiers. A finding passes only when the accepted list
-names that exact pair, so an entry never carries over to another version of the package. ``image_scan/accepted_findings.yml`` is outside every image's
-sources, so a change in it changes no image tag.
+for its push. A finding is the vulnerability's ID, the package URL with its version, without qualifiers, and the artifacts that hold the package: the paths
+that the report's locations name, where a library inside a jar is located at the jar. An accepted entry names one image, one artifact, the ID and the package
+URL. A finding passes only when every one of its artifacts has an entry for the scanned image, so an entry never carries over to another image, artifact or
+version of the package.
+
+``image_scan/accepted_findings.yml`` holds the active list, ``findings``, and may hold a list named ``pending`` of entries that wait for the owner's
+decision. The gate never reads ``pending``. The file is outside every image's sources, so a change in it changes no image tag.
 
 Everything that is not a complete report is refused and is never read as a clean image: a missing or unreadable file, another format or tool, an object that
 holds a key twice (a second, empty list of results would hide the first), a run without invocations that all report ``executionSuccessful`` as true, and a
-result that does not name exactly one package. Only an ID and a package URL that match their forms are ever shown.
+result that does not name exactly one package and at least one location. Only an ID, a package URL and an artifact path that match their forms are ever
+shown.
 
 Known conflict (open, Nov 25 2026): the Docker Scout 1.28.0 reports that were read on that day hold no ``invocations`` at all, so this gate refuses them.
 """
@@ -26,7 +31,12 @@ from scripts.ingestion.notice import FixedTextError
 from scripts.stack.yaml_text import YamlError, load_yaml
 
 ACCEPTED_FILE = Path(__file__).resolve().parents[2] / "image_scan" / "accepted_findings.yml"
-FIELDS = {"cve", "package", "reason", "date"}
+FIELDS = {"image", "artifact", "cve", "package", "reason", "date"}
+IMAGE_FORM = re.compile(r"[a-z][a-z0-9_]{0,39}")
+ARTIFACT_FORM = re.compile(r"[A-Za-z0-9._+~@=,%:\[\]/-]{1,300}")
+# Docker Scout names a library inside a jar twice: the jar, and the jar followed by the library's group and name.
+INSIDE_JAR = re.compile(r"(.+\.jar):[A-Za-z0-9._-]+:[A-Za-z0-9._-]+")
+SHOWN_ARTIFACTS = 3
 CVE_FORM = re.compile(r"(CVE|GHSA|GO)-[A-Za-z0-9-]{4,40}")
 PACKAGE_FORM = re.compile(r"pkg:[a-z]+/[A-Za-z0-9._+~:/-]{1,200}@[A-Za-z0-9._+~:-]{1,100}")
 DATE_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -40,6 +50,15 @@ class ScanError(FixedTextError, ValueError):
 class Finding:
     cve: str
     package: str
+    artifacts: tuple[str, ...]
+
+
+@dataclass(frozen=True, order=True)
+class Accepted:
+    image: str
+    artifact: str
+    cve: str
+    package: str
 
 
 def scan_arguments(tag: str, report: Path) -> list[str]:
@@ -47,14 +66,32 @@ def scan_arguments(tag: str, report: Path) -> list[str]:
     return ["scout", "cves", "--platform", "linux/amd64", "--only-fixed", "--format", "sarif", "--output", str(report), f"local://{tag}"]
 
 
-def checked(cve: object, package: object) -> Finding:
+def checked(cve: object, package: object) -> tuple[str, str]:
     if not (isinstance(cve, str) and CVE_FORM.fullmatch(cve) and isinstance(package, str) and PACKAGE_FORM.fullmatch(package)):
         raise ScanError("a finding does not name a vulnerability ID and a package URL with its version in their forms")
-    return Finding(cve, package)
+    return cve, package
+
+
+def checked_artifact(artifact: object) -> str:
+    if not (isinstance(artifact, str) and ARTIFACT_FORM.fullmatch(artifact)):
+        raise ScanError("an artifact is not a path in its form")
+    return artifact
+
+
+def located(result: Any) -> tuple[str, ...]:
+    """The artifacts of one SARIF result, each once and in order."""
+    try:
+        uris = [location["physicalLocation"]["artifactLocation"]["uri"] for location in result["locations"]]
+    except (KeyError, TypeError) as error:
+        raise ScanError("a result of the scan report lacks a location") from error
+    if not uris:
+        raise ScanError("a result of the scan report lacks a location")
+    paths = [checked_artifact(uri) for uri in uris]
+    return tuple(sorted({match.group(1) if (match := INSIDE_JAR.fullmatch(path)) else path for path in paths}))
 
 
 def reported(result: Any) -> Finding:
-    """The finding of one SARIF result: its rule is the vulnerability's ID, and one line of its message names the package."""
+    """The finding of one SARIF result: its rule is the vulnerability's ID, one line of its message names the package and its locations name the artifacts."""
     try:
         cve = result["ruleId"]
         lines = str(result["message"]["text"]).split("\n")
@@ -63,7 +100,7 @@ def reported(result: Any) -> Finding:
     packages = [match.group(1) for line in lines if (match := re.fullmatch(r"Package\s*:(\S+)\s*", line))]
     if len(packages) != 1:
         raise ScanError("a result of the scan report does not name exactly one package")
-    return checked(cve, urllib.parse.unquote(packages[0].partition("?")[0]))
+    return Finding(*checked(cve, urllib.parse.unquote(packages[0].partition("?")[0])), located(result))
 
 
 def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -98,34 +135,56 @@ def read_report(text: str) -> frozenset[Finding]:
     return frozenset(reported(result) for result in results)
 
 
-def load_accepted(path: Path) -> frozenset[Finding]:
-    """The findings that the list accepts. Each entry holds exactly the vulnerability's ID, the package URL with its version, the reason and the date."""
+def accepted_entry(value: Any) -> Accepted:
+    """One entry of a list: exactly the image's name, the artifact, the vulnerability's ID, the package URL with its version, the reason and the date."""
+    if not isinstance(value, dict) or set(value) != FIELDS:
+        raise ScanError("each accepted finding holds exactly the fields image, artifact, cve, package, reason and date")
+    cve, package = checked(value["cve"], value["package"])
+    image = value["image"]
+    if not isinstance(image, str) or IMAGE_FORM.fullmatch(image) is None:
+        raise ScanError("each accepted finding gives the name of its image")
+    artifact = checked_artifact(value["artifact"])
+    if not isinstance(value["reason"], str) or not value["reason"].strip():
+        raise ScanError("each accepted finding gives its reason")
+    date = value["date"]
+    if not isinstance(date, str) or DATE_FORM.fullmatch(date) is None:
+        raise ScanError("each accepted finding gives its date as the quoted text YYYY-MM-DD")
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError as error:
+        raise ScanError("each accepted finding gives a date that exists") from error
+    return Accepted(image, artifact, cve, package)
+
+
+def load_accepted(path: Path) -> frozenset[Accepted]:
+    """The entries of the active list. The list named ``pending`` may be there beside it and is never read."""
     try:
         document = load_yaml(path.read_text())
     except (YamlError, ValueError, OSError) as error:
         raise ScanError("the accepted-findings file cannot be read as YAML") from error
-    if not isinstance(document, dict) or set(document) != {"findings"} or not isinstance(document["findings"], list):
-        raise ScanError("the accepted-findings file must hold one list named findings")
-    found: set[Finding] = set()
+    if not isinstance(document, dict) or set(document) - {"pending"} != {"findings"} or not isinstance(document["findings"], list):
+        raise ScanError("the accepted-findings file must hold one list named findings, and may hold one named pending beside it")
+    found: set[Accepted] = set()
     for value in document["findings"]:
-        if not isinstance(value, dict) or set(value) != FIELDS:
-            raise ScanError("each accepted finding holds exactly the fields cve, package, reason and date")
-        finding = checked(value["cve"], value["package"])
-        if not isinstance(value["reason"], str) or not value["reason"].strip():
-            raise ScanError("each accepted finding gives its reason")
-        date = value["date"]
-        if not isinstance(date, str) or DATE_FORM.fullmatch(date) is None:
-            raise ScanError("each accepted finding gives its date as the quoted text YYYY-MM-DD")
-        try:
-            datetime.date.fromisoformat(date)
-        except ValueError as error:
-            raise ScanError("each accepted finding gives a date that exists") from error
-        if finding in found:
+        accepted = accepted_entry(value)
+        if accepted in found:
             raise ScanError("the accepted-findings file names a finding twice")
-        found.add(finding)
+        found.add(accepted)
     return frozenset(found)
 
 
-def unaccepted(found: frozenset[Finding], accepted: frozenset[Finding]) -> list[Finding]:
-    """The findings that stop a push, in order."""
-    return sorted(found - accepted)
+def unaccepted(image: str, found: frozenset[Finding], accepted: frozenset[Accepted]) -> list[Finding]:
+    """The findings of one image that stop a push, in order. Each names only its artifacts that no entry for this image accepts."""
+    left: list[Finding] = []
+    for finding in found:
+        missing = tuple(artifact for artifact in finding.artifacts if Accepted(image, artifact, finding.cve, finding.package) not in accepted)
+        if missing:
+            left.append(Finding(finding.cve, finding.package, missing))
+    return sorted(left)
+
+
+def shown(finding: Finding) -> str:
+    """The text of a refused finding. A system package has many files, so only the first artifacts are named and the others are counted."""
+    more = len(finding.artifacts) - SHOWN_ARTIFACTS
+    text = f"{finding.cve} {finding.package} in {' '.join(finding.artifacts[:SHOWN_ARTIFACTS])}"
+    return f"{text} and {more} more" if more > 0 else text

@@ -434,12 +434,19 @@ class PushTest(Case):
 
 
 FINDING_PACKAGE = "pkg:maven/io.netty/netty-handler@4.2.7"
+HOLDER = "/opt/jars/holder-1.0.jar"
+
+
+def accepted_entry(image: str = "tool", artifact: str = HOLDER, package: str = FINDING_PACKAGE) -> str:
+    fields = f"  - image: {image}\n    artifact: {artifact}\n    cve: CVE-2026-1111\n    package: {package}\n"
+    return fields + '    reason: No release holds the fix.\n    date: "2026-11-25"\n'
 
 
 class ScanGateTest(Case):
     def plant(self, image: str, cve: str) -> None:
         text = f"Vulnerability    :{cve}  \nPackage          :{FINDING_PACKAGE}  \nFixed version    :9  \n"
-        self.plant_report(image, [{"ruleId": cve, "message": {"text": text}}])
+        location = {"physicalLocation": {"artifactLocation": {"uri": f"{HOLDER}:io.netty:netty-handler"}}}
+        self.plant_report(image, [{"ruleId": cve, "message": {"text": text}, "locations": [location]}])
 
     def plant_report(self, image: str, results: list[dict[str, Any]], invocations: list[dict[str, Any]] | None = None) -> None:
         run: dict[str, Any] = {"tool": {"driver": {"name": "docker scout"}}, "results": results}
@@ -470,18 +477,30 @@ class ScanGateTest(Case):
                 for image in planted:
                     self.plant(image, "CVE-2026-1111")
                 error = self.refusal()
-                self.assertEqual(tuple(f"{image}: CVE-2026-1111 {FINDING_PACKAGE}" for image in planted), error.findings)
+                self.assertEqual(tuple(f"{image}: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}" for image in planted), error.findings)
                 self.assertIn("nothing was pushed", str(error))
                 self.assert_nothing_pushed_or_pinned()
 
-    def test_a_finding_that_the_accepted_list_names_with_that_package_version_passes_and_another_one_does_not(self) -> None:
+    def test_a_finding_passes_only_by_an_entry_for_that_image_artifact_and_package_version(self) -> None:
         self.plant("tool", "CVE-2026-1111")
-        entry = f'findings:\n  - cve: CVE-2026-1111\n    package: {FINDING_PACKAGE}\n    reason: No release holds the fix.\n    date: "2026-11-25"\n'
-        self.accepted_file.write_text(entry.replace("4.2.7", "4.2.6"))
-        self.refusal()
-        self.assert_nothing_pushed_or_pinned()
-        self.accepted_file.write_text(entry)
+        others = {
+            "another version": accepted_entry(package=FINDING_PACKAGE.replace("4.2.7", "4.2.6")),
+            "another image": accepted_entry(image="app"),
+            "another artifact": accepted_entry(artifact="/opt/jars/other-2.0.jar"),
+        }
+        for label, other in others.items():
+            with self.subTest(case=label):
+                self.accepted_file.write_text("findings:\n" + other)
+                self.assertEqual((f"tool: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), self.refusal().findings)
+                self.assert_nothing_pushed_or_pinned()
+        self.accepted_file.write_text("findings:\n" + accepted_entry())
         self.assertEqual(["app: pushed and pinned", "tool: pushed and pinned"], self.run_publish())
+
+    def test_an_entry_that_is_only_pending_lets_nothing_pass(self) -> None:
+        self.plant("tool", "CVE-2026-1111")
+        self.accepted_file.write_text("findings: []\npending:\n" + accepted_entry())
+        self.assertEqual((f"tool: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}",), self.refusal().findings)
+        self.assert_nothing_pushed_or_pinned()
 
     def test_a_scan_that_fails_or_writes_no_report_or_an_incomplete_one_pushes_nothing_and_shows_no_output_of_docker(self) -> None:
         cases = (
@@ -527,7 +546,7 @@ class ScanGateTest(Case):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.assertEqual(1, publish.main([], self.settings()))
         self.assertEqual("", out.getvalue())
-        self.assertIn(f"publish: app: CVE-2026-1111 {FINDING_PACKAGE}\n", err.getvalue())
+        self.assertIn(f"publish: app: CVE-2026-1111 {FINDING_PACKAGE} in {HOLDER}\n", err.getvalue())
         self.assertNotIn(CANARY_TEXT, err.getvalue())
 
 
