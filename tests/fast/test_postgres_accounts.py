@@ -19,6 +19,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import shared_module
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -386,6 +387,134 @@ class ServerFailureTest(unittest.TestCase):
                 with self.subTest(reason=reason, sign=sign):
                     self.assertIn(f"(reason: {reason})", self.failure(f"psql: {sign}"))
         self.assertEqual(self.SIGNS, {word: tuple(signs) for word, signs in accounts.REASONS})
+
+
+class SlotsTest(unittest.TestCase):
+    """The read of the connection slots, which a failed health wait of the start shows: counts by account name, never a query, a host or a password."""
+
+    SETTINGS = "setting|max_connections|100\nsetting|reserved_connections|0\nsetting|superuser_reserved_connections|3\n"
+    OUTPUT = SETTINGS + "held|airbyte|75\nheld|apicurio|20\nheld|nessie|1\n"
+
+    def report(self, output: str) -> tuple[bool, str]:
+        full, message = accounts.slots_report(accounts.parse_slots(output))
+        return bool(full), str(message)
+
+    def test_the_output_is_read_back_as_the_slots_and_the_connections_each_account_holds(self) -> None:
+        slots = accounts.parse_slots(self.OUTPUT)
+        self.assertEqual((100, 3, 0, {"airbyte": 75, "apicurio": 20, "nessie": 1}), (slots.max_connections, slots.reserved, slots.role_reserved, slots.held))
+
+    def test_a_server_whose_ordinary_slots_are_all_held_is_full_and_the_message_names_the_cause_the_figures_the_holders_and_the_budget(self) -> None:
+        full, message = self.report(self.OUTPUT.replace("airbyte|75", "airbyte|76"))
+        self.assertTrue(full)
+        self.assertIn("PostgreSQL connection slots are full", message)
+        self.assertIn("97 of 97", message)
+        self.assertIn("airbyte 76, apicurio 20, nessie 1", message)
+        self.assertIn("compose/postgres_connections.yml", message)
+
+    def test_the_full_message_states_the_count_and_does_not_predict_the_error_text_that_a_tool_gets(self) -> None:
+        """The count is what this read saw. What PostgreSQL tells a client that connects later is not in the message: a prediction can be wrong."""
+        _, message = self.report(self.OUTPUT.replace("airbyte|75", "airbyte|76"))
+        for predicted in ("SUPERUSER", "refused", "remaining connection slots", "a tool that connects now"):
+            with self.subTest(predicted=predicted):
+                self.assertNotIn(predicted, message)
+
+    def test_one_slot_free_is_not_full_and_the_message_does_not_name_the_cause(self) -> None:
+        full, message = self.report(self.OUTPUT)
+        self.assertFalse(full)
+        self.assertNotIn("slots are full", message)
+        self.assertIn("96 of 97", message)
+
+    def test_a_superuser_session_takes_a_slot_that_an_ordinary_account_would_need(self) -> None:
+        """96 sessions of ordinary accounts and one of a superuser leave an ordinary account no slot: PostgreSQL counts every client backend."""
+        full, message = self.report(self.SETTINGS + "held|airbyte|76\nheld|apicurio|20\nheld|postgres|1\n")
+        self.assertTrue(full, message)
+        self.assertIn("97 of 97", message)
+        self.assertIn("postgres 1", message)
+
+    def test_the_slots_that_the_server_keeps_for_reserved_roles_come_off_the_ordinary_slots_too(self) -> None:
+        full, message = self.report(self.OUTPUT.replace("reserved_connections|0", "reserved_connections|2").replace("nessie|1", "nessie|0"))
+        self.assertTrue(full, message)
+        self.assertIn("95 of 95", message)
+
+    def test_a_server_with_no_connection_is_not_full(self) -> None:
+        full, message = self.report(self.SETTINGS)
+        self.assertFalse(full)
+        self.assertIn("0 of 97", message)
+
+    def test_a_line_of_another_shape_or_a_missing_setting_is_refused_without_echoing_it(self) -> None:
+        for output in (
+            "held|airbyte|many\n",
+            "setting|max_connections|100\nsetting|superuser_reserved_connections|3\n",
+            "setting|work_mem|4\n",
+            "something secret-looking\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(accounts.AccountError) as caught:
+                accounts.parse_slots(output)
+            self.assertNotIn("secret-looking", str(caught.exception))
+            self.assertNotIn("many", str(caught.exception))
+
+    def test_the_query_counts_every_client_backend_but_its_own_and_reads_no_query_text_address_or_name_of_a_database(self) -> None:
+        for column in ("query", "client_addr", "datname", "application_name"):
+            self.assertNotIn(column, accounts.SLOTS_QUERY)
+        self.assertNotIn("rolsuper", accounts.SLOTS_QUERY)
+        self.assertIn("backend_type = 'client backend'", accounts.SLOTS_QUERY)
+        self.assertIn("pid <> pg_backend_pid()", accounts.SLOTS_QUERY)
+        self.assertIn("'reserved_connections'", accounts.SLOTS_QUERY)
+
+    def test_the_server_returns_the_answer_of_the_slots_query(self) -> None:
+        calls: list[str] = []
+
+        def run(command: list[str], data: str) -> tuple[int, str, str]:
+            calls.append(data)
+            return 0, self.OUTPUT, ""
+
+        self.assertEqual(self.OUTPUT, accounts.Server(run, ["docker", "compose"]).psql(accounts.SLOTS_QUERY, {"nessie": ["nessie"]}))
+        self.assertEqual([accounts.SLOTS_QUERY], calls)
+
+
+STACK_TASKS = ROOT / "ansible" / "roles" / "compose_stack" / "tasks"
+
+
+def tasks_of(name: str) -> list[dict[str, Any]]:
+    document: Any = load_yaml((STACK_TASKS / name).read_text())
+    if not isinstance(document, list):
+        raise TypeError("expected a task list")
+    return document
+
+
+class StartDiagnosisTest(unittest.TestCase):
+    """Each wait for health that can fail (the start of the services and the forced recreate of the stale ones) stops with the same diagnosis."""
+
+    def test_the_forced_recreate_runs_in_a_block_whose_rescue_includes_the_same_diagnosis_as_the_start(self) -> None:
+        blocks = [task for task in tasks_of("start.yml") if "rescue" in task]
+        self.assertEqual(2, len(blocks), "the start and the forced recreate each have a block with a rescue")
+        recreate = next(task for task in blocks if any("--force-recreate" in str(item.get("ansible.builtin.command", "")) for item in task["block"]))
+        start = next(task for task in blocks if task is not recreate)
+        for block in (start, recreate):
+            includes = [item for item in block["rescue"] if "ansible.builtin.include_tasks" in item]
+            self.assertEqual(["start_failure.yml"], [item["ansible.builtin.include_tasks"] for item in includes])
+        self.assertTrue(
+            all("ansible.builtin.fail" not in item for block in (start, recreate) for item in block["rescue"]), "the stop is in the shared file only"
+        )
+
+    def test_the_shared_diagnosis_reads_the_state_then_the_slots_and_stops_with_the_slots_first(self) -> None:
+        tasks = tasks_of("start_failure.yml")
+        read = next(task for task in tasks if "postgres_accounts" in task)
+        self.assertEqual("slots", read["postgres_accounts"]["step"])
+        self.assertIs(False, read["failed_when"])
+        self.assertEqual("compose_stack_slots", read["register"])
+        self.assertLess(next(index for index, task in enumerate(tasks) if "ansible.builtin.command" in task), tasks.index(read))
+        self.assertLess(tasks.index(read), next(index for index, task in enumerate(tasks) if "ansible.builtin.fail" in task))
+        message = next(task for task in tasks if "ansible.builtin.fail" in task)["ansible.builtin.fail"]["msg"]
+        self.assertIn("compose_stack_slots.message", message)
+        self.assertLess(message.index("compose_stack_slots.message"), message.index("did not become healthy"))
+
+    def test_each_wait_names_what_it_waited_for_in_the_failure(self) -> None:
+        subjects = []
+        for task in tasks_of("start.yml"):
+            if "rescue" in task:
+                subjects.append(next(item for item in task["rescue"] if "ansible.builtin.include_tasks" in item)["vars"]["compose_stack_failure_subject"])
+        self.assertEqual(["The services", "The recreated services"], sorted(subjects, key=len))
 
 
 if __name__ == "__main__":

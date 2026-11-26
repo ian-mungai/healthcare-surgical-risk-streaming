@@ -77,6 +77,7 @@ case "$verb" in
     fi
     if [ -f "$here/hang_pull" ]; then exec sleep 30; fi ;;
   up)
+    case " $* " in *" --force-recreate "*) [ -f "$here/fail_recreate" ] && { echo "unhealthy" >&2; exit 1; } ;; esac
     touch "$here/started"
     case " $* " in *" --force-recreate "*) sed -i.bak 's/ .*$/ 2099-01-01T00:00:00Z/' "$here/inspect.txt"; rm -f "$here/inspect.txt.bak" ;; esac ;;
   ps) if [ -f "$here/started" ]; then echo abc123; fi ;;
@@ -242,6 +243,30 @@ class RecreateTest(unittest.TestCase):
             forced = self.recreations(stand_in)
         self.assertEqual(0, code, output)
         self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps alloy"], forced)
+
+    def test_a_recreate_whose_health_wait_fails_stops_with_the_slots_line_first_and_the_state_of_each_service(self) -> None:
+        """The forced recreate waits for health like the start does, so a code location that cannot connect to a full server is diagnosed the same way."""
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
+            (stand_in.parent / "fail_recreate").write_text("")
+            (folder / "tools.txt").write_text("nessie\n")
+            (folder / "secrets").mkdir()
+            code, output = run_tasks(
+                "start.yml",
+                variables(
+                    folder,
+                    stand_in,
+                    compose_stack_start_services=[],
+                    compose_stack_tools_file=str(folder / "tools.txt"),
+                    compose_stack_secrets_directory=str(folder / "secrets"),
+                ),
+            )
+        self.assertNotEqual(0, code)
+        self.assertIn("The recreated services did not become healthy within 30 seconds", output)
+        self.assertLess(output.index("PostgreSQL connection slots could not be read"), output.index("The recreated services did not become healthy"))
+        self.assertIn("State of each service:", output)
 
     def test_a_second_run_recreates_nothing_and_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

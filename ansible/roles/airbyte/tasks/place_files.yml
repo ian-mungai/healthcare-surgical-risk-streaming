@@ -39,6 +39,14 @@
     group: "{{ airbyte_group }}"
     mode: "0644"
 
+- name: Place the post-renderer that gives the deployments holding database connections the Recreate strategy
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/recreate_post_renderer.py"
+    dest: "{{ airbyte_directory }}/recreate_post_renderer.py"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0755"
+
 - name: Write the host settings file
   ansible.builtin.template:
     src: host.values.yaml.j2

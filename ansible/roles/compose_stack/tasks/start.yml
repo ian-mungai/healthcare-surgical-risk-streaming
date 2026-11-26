@@ -53,28 +53,26 @@
       changed_when: false
       timeout: "{{ compose_stack_start_deadline_seconds | int }}"
   rescue:
-    - name: Read each service's state without logs
-      ansible.builtin.command:
-        argv: "{{ compose_stack_docker + ['ps', '--all', '--format', 'table {{ .Service }}\\t{{ .State }}\\t{{ .Status }}'] }}"
-      register: compose_stack_diagnosis
-      changed_when: false
-      failed_when: false
-      timeout: 60
+    - name: Stop with the PostgreSQL slots and the state of each service
+      ansible.builtin.include_tasks: start_failure.yml
+      vars:
+        compose_stack_failure_subject: The services
 
-    - name: Stop with the service and its state
-      ansible.builtin.fail:
-        msg: >-
-          The services did not become healthy within {{ compose_stack_health_deadline_seconds }} seconds (start deadline {{ compose_stack_start_deadline_seconds }}
-          seconds). State of each service: {{ compose_stack_diagnosis.stdout | default('unreadable') }}
-
-- name: Recreate the services that run with an older copy of a configuration file, each without its dependencies
-  ansible.builtin.command:
-    argv: >-
-      {{ compose_stack_docker + ['up', '--detach', '--wait', '--wait-timeout', compose_stack_health_deadline_seconds | string, '--force-recreate', '--no-deps']
-      + compose_stack_stale.stale }}
+- name: Wait for the health of the recreated stale services, and diagnose a failure the way the start does
   when: compose_stack_stale.stale | length > 0
-  changed_when: false
-  timeout: "{{ compose_stack_start_deadline_seconds | int }}"
+  block:
+    - name: Recreate the services that run with an older copy of a configuration file, each without its dependencies
+      ansible.builtin.command:
+        argv: >-
+          {{ compose_stack_docker + ['up', '--detach', '--wait', '--wait-timeout', compose_stack_health_deadline_seconds | string, '--force-recreate', '--no-deps']
+          + compose_stack_stale.stale }}
+      changed_when: false
+      timeout: "{{ compose_stack_start_deadline_seconds | int }}"
+  rescue:
+    - name: Stop with the PostgreSQL slots and the state of each service
+      ansible.builtin.include_tasks: start_failure.yml
+      vars:
+        compose_stack_failure_subject: The recreated services
 
 - name: Read the stack's containers after the start
   ansible.builtin.command:

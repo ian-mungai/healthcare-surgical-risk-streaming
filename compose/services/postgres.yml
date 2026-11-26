@@ -4,6 +4,8 @@ services:
     platform: linux/amd64
     mem_limit: ${MEM_LIMIT_POSTGRES:?render the limits first}
     restart: unless-stopped
+    # The slots are the budget of compose/postgres_connections.yml, passed here so that no image default decides them.
+    command: [postgres, -c, max_connections=100, -c, superuser_reserved_connections=3]
     environment:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256

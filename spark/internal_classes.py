@@ -155,6 +155,7 @@ PROJECT_CLASSES = (
     "scripts.stack.caddy.RoutesError",
     "scripts.stack.capacity_sampler.Failure",
     "scripts.stack.capacity_sampler.SamplerError",
+    "scripts.stack.connection_budget.BudgetError",
     "scripts.stack.disk_summary.SummaryError",
     "scripts.stack.groups.GroupError",
     "scripts.stack.groups.GroupWaits",

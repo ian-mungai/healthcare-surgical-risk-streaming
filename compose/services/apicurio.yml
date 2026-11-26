@@ -16,6 +16,10 @@ services:
       APICURIO_DATASOURCE_URL: jdbc:postgresql://postgres:5432/apicurio
       APICURIO_DATASOURCE_USERNAME: apicurio
       APICURIO_DATASOURCE_PASSWORD_FILE: /run/secrets/apicurio_database_password
+      # The most connections that Apicurio may hold (compose/postgres_connections.yml). Its defaults are 20 at the start and 100 at most, and the pool refuses a minimum above the maximum.
+      APICURIO_DATASOURCE_JDBC_INITIAL_SIZE: "1"
+      APICURIO_DATASOURCE_JDBC_MIN_SIZE: "1"
+      APICURIO_DATASOURCE_JDBC_MAX_SIZE: "4"
     secrets:
       - apicurio_database_password
     volumes:

@@ -411,6 +411,11 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "parser", "requested", "restore", "run_sampler", "sample_line", "say_error", "sleep", "staging_argument", "staging_body", "staging_row",
         "timed", "write_line",
     ),
+    "scripts/stack/connection_budget.py": (
+        "Budget", "BudgetError", "Client", "Setting", "budget_problems", "coverage_problems", "exact_keys", "find_setting", "java_property_value",
+        "load_budget", "mapping", "parse_budget", "parse_client", "parse_setting", "passed_figures", "postgres_problems", "setting_problems",
+        "usable_slots", "whole_number",
+    ),
     "scripts/stack/disk_summary.py": (
         "SummaryError", "check_header", "describe", "finite_number", "limit_argument", "main", "phase_argument", "phase_summary", "sampler_lines",
         "summarize", "write_record",
