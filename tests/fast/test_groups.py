@@ -7,12 +7,17 @@ Each case changes one fact of a good setup and expects the result to follow from
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
+from scripts.project_config import ROOT
 from scripts.stack.groups import (
+    AISTOR_STATE_NAME,
     ALWAYS_ON_GROUPS,
+    LICENSED_SERVICES,
     PROJECT_IMAGE_SETTINGS,
     GroupError,
     ServiceState,
@@ -26,12 +31,14 @@ from scripts.stack.groups import (
     profile_of,
     rendered_environment,
     start_compose,
+    start_group,
     stop_arguments,
     stop_compose,
     up_arguments,
     wait_ready,
 )
 from scripts.stack.limits import LIMITS_FILE, load_limits, parse_limits
+from scripts.stack.yaml_text import load_yaml
 
 GOOD = """\
 host_reserve_mib: 4096
@@ -180,6 +187,62 @@ LINE = "{service}|{state}|{health}|{exit_code}|{oom}|{restarts}"
 def inspect_text(*rows: dict[str, str]) -> str:
     defaults = {"service": "batch_worker", "state": "running", "health": "healthy", "exit_code": "0", "oom": "false", "restarts": "0"}
     return "\n".join(LINE.format(**(defaults | row)) for row in rows) + "\n"
+
+
+LICENSED = (
+    GOOD
+    + """\
+  aistor:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+"""
+)
+
+
+class StorageLicenceGateTest(unittest.TestCase):
+    """AIStor needs its licence, so group-up starts it only while the host's record of the AIStor step says that the step started it."""
+
+    def start(self, record: str | None) -> tuple[list[str], tuple[str, ...], list[str]]:
+        """The services that one start of the always-on group names to docker, the services it reports as started and its messages."""
+        named: list[str] = []
+        messages: list[str] = []
+
+        def docker(arguments: list[str], **_options: object) -> str:
+            named.extend(arguments[arguments.index("--no-recreate") + 1 :])
+            return ""
+
+        def states(*_arguments: object) -> dict[str, ServiceState]:
+            return {name: ServiceState(name, "running", "healthy", 0, False, 0) for name in named}
+
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "limits.yml").write_text(LICENSED)
+            if record is not None:
+                (folder / "aistor.state").write_text(record)
+            found = Settings(compose_directory=folder, project="stack_project", available_mib=100000)
+            with mock.patch("scripts.stack.groups.docker", side_effect=docker), mock.patch("scripts.stack.groups.read_states", side_effect=states):
+                result = start_group(found, "supporting", log=messages.append)
+        return named, result.started, messages
+
+    def test_a_recorded_start_of_aistor_lets_group_up_start_it_with_the_rest_of_the_group(self) -> None:
+        named, started, messages = self.start("started\n")
+        self.assertEqual(["aistor", "postgres"], named)
+        self.assertEqual(("aistor", "postgres"), started)
+        self.assertFalse(any("left out" in message for message in messages))
+
+    def test_a_skipped_missing_empty_or_unknown_record_leaves_aistor_out_and_says_so(self) -> None:
+        for record in ("skipped: no AIStor licence file was on the host at the last deploy; place the licence and deploy again\n", None, "", "starting\n"):
+            with self.subTest(record=record):
+                named, started, messages = self.start(record)
+                self.assertEqual(["postgres"], named)
+                self.assertEqual(("postgres",), started)
+                self.assertEqual(1, sum("aistor is left out" in message for message in messages), messages)
+
+    def test_the_record_is_the_file_that_the_aistor_step_writes_in_the_compose_folder(self) -> None:
+        variables: Any = load_yaml((ROOT / "ansible" / "group_vars" / "all.yml").read_text())
+        self.assertEqual(f"{{{{ compose_stack_compose_directory }}}}/{AISTOR_STATE_NAME}", variables["compose_stack_aistor_state_file"])
+        self.assertEqual(list(LICENSED_SERVICES), variables["compose_stack_storage_services"])
 
 
 class ReadinessTest(unittest.TestCase):

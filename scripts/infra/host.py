@@ -60,7 +60,7 @@ SSH_ATTEMPT_SECONDS = 30
 # (ansible/storage.yml: the licence check, the start of AIStor and its project user) and the connection step (ansible/connection.yml: the Airbyte connection
 # step and the start of the orchestration services) each have their own budget from the same sum.
 HOST_SETUP_TIMEOUT_SECONDS = 10800
-STACK_TIMEOUT_SECONDS = 18900
+STACK_TIMEOUT_SECONDS = 19200
 CONNECTION_TIMEOUT_SECONDS = 5100
 STORAGE_TIMEOUT_SECONDS = 3300
 PLAYBOOKS = {

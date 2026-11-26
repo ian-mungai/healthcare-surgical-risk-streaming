@@ -427,6 +427,11 @@ class PullTest(unittest.TestCase):
     LOGIN = "deploy-login-marker"
     USER = "example_account"
     SHAPE = "login.[A-Za-z0-9]+"
+    # The services that the stand-in's compose files name. AIStor is left out of the pull: its own step pulls it, and only when its licence is on the host.
+    SERVICES = ("postgres", "aistor", "spark_bronze", "grafana")
+    PROFILES = "--profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance"
+    LIST_CALL = f"compose --project-name sample {PROFILES} config --services"
+    PULL_CALL = f"compose --project-name sample {PROFILES} pull --quiet grafana postgres spark_bronze"
 
     def prepare_pull(self, folder: Path, *, stored: str | None = TOKEN) -> tuple[Path, dict[str, object]]:
         stand_in = prepare(folder)
@@ -440,9 +445,11 @@ class PullTest(unittest.TestCase):
         self.addCleanup(server.__exit__)
         if stored is not None:
             server.versions["external/dockerhub_read"] = [stored]
+        (stand_in.parent / "services.txt").write_text("".join(f"{name}\n" for name in self.SERVICES))
         values = variables(
             folder,
             stand_in,
+            compose_stack_storage_services=load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_storage_services"),
             compose_stack_registry_user=self.USER,
             openbao_address=server.address,
             openbao_secrets_directory=str(secrets),
@@ -473,6 +480,11 @@ class PullTest(unittest.TestCase):
         existing.write_text("existing-login\n")
         return existing
 
+    @staticmethod
+    def pulls(stand_in: Path) -> list[str]:
+        """The docker calls that pull. The listing of the services' names comes before them and is no pull."""
+        return [call for call in calls(stand_in) if " pull " in f" {call} "]
+
     def configurations(self, stand_in: Path) -> list[tuple[str, str]]:
         """The ``DOCKER_CONFIG`` value and the folder mode that each docker call saw, in the order of the calls."""
         log = stand_in.parent / "config.log"
@@ -501,12 +513,10 @@ class PullTest(unittest.TestCase):
             holders = (stand_in.parent / "token_files.log").read_text()
         self.assertEqual(0, code, output)
         self.assertEqual([], running, "the task left a process of its own: the pull, the shell or its watchdog")
-        self.assertEqual(
-            ["compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet"],
-            logged,
-        )
-        self.assertEqual(1, len(seen))
-        used_folder, mode = seen[0]
+        self.assertEqual([self.LIST_CALL, self.PULL_CALL], logged)
+        self.assertEqual(2, len(seen))
+        self.assertEqual("unset", seen[0][0], "the listing runs with no login")
+        used_folder, mode = seen[1]
         self.assertRegex(used_folder, re.escape(str(parent)) + "/" + self.SHAPE + "$")
         self.assertEqual("drwx------", mode)
         self.assertEqual("-rw-------", file_mode)
@@ -527,11 +537,7 @@ class PullTest(unittest.TestCase):
         for name, text in {**seen, "output": output}.items():
             self.assertNotIn(self.TOKEN, text, name)
             self.assertNotIn(auth, text, name)
-        self.assertIn(
-            "compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet",
-            seen["ps.log"],
-            "the process list was read while the pull ran",
-        )
+        self.assertIn(self.PULL_CALL, seen["ps.log"], "the process list was read while the pull ran")
 
     def test_the_pull_sees_neither_a_docker_auth_setting_nor_a_project_image_setting_of_the_hosts_environment(self) -> None:
         planted = {"DOCKER_AUTH_CONFIG": '{"auths": {}}', "IMAGE_SPARK": "stale/x@sha256:" + "a" * 64, "IMAGE_DAGSTER": "stale/y", "IMAGE_REPLAY": "stale/z"}
@@ -541,7 +547,8 @@ class PullTest(unittest.TestCase):
             code, output = run_tasks("pull_images.yml", values, environment=planted)
             names = (stand_in.parent / "names.log").read_text().splitlines()
         self.assertEqual(0, code, output)
-        self.assertEqual(["compose: "], names)
+        self.assertEqual("compose: ", names[-1], "the pull, the last call, has none of the three names and no DOCKER_AUTH_CONFIG")
+        self.assertFalse([line for line in names if "IMAGE_" in line], "no call keeps a project image setting of the host")
 
     def test_a_docker_credential_helper_on_the_path_does_not_stop_the_pull_because_the_one_entry_file_gives_it_no_helper_to_use(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -551,10 +558,7 @@ class PullTest(unittest.TestCase):
             logged = calls(stand_in)
             used = json.loads((stand_in.parent / "pull_config.json").read_text())
         self.assertEqual(0, code, output)
-        self.assertEqual(
-            ["compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet"],
-            logged,
-        )
+        self.assertEqual([self.LIST_CALL, self.PULL_CALL], logged)
         self.assertEqual(["auths"], list(used))
         self.assertEqual(1, len(used["auths"]))
 
@@ -580,7 +584,7 @@ class PullTest(unittest.TestCase):
                 left = os.listdir(self.parent(folder))
             self.assertNotEqual(0, code, output)
             self.assertIn("the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key", output)
-            self.assertEqual([], calls(stand_in), "no Docker command ran with that file")
+            self.assertEqual([], self.pulls(stand_in), "no pull ran with that file")
             self.assertEqual([], left)
             self.assertNotIn(self.TOKEN, output)
 
@@ -608,7 +612,7 @@ class PullTest(unittest.TestCase):
                 left = os.listdir(self.parent(folder))
             self.assertNotEqual(0, code, output)
             self.assertIn("the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key", output)
-            self.assertEqual([], calls(stand_in), "no Docker command ran with that file")
+            self.assertEqual([], self.pulls(stand_in), "no pull ran with that file")
             self.assertEqual([], left)
 
     def test_the_task_file_has_no_refusal_for_a_credential_helper_on_the_path(self) -> None:
@@ -639,7 +643,8 @@ class PullTest(unittest.TestCase):
                 self.assertEqual(0o700, stat.S_IMODE(self.parent(folder).stat().st_mode))
                 self.assertEqual("existing-login\n", existing.read_text())
                 self.assertEqual(["config.json"], os.listdir(existing.parent))
-                self.assertNotIn("unset", [configuration for configuration, _ in self.configurations(stand_in)])
+                made = zip(calls(stand_in), [configuration for configuration, _ in self.configurations(stand_in)], strict=True)
+                self.assertNotIn("unset", [configuration for call, configuration in made if call != self.LIST_CALL], "every call but the listing")
 
     def test_a_parent_that_is_not_a_root_only_folder_is_refused_and_left_as_it_is(self) -> None:
         for label in ("open_mode", "symbolic_link", "plain_file"):
@@ -658,7 +663,7 @@ class PullTest(unittest.TestCase):
                 code, output = run_tasks("pull_images.yml", values)
                 self.assertNotEqual(0, code)
                 self.assertIn("is not a directory with mode 0700", output)
-                self.assertEqual([], calls(stand_in))
+                self.assertEqual([], self.pulls(stand_in))
                 if label == "open_mode":
                     self.assertEqual(0o755, stat.S_IMODE(parent.stat().st_mode), "the folder's mode is not changed")
                 if label == "symbolic_link":
@@ -927,9 +932,7 @@ class PullTest(unittest.TestCase):
             listing = (stand_in.parent / "ps.log").read_text()
         self.assertEqual(0, code, output)
         self.assertNotIn("sleep 4711", listing, "a process outside the run's groups is in the list")
-        self.assertIn(
-            "compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet", listing
-        )
+        self.assertIn(self.PULL_CALL, listing)
 
     def test_a_second_run_changes_nothing_on_the_host_and_runs_the_same_pull(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -941,8 +944,19 @@ class PullTest(unittest.TestCase):
             count = len(calls(stand_in))
         self.assertEqual((0, 0), (first, code), output)
         self.assertRegex(output, CHANGED_NONE)
-        self.assertEqual(2, count)
+        self.assertEqual(4, count)
         self.assertEqual([], left)
+
+    def test_a_service_list_that_holds_only_the_storage_services_is_refused_so_the_pull_never_names_no_service(self) -> None:
+        """``docker compose pull`` with no service name pulls every image, AIStor's too."""
+        with tempfile.TemporaryDirectory() as scratch:
+            stand_in, values = self.prepare_pull(Path(scratch))
+            (stand_in.parent / "services.txt").write_text("aistor\n")
+            code, output = run_tasks("pull_images.yml", values)
+            logged = calls(stand_in)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the Compose files name no service to pull", output)
+        self.assertEqual([self.LIST_CALL], logged)
 
     def test_an_empty_path_or_a_stored_value_in_the_wrong_form_stops_the_deploy_before_any_write_and_leaves_no_file(self) -> None:
         cases = {"empty path": None, "wrong form": "not a docker hub token", "white space only": "  "}
@@ -952,7 +966,7 @@ class PullTest(unittest.TestCase):
                 stand_in, values = self.prepare_pull(folder, stored=stored)
                 code, output = run_tasks("pull_images.yml", values)
                 self.assertNotEqual(0, code)
-                self.assertEqual([], calls(stand_in), "no docker call at all")
+                self.assertEqual([], self.pulls(stand_in), "no pull at all")
                 self.assertFalse(self.parent(folder).exists(), "nothing was written, not even the parent")
                 self.assertNotIn(self.TOKEN, output)
                 self.assertNotIn("not a docker hub token", output)
@@ -964,7 +978,7 @@ class PullTest(unittest.TestCase):
             # The login of another consumer's role is not accepted: the secret ID file holds a text that the server does not know.
             (folder / "secrets" / "openbao" / "deploy.secret_id").write_text("some-other-login")
             code, output = run_tasks("pull_images.yml", values)
-            logged = calls(stand_in)
+            logged = self.pulls(stand_in)
         self.assertNotEqual(0, code)
         self.assertEqual([], logged)
         self.assertNotIn(self.TOKEN, output)

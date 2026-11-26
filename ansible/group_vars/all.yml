@@ -107,7 +107,7 @@ compose_stack_docker_socket: /var/run/docker.sock
 # the tag that holds the version (the repository and the folder's hash complete it), the name of the image (its pin in compose/image_pins.yml), the repository's folders
 # that the image's folder holds, the build context (a source, or "." for the whole folder; the first source when unset), the Dockerfile (in the context when unset) and
 # the named build contexts that the Dockerfile copies from. The pin file is the authority: the command pushes only a tag that the pin file lacks and never reads the registry.
-# The host builds nothing: it pulls the pinned digests (pull_images.yml).
+# The host builds nothing: it pulls the pinned digests (pull_images.yml, and for AIStor, whose image is not the project's, the AIStor step's start).
 compose_stack_built_images:
   - tag: surgical-risk-dagster:1.13.31
     name: dagster
@@ -135,8 +135,8 @@ compose_stack_nessie_namespace: surgical_risk
 compose_stack_orchestration_services: [dagster_code_location, dagster_daemon, dagster_webserver]
 # An empty project name keeps the one fixed name in compose.yml.
 compose_stack_project: ""
-# Each deadline is in seconds. The start deadline covers starting the containers and the health deadline each service's health check. The pull deadline covers the
-# pull of every image after the login.
+# Each deadline is in seconds. The start deadline covers starting the containers (and, for AIStor, the pull of its missing image) and the health deadline each
+# service's health check. The pull deadline covers the pull of every image but the storage services' after the login.
 compose_stack_start_deadline_seconds: 900
 compose_stack_health_deadline_seconds: 180
 compose_stack_pull_deadline_seconds: 1800

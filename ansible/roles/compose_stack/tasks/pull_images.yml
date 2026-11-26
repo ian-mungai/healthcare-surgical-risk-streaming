@@ -1,7 +1,11 @@
-# Reads compose_stack_docker (the Compose command, which runs with the project image settings removed from its environment), compose_stack_registry_user,
+# Reads compose_stack_docker (the Compose command, which runs with the project image settings removed from its environment), compose_stack_storage_services,
+# compose_stack_registry_user,
 # compose_stack_registry_config_directory (the parent of the pull's login folder), compose_stack_owner and
 # compose_stack_pull_deadline_seconds. The project's images are in one private Docker Hub repository, which the owner's computer pushed to (make images-push) and
-# which compose/image_pins.yml names by digest. The host builds nothing: it pulls every image that the Compose files name (including those of the Spark jobs' profiles).
+# which compose/image_pins.yml names by digest. The host builds nothing: it pulls every image that the Compose files name (including those of the Spark jobs' profiles)
+# but those of the storage services (compose_stack_storage_services). AIStor's image comes from another registry and the server needs its licence, so only the AIStor
+# step pulls it, as its start does for a missing image and only when the licence is on the host (storage.yml). A deploy with no licence therefore needs that registry
+# for nothing. The pull names its services, so it first lists them, with no login, and refuses an empty list, because a pull that names none pulls every image.
 # The role owns every piece of Docker state that the pull uses and changes no state that anything else shares: it runs no docker login and no docker logout. One shell
 # task (run by bash, which makes a process group for a background job with no terminal) makes a fresh folder under the parent (mode 0700, never removed, never changed), writes the folder's
 # config.json (mode 0600) with the one auth entry for Docker Hub, checks what it wrote, runs the pull in a process group of its own with DOCKER_CONFIG set to that folder and
@@ -43,6 +47,22 @@
           - compose_stack_pull_deadline_seconds | int > compose_stack_pull_reserve_seconds
         quiet: true
         fail_msg: "compose_stack_pull_deadline_seconds must be more than {{ compose_stack_pull_reserve_seconds }} seconds: the pull task keeps the last {{ compose_stack_pull_reserve_seconds }} for its own end"
+
+    - name: List the services of the Compose files, those of the Spark jobs' profiles too
+      ansible.builtin.command:
+        argv: >-
+          {{ compose_stack_docker + ['--profile', 'batch_bronze', '--profile', 'batch_silver', '--profile', 'batch_gold', '--profile', 'batch_maintenance',
+          'config', '--services'] }}
+      register: compose_stack_pull_listing
+      changed_when: false
+      check_mode: false
+      timeout: 60
+
+    - name: Stop when the Compose files name no service to pull
+      ansible.builtin.assert:
+        that: compose_stack_pull_listing.stdout_lines | difference(compose_stack_storage_services) | length > 0
+        quiet: true
+        fail_msg: "the Compose files name no service to pull but the storage services"
 
     - name: Read the registry token from OpenBao, hidden, with no file
       ansible.builtin.include_role:
@@ -134,7 +154,7 @@
             if IFS= read -r -d '' raw < "$folder/config.json" || [ "$raw" != "$expected"$'\n' ]; then
               refuse "the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key"
             fi
-            env -u DOCKER_AUTH_CONFIG "DOCKER_CONFIG=$folder" {{ compose_stack_docker | map('quote') | join(' ') }} --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet < /dev/null > /dev/null 2>&1 &
+            env -u DOCKER_AUTH_CONFIG "DOCKER_CONFIG=$folder" {{ compose_stack_docker | map('quote') | join(' ') }} --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet {{ compose_stack_pull_listing.stdout_lines | difference(compose_stack_storage_services) | sort | map('quote') | join(' ') }} < /dev/null > /dev/null 2>&1 &
             pull=$!
             (
               trap - EXIT

@@ -10,6 +10,9 @@ services and leaves every other service running. Both are safe to repeat: a grou
 again. A message holds the service's name and a closed list of fields of its state (state, health, exit code, out-of-memory flag, restarts), never a
 container's own text, so no secret can reach it.
 
+``up`` leaves AIStor out of its group unless the AIStor step recorded that it started the server (``aistor.state`` in the compose folder), because the
+server needs its licence, which the deploy places only when the owner holds one. The admission check still counts AIStor's memory.
+
 ``up`` refuses a Spark group (``batch_<workload>``) before Compose starts a container: the service starts no job by itself, and a stopped container of an older
 version would restart its old job under ``--no-recreate``. A Spark job starts with ``scripts/stack/spark_run.py``, which holds the one Spark slot.
 
@@ -27,7 +30,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -45,6 +48,11 @@ SPARK_REFUSAL = (
     "Start a job with python -m scripts.stack.spark_run <job> in the code location container"
 )
 ALWAYS_ON_GROUPS = frozenset({SUPPORTING_GROUP})
+# The services that need AIStor's licence, and the record of the AIStor step in the compose folder (compose_stack_storage_services and
+# compose_stack_aistor_state_file of ansible/group_vars/all.yml). A fast test holds both names to the group variables.
+LICENSED_SERVICES = ("aistor",)
+AISTOR_STATE_NAME = "aistor.state"
+AISTOR_STARTED = "started"
 COMPOSE_DIRECTORY_VARIABLE = "STACK_COMPOSE_DIRECTORY"
 PROJECT_VARIABLE = "COMPOSE_PROJECT_NAME"
 AVAILABLE_VARIABLE = "STACK_TEST_AVAILABLE_MIB"
@@ -393,6 +401,23 @@ def refuse_spark_group(group: Group) -> None:
         raise SparkGroupRefused(f"the group {group.name} is a Spark group: {SPARK_REFUSAL}")
 
 
+def aistor_started(settings: Settings) -> bool:
+    """Whether the AIStor step recorded a start of the server. It records ``skipped`` when the host has no licence and removes the record when it fails."""
+    try:
+        return (settings.compose_directory / AISTOR_STATE_NAME).read_text().strip() == AISTOR_STARTED
+    except OSError, UnicodeError:
+        return False
+
+
+def licensed_group(settings: Settings, group: Group, log: Log) -> Group:
+    """The group without the services that need AIStor's licence, unless the AIStor step recorded a start. The same gate as the deploy's."""
+    gated = [name for name in group.compose if name in LICENSED_SERVICES]
+    if not gated or aistor_started(settings):
+        return group
+    log(f"group {group.name}: {', '.join(gated)} is left out, because {AISTOR_STATE_NAME} records no start: the deploy starts it with its licence")
+    return replace(group, compose=tuple(name for name in group.compose if name not in gated))
+
+
 def start_group(
     settings: Settings, group_name: str, *, wait_seconds: float = 0, deadline_seconds: float = START_DEADLINE_SECONDS, log: Log = no_log
 ) -> StartResult:
@@ -401,6 +426,7 @@ def start_group(
     group = find_group(limits, group_name)
     refuse_spark_group(group)
     require_control(settings, group)
+    group = licensed_group(settings, group, log)
     before = running_services(settings, limits)
     decision = admit(settings, limits, group, wait_seconds, log)
     log(f"admission: {describe(decision)}")

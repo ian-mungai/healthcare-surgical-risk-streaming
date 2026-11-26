@@ -452,10 +452,10 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "scripts/stack/groups.py": (
         "Group", "GroupError", "GroupWaits", "ServiceState", "Settings", "SparkGroupRefused", "StartResult", "WorkloadControl", "admit",
-        "check_stoppable", "compose_arguments", "describe_states", "docker", "find_group", "groups_of", "limits_file", "main", "no_log",
-        "parse_inspect", "parser", "profile_of", "project_name", "read_states", "ready", "refuse_spark_group", "rendered_environment",
-        "require_control", "running", "running_services", "say", "settings_from_environment", "start", "start_compose", "start_group", "stop",
-        "stop_arguments", "stop_compose", "stop_group", "up_arguments", "wait_ready", "whole_number",
+        "aistor_started", "check_stoppable", "compose_arguments", "describe_states", "docker", "find_group", "groups_of", "licensed_group",
+        "limits_file", "main", "no_log", "parse_inspect", "parser", "profile_of", "project_name", "read_states", "ready", "refuse_spark_group",
+        "rendered_environment", "require_control", "running", "running_services", "say", "settings_from_environment", "start", "start_compose",
+        "start_group", "stop", "stop_arguments", "stop_compose", "stop_group", "up_arguments", "wait_ready", "whole_number",
     ),
     "scripts/stack/groups_k3s.py": (
         "HttpsTransport", "KubernetesConfig", "KubernetesControl", "PinnedConnection", "Transport", "__init__", "authorization",

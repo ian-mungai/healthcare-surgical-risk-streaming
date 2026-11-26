@@ -3,7 +3,8 @@
 # When the launcher says that it placed the licence and the file is missing, the step fails (aistor_licence.yml). When this computer sent none and the file is missing
 # on the host, the server cannot serve a call, so this step does not start it, and the skip is announced only then:
 # it records "skipped" in the state file that make storage-up reads and goes on, and the deploy's other steps run. When the file is there (malformed is refused by
-# aistor_licence.yml), AIStor starts, its project user is verified and, if need be, made, and the state file says "started" only after both. The state file is removed
+# aistor_licence.yml), AIStor starts (the start pulls its image when the host does not have it, so no deploy without a licence needs the image's registry), its
+# project user is verified and, if need be, made, and the state file says "started" only after both. The state file is removed
 # on any failure of the step, so a step that fails never leaves an earlier claim behind, and it is written again only when its content changes. A second run with the
 # licence in place changes nothing.
 - name: Start AIStor when its licence is there, skip it when it is not, and keep a record of which
