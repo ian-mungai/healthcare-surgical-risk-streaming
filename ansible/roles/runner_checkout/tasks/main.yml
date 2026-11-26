@@ -1,13 +1,14 @@
-# Places the deployed commit's code and a pinned Python environment in one folder for the native host-mode runners, and nothing else. The order: refuse a commit or pin of the
-# wrong form; read the commit's archive on the controller (git archive, no Git history: its files and hashes are the only expected files, and a commit or a link that the
-# repository cannot give fails the deploy here, before anything on the host changes); install the pinned interpreter once (a folder of its own named for its version, beside
-# the others of this host, published by one atomic replacement of the link that names it, only after it ran and said its version); decide whether this commit's folder is
-# finished (real folders, its marker, every file of the controller's archive, and an environment that holds exactly the lock files); and only when it is not, make sure that no
-# process of an earlier build works, remove every other folder under the runner folder and the unfinished one, place the code, build the environment from the hash-pinned
-# requirements, close the folder to everyone but its owner and its group, check that, and write the finished marker last. The marker names the commit, the interpreter pin and
-# the requirements, so a second run of the same commit changes nothing and keeps the runner files that the launcher placed there, and a new commit, a new interpreter pin or
-# an unfinished folder replaces the folder. Every command runs under timeout with a kill-after, so a command that never ends is stopped, with its processes, where it runs. The
-# role reads no Compose, Docker, Kubernetes or secret setting and writes outside its own two folders, the interpreter archive's folder and the record of build processes never.
+# Places the deployed commit's code and a pinned Python environment in one folder for the native host-mode runners, and nothing else. The order: refuse a commit or pin of
+# the wrong form; read the commit's archive on the controller (git archive, no Git history: its files and hashes are the only expected files, and a commit or a link that
+# the repository cannot give fails the deploy here, before this role changes anything on the host: the changes of the earlier roles stay); install the pinned interpreter
+# once (a folder of its own named for its version, beside the others of this host, published by one atomic replacement of the link that names it, only after it ran and said
+# its version); decide whether this commit's folder is finished (real folders, its marker, every file of the controller's archive, and an environment that holds exactly the
+# lock files); and only when it is not, make sure that no process of an earlier build works, remove every other folder under the runner folder and the unfinished one, place
+# the code, build the environment from the hash-pinned requirements, close the folder to everyone but its owner and its group, check that, and write the finished marker
+# last. The marker names the commit, the interpreter pin and the requirements, so a second run of the same commit changes nothing and keeps the runner files that the
+# launcher placed there, and a new commit, a new interpreter pin or an unfinished folder replaces the folder. Every command runs under timeout with a kill-after, so a
+# command that never ends is stopped, with its processes, where it runs. The role reads no Compose, Docker, Kubernetes or secret setting and writes outside its own two
+# folders, the interpreter archive's folder and the record of build processes never.
 - name: Refuse a commit, an interpreter pin or a requirements file of the wrong form
   ansible.builtin.assert:
     that:
@@ -21,7 +22,7 @@
 
 - name: Read the commit's archive on the controller, install the interpreter, decide whether the folder is finished and place it when it is not
   block:
-    - name: Make the commit's archive on the controller and read its files, before anything on the host changes
+    - name: Make the commit's archive on the controller and read its files, before this role changes anything on the host
       ansible.builtin.include_tasks: source.yml
 
     - name: Install the pinned interpreter
