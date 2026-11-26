@@ -2,8 +2,9 @@
 
 The order is read from the real playbooks, not described: the roles and post tasks of ``ansible/host.yml`` are expanded in the order Ansible runs them, each
 role's dependencies first, each task file with the files it includes right after it; then the launcher's step that gives the host's OpenBao the external secrets
-(the intake), the tasks of ``ansible/stack.yml``, the launcher's step that places the project profile's key and the tasks of ``ansible/connection.yml``
-(the launcher runs the steps between the playbooks in ``host_up``, which ``test_host_commands`` holds). A service starts at the first
+(the intake), the tasks of ``ansible/stack.yml``, the launcher's step that places AIStor's licence, the tasks of ``ansible/storage.yml``, the launcher's step
+that places the project profile's key and the tasks of ``ansible/connection.yml`` (the launcher runs the steps between the playbooks in ``host_up``, which
+``test_host_commands`` holds). A service starts at the first
 ``start.yml`` that names it, or that names none and so starts every service that is not left out (``compose_stack_start_except``). A secret file is made by the
 task file that the tables below name for it or for its folder. On a redeploy a file can be new (a host deployed before the file existed) or replaced:
 the stale check reads only the files of the services that a start names, so a file made later in the order cannot stop an earlier start; a named service
@@ -29,6 +30,7 @@ VARIABLES = ROOT / "ansible" / "group_vars" / "all.yml"
 PRODUCERS = {
     "postgres": ("compose_stack", "passwords.yml"),
     "grafana": ("compose_stack", "grafana_password.yml"),
+    "aistor": ("compose_stack", "aistor_credentials.yml"),
     "k3s": ("airbyte", "group_access.yml"),
     "airbyte_api": ("airbyte", "record_client_files.yml"),
     "openbao": ("openbao", "prepare.yml"),
@@ -38,8 +40,13 @@ KEY_STEP = ("launcher", "place_project_key")
 # The launcher's intake writes the external secrets into the host's OpenBao after the host playbook made OpenBao and its policies, and before the stack playbook
 # pulls the images with the Docker Hub token that the intake stored.
 INTAKE_STEP = ("launcher", "place_external_secrets")
-FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP}
+# AIStor's licence is placed by the launcher too, between the stack playbook and the AIStor step: it reads the licence in the owner's OpenBao and pipes it on.
+LICENCE_STEP = ("launcher", "place_aistor_licence")
+FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP, "aistor/licence": LICENCE_STEP}
 CONNECTION = ROOT / "ansible" / "connection.yml"
+STORAGE = ROOT / "ansible" / "storage.yml"
+STORAGE_NAME = "compose_stack_storage_services"
+DEFERRED = "{{ compose_stack_orchestration_services + " + STORAGE_NAME + " }}"
 
 
 @dataclass
@@ -69,6 +76,8 @@ def expand_file(role: str, file: str, variables: dict[str, Any]) -> list[Event]:
 
 
 def expand_task(role: str, task: dict[str, Any]) -> list[Event]:
+    if "block" in task:
+        return [event for inner in task["block"] for event in expand_task(role, inner)]
     variables = dict(task.get("vars") or {})
     if "ansible.builtin.include_tasks" in task:
         return expand_file(role, task["ansible.builtin.include_tasks"], variables)
@@ -103,8 +112,9 @@ def play_events(path: Path) -> list[Event]:
 
 
 def playbook_events() -> list[Event]:
-    """The host playbook, the launcher's intake, the stack playbook, the launcher's key step and the connection playbook, in the order ``host_up`` runs them."""
-    return [*play_events(HOST), Event(*INTAKE_STEP), *play_events(STACK), Event(*KEY_STEP), *play_events(CONNECTION)]
+    """Every playbook with the launcher's steps between them: host, intake, stack, licence, AIStor, key and connection, in the order ``host_up`` runs them."""
+    first = [*play_events(HOST), Event(*INTAKE_STEP), *play_events(STACK)]
+    return [*first, Event(*LICENCE_STEP), *play_events(STORAGE), Event(*KEY_STEP), *play_events(CONNECTION)]
 
 
 def all_services() -> dict[str, dict[str, str]]:
@@ -126,6 +136,17 @@ def variable(name: str) -> Any:
     return mapping(load_yaml(VARIABLES.read_text()))[name]
 
 
+def named_services(event: Event) -> list[str] | None:
+    """The services that a start names: a list, or one of the two variables of the services that start apart, or None when it names none."""
+    named = event.vars.get("compose_stack_start_services")
+    for name in ("compose_stack_orchestration_services", STORAGE_NAME):
+        if named == "{{ " + name + " }}":
+            named = list(variable(name))
+    if named is not None and not isinstance(named, list):
+        raise AssertionError("a start must name its services as a list or by one of the two variables, or leave them out")
+    return named
+
+
 def start_positions(events: list[Event]) -> dict[str, int]:
     """The position of the first ``start.yml`` that starts each service."""
     services = set(all_services())
@@ -134,15 +155,13 @@ def start_positions(events: list[Event]) -> dict[str, int]:
     for position, event in enumerate(events):
         if event.file != "start.yml":
             continue
-        named = event.vars.get("compose_stack_start_services")
-        if named == "{{ " + left_out_name + " }}":
-            named = list(variable(left_out_name))
-        if named is not None and not isinstance(named, list):
-            raise AssertionError("a start must name its services as a list or by the one variable, or leave them out")
+        named = named_services(event)
         excluded = event.vars.get("compose_stack_start_except")
-        left_out = set(variable(left_out_name)) if excluded == "{{ " + left_out_name + " }}" else set()
-        if excluded not in (None, "{{ " + left_out_name + " }}"):
-            raise AssertionError("a start leaves services out only through the one variable")
+        left_out = {"{{ " + left_out_name + " }}": set(variable(left_out_name)), DEFERRED: set(variable(left_out_name)) | set(variable(STORAGE_NAME))}.get(
+            str(excluded), set()
+        )
+        if excluded not in (None, "{{ " + left_out_name + " }}", DEFERRED):
+            raise AssertionError("a start leaves services out only through the orchestration variable or the orchestration and storage variables")
         started = set(named) if named else services - left_out
         for service in started:
             first.setdefault(service, position)
@@ -197,6 +216,24 @@ class DeployOrderTest(unittest.TestCase):
         self.assertGreater(grafana, bootstrap)
         self.assertLess(grafana, start_positions(events)["grafana"])
 
+    def test_the_storage_service_starts_alone_after_the_licence_is_placed_and_checked_and_after_its_credential_files_and_no_other_start_names_it(self) -> None:
+        events = playbook_events()
+        starts = start_positions(events)
+        positions = {(event.role, event.file): index for index, event in reversed(list(enumerate(events)))}
+        self.assertEqual(["aistor"], variable(STORAGE_NAME))
+        for service in variable(STORAGE_NAME):
+            with self.subTest(service):
+                self.assertGreater(starts[service], positions[LICENCE_STEP], "the launcher places the licence before the AIStor step starts the server")
+                self.assertGreater(starts[service], positions[("compose_stack", "aistor_licence.yml")])
+                self.assertGreater(starts[service], positions[("compose_stack", "aistor_credentials.yml")])
+                self.assertGreater(
+                    starts[service], positions[("compose_stack", "aistor_licence_script.yml")], "the script that places the licence is installed first"
+                )
+                named = [index for index, event in enumerate(events) if event.file == "start.yml" and service in (named_services(event) or [])]
+                self.assertEqual([starts[service]], named, "only the storage step names the service")
+        general = [event for event in events if event.file == "start.yml" and not named_services(event)]
+        self.assertEqual([DEFERRED], [event.vars.get("compose_stack_start_except") for event in general])
+
     def test_the_producers_in_the_table_are_the_files_that_write_those_folders(self) -> None:
         for folder, (role, file) in PRODUCERS.items():
             with self.subTest(folder):
@@ -212,9 +249,24 @@ class DeployOrderTest(unittest.TestCase):
         for service in variable("compose_stack_orchestration_services"):
             with self.subTest(service):
                 self.assertGreater(starts[service], key)
-        for service in set(all_services()) - set(variable("compose_stack_orchestration_services")):
+        for service in set(all_services()) - set(variable("compose_stack_orchestration_services")) - set(variable(STORAGE_NAME)):
             with self.subTest(service):
                 self.assertLess(starts[service], made, "everything else starts first, so the Airbyte role finds its database and the stack")
+        for service in variable(STORAGE_NAME):
+            with self.subTest(service):
+                self.assertGreater(starts[service], made, "AIStor starts in its own step after the host playbook, and the Airbyte role needs nothing of it")
+                self.assertLess(starts[service], key)
+
+    def test_the_aistor_step_is_a_playbook_of_its_own_between_the_host_playbook_and_the_key_step(self) -> None:
+        host_files = {(event.role, event.file) for event in play_events(HOST)}
+        storage_files = {(event.role, event.file) for event in play_events(STORAGE)}
+        for name in ("storage.yml", "aistor_licence.yml", "aistor_project_user.yml"):
+            self.assertIn(("compose_stack", name), storage_files)
+            self.assertNotIn(("compose_stack", name), host_files)
+        self.assertIn(("compose_stack", "aistor_licence_script.yml"), host_files)
+        events = playbook_events()
+        self.assertLess(events.index(Event(*LICENCE_STEP)), events.index(Event(*KEY_STEP)))
+        self.assertLess(max(index for index, event in enumerate(events) if event.file == "aistor_project_user.yml"), events.index(Event(*KEY_STEP)))
 
     def test_the_orchestration_start_is_a_task_of_the_connection_playbook_and_not_of_the_host_playbook(self) -> None:
         host_files = {(event.role, event.file) for event in play_events(HOST)}

@@ -72,6 +72,7 @@ class ExistingHostCase(Case):
             "services_file": str(self.services_file),
             "tools_file": str(self.tools_file),
             "external_secrets_file": str(LIST),
+            "client_service": "aistor",
             "address": self.server.address,
             "file_owner": OWNER_TEXT,
             "root_owner": OWNER_TEXT,
@@ -108,9 +109,10 @@ class OneDeployTest(ExistingHostCase):
         result = self.deploy()
         self.assertEqual(before, self.snapshot())
         self.assertIn("write role external_intake", result["actions"])
+        new = ("external_intake", "deploy", "aistor")
         self.assertTrue(
-            all("external_intake" in action or "deploy" in action for action in result["actions"]),
-            f"only the new intake role and the new deploy consumer are written: {result['actions']}",
+            all(any(name in action for name in new) for action in result["actions"]),
+            f"only the new intake role, the new deploy consumer and the new AIStor client are written: {result['actions']}",
         )
         self.assertEqual(OLD_ADMIN_POLICY, self.server.policies["bootstrap_admin"])
 

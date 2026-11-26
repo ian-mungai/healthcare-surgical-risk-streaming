@@ -203,6 +203,9 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "main", "pin_path", "publish", "publish_image", "push_image", "pushed_digest", "require_clean", "stage",
     ),
     "scripts/infra/__init__.py": (),
+    "scripts/infra/aistor_licence.py": (
+        "LicenceError", "NoLicenceSource", "keychain_token", "read_licence", "usable",
+    ),
     "scripts/infra/created.py": (
         "created_entries", "device_entries", "entry", "managed_resources", "merge_created", "module_resources", "run_inventory",
     ),
@@ -211,12 +214,13 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "write_line",
     ),
     "scripts/infra/host.py": (
-        "FixedHostError", "HostError", "IntakeRefusal", "NoPeerError", "Peer", "ansible_recap", "ask_host", "check_sudo_policy", "deploy_variables",
-        "device_gone", "exported_key", "gone", "heavy_memory_variables", "host_check", "host_peer", "host_start", "host_stop", "host_up",
-        "instance_id", "instance_state", "keep_host_keys_of", "main", "peer_online", "place_external_secrets", "place_project_key",
-        "planned_heavy_figure", "platform_commit", "record_tailscale_device", "registry_user", "release_tailscale_device", "require_connected",
-        "require_current_inputs", "require_instance", "run_ansible", "saved_plan", "select_peer", "ssh_arguments", "ssh_output",
-        "sudo_policy_problem", "tailscale_device_id", "tailscale_status", "wait_for", "wait_until_reachable", "workload_variables",
+        "FixedHostError", "HostError", "IntakeRefusal", "LicenceRefusal", "NoPeerError", "Peer", "ansible_recap", "ask_host", "check_sudo_policy",
+        "deploy_variables", "device_gone", "exported_key", "gone", "heavy_memory_variables", "host_check", "host_peer", "host_start", "host_stop",
+        "host_up", "instance_id", "instance_state", "keep_host_keys_of", "licence_fact", "main", "peer_online", "place_aistor_licence",
+        "place_external_secrets", "place_project_key", "planned_heavy_figure", "platform_commit", "record_tailscale_device", "registry_user",
+        "release_tailscale_device", "report_aistor_state", "require_connected", "require_current_inputs", "require_instance", "run_ansible",
+        "saved_plan", "select_peer", "ssh_arguments", "ssh_output", "sudo_policy_problem", "tailscale_device_id", "tailscale_status", "wait_for",
+        "wait_until_reachable", "workload_variables",
     ),
     "scripts/infra/inventory.py": (
         "main", "write_inventory",
@@ -224,6 +228,12 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "scripts/infra/state_bootstrap.py": (
         "RunBinding", "adoption_problem", "binding_path", "bucket_exists", "bucket_problem", "create", "empty", "main", "new_binding", "owned",
         "problems", "read_settings", "repair", "required_tags", "run_suffix", "short_lived_bucket_name", "state_keys", "verify", "write",
+    ),
+    "scripts/infra/storage.py": (
+        "Credentials", "StorageError", "apply_plan", "binding_problems", "binding_record", "check_state", "check_versioning", "configuration_folder",
+        "endpoint", "environment_for", "expected_user", "initialise", "lock_problem", "main", "openbao_call", "plans_folder", "prepare_configuration",
+        "read_credentials", "redact", "require_provider_hashes", "require_started", "running_platform", "save_plan", "state_file", "state_leaks",
+        "storage_up", "terraform",
     ),
     "scripts/infra/teardown.py": (
         "TeardownRefused", "apply_destroy", "approval_binding", "approval_bytes", "approved_problems", "bucket_entries", "bucket_entry_problems",

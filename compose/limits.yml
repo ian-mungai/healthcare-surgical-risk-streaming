@@ -127,6 +127,10 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 768
+  aistor:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
   replay:
     runtime: compose
     group: supporting

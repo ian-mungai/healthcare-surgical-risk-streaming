@@ -93,6 +93,7 @@ LAUNCHER_MARKED = {
 MARKED = {
     "scripts.images.pins.PinError",
     "scripts.infra.host.IntakeRefusal",
+    "scripts.infra.host.LicenceRefusal",
     "scripts.images.publish.PublishError",
     "infra.iam.scripts.manage_policies.KeyAdviceError",
     "scripts.stack.tags.RecordNotPublished",
@@ -132,6 +133,7 @@ ALLOWED_PARTS = frozenset(
         "host_name",
         "kept",
         "KEY_MESSAGES[problem].format(status=255, seconds=KEY_SEND_SECONDS)",
+        "LICENCE_MESSAGES[problem].format(status=255, seconds=KEY_SEND_SECONDS)",
         "INTAKE_POLICY_MESSAGES[problem].format(status=255, seconds=INTAKE_SEND_SECONDS)",
         "label",
         "len(peers)",
@@ -145,7 +147,7 @@ ALLOWED_PARTS = frozenset(
     }
 )
 KEY_MESSAGE_PART = re.compile(
-    r"KEY_MESSAGES\[(?:'[a-z_]+'|f'script_\{code\}')\](?:\.format\((?:seconds=(?:KEY_EXPORT_SECONDS|KEY_SEND_SECONDS)|status=(?:255|result\.returncode|sent\.returncode))\))?"
+    r"(?:KEY|LICENCE)_MESSAGES\[(?:'[a-z_]+'|f'script_\{code\}')\](?:\.format\((?:seconds=(?:KEY_EXPORT_SECONDS|KEY_SEND_SECONDS|LICENCE_SEND_SECONDS)|status=(?:255|result\.returncode|sent\.returncode))\))?"
 )
 FIXED_RETURNS = {
     "scripts/infra/state_bootstrap.py": ("bucket_problem",),

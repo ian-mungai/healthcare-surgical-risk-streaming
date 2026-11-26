@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 override TERRAFORM := .tools/bin/terraform
 
-.PHONY: images-push setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
+.PHONY: images-push setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start storage-up inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -36,11 +36,14 @@ check-terraform:
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra init -backend=false -input=false
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra validate
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra test
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static_storage $(TERRAFORM) -chdir=infra/storage init -backend=false -input=false
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static_storage $(TERRAFORM) -chdir=infra/storage validate
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static_storage $(TERRAFORM) -chdir=infra/storage test
 	TFLINT_PLUGIN_DIR=$(CURDIR)/.tools/tflint_plugins .tools/bin/tflint --chdir=infra --recursive --config=$(CURDIR)/infra/.tflint.hcl
 	.tools/bin/trivy config --cache-dir $(CURDIR)/.tools/trivy_embedded_cache --skip-check-update --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .terraform --quiet infra
 
 check-ansible:
-	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml stack.yml connection.yml
+	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml stack.yml storage.yml connection.yml
 
 test-fast:
 	$(PYTHON) -m unittest discover --start-directory tests/fast --top-level-directory .
@@ -56,6 +59,9 @@ test-deadline:
 
 host-up:
 	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM))
+
+storage-up:
+	$(PYTHON) -m scripts.infra.storage up $(if $(CONFIRM),--confirm $(CONFIRM))
 
 host-stop:
 	$(PYTHON) -m scripts.infra.host stop

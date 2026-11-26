@@ -1,0 +1,57 @@
+# The AIStor step. Reads compose_stack_aistor_state_file, compose_stack_owner, compose_stack_group, compose_stack_aistor_licence_file, compose_stack_storage_services
+# and aistor_licence_placement (placed or absent: what the launcher did with the licence). The licence file is placed by the launcher before this step (scripts.infra.host).
+# When the launcher says that it placed the licence and the file is missing, the step fails (aistor_licence.yml). When this computer sent none and the file is missing
+# on the host, the server cannot serve a call, so this step does not start it, and the skip is announced only then:
+# it records "skipped" in the state file that make storage-up reads and goes on, and the deploy's other steps run. When the file is there (malformed is refused by
+# aistor_licence.yml), AIStor starts, its project user is verified and, if need be, made, and the state file says "started" only after both. The state file is removed
+# on any failure of the step, so a step that fails never leaves an earlier claim behind, and it is written again only when its content changes. A second run with the
+# licence in place changes nothing.
+- name: Start AIStor when its licence is there, skip it when it is not, and keep a record of which
+  block:
+    - name: Check the AIStor licence file, and find whether it is there
+      ansible.builtin.include_tasks: aistor_licence.yml
+
+    - name: Record that AIStor is skipped for want of a licence file
+      ansible.builtin.copy:
+        dest: "{{ compose_stack_aistor_state_file }}"
+        content: "skipped: no AIStor licence file was on the host at the last deploy; place the licence and deploy again\n"
+        owner: "{{ compose_stack_owner }}"
+        group: "{{ compose_stack_group }}"
+        mode: "0644"
+      when: not compose_stack_aistor_licence_present
+
+    - name: Say that AIStor is skipped
+      ansible.builtin.debug:
+        msg: >-
+          AIStor is skipped: this computer sent no licence and the licence file {{ compose_stack_aistor_licence_file }} is missing on the host. The deploy goes on;
+          store the licence in the owner's OpenBao at secret/aistor_licence (README.md, AIStor's licence, names the owner's step) and run make host-up again.
+      when: not compose_stack_aistor_licence_present
+
+    - name: Start AIStor and wait for its health
+      ansible.builtin.include_tasks: start.yml
+      vars:
+        compose_stack_start_services: "{{ compose_stack_storage_services }}"
+      when: compose_stack_aistor_licence_present
+
+    - name: Verify the AIStor project user as itself, and make its user and policy only when that is refused
+      ansible.builtin.include_tasks: aistor_project_user.yml
+      when: compose_stack_aistor_licence_present
+
+    - name: Record that AIStor started
+      ansible.builtin.copy:
+        dest: "{{ compose_stack_aistor_state_file }}"
+        content: "started\n"
+        owner: "{{ compose_stack_owner }}"
+        group: "{{ compose_stack_group }}"
+        mode: "0644"
+      when: compose_stack_aistor_licence_present
+
+  rescue:
+    - name: Remove the record of the AIStor step, which did not finish
+      ansible.builtin.file:
+        path: "{{ compose_stack_aistor_state_file }}"
+        state: absent
+
+    - name: Stop with a fixed message, because the step failed
+      ansible.builtin.fail:
+        msg: "the AIStor step failed and its record is removed: the kept output of this playbook names the failed task"

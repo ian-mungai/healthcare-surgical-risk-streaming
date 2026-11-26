@@ -157,6 +157,7 @@ not_clients:
   - prometheus
   - grafana
   - loki
+  - aistor
   - spark
   - trino
   - kafka

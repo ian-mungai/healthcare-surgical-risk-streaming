@@ -16,4 +16,5 @@ include:
   - services/trino.yml
   - services/kafka.yml
   - services/apicurio.yml
+  - services/aistor.yml
   - services/replay.yml

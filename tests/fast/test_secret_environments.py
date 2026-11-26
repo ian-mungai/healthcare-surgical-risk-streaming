@@ -30,6 +30,14 @@ FILE_VARIABLES: dict[tuple[str, str], str] = {
         "apicurio",
         "APICURIO_DATASOURCE_PASSWORD_FILE",
     ): "holds a path only; Apicurio 3.3.5's own interceptor reads the mounted password file itself (confirmed in the recheck of the slice)",
+    (
+        "aistor",
+        "MINIO_ROOT_USER_FILE",
+    ): "owner decision pending: the server reads the file itself and may keep the root user in its own environment (heavy run: docker exec)",
+    (
+        "aistor",
+        "MINIO_ROOT_PASSWORD_FILE",
+    ): "owner decision pending: the server reads the file itself and may keep the root password in its own environment (heavy run: docker exec)",
     **{
         (
             "dagster_code_location",
@@ -60,6 +68,18 @@ def script_text(service: dict[str, Any]) -> str:
     return "\n".join(str(part) for part in parts)
 
 
+def secret_values(found: dict[str, dict[str, Any]]) -> list[str]:
+    """Each environment variable of a service whose name says password, token, key or licence and whose value is neither a secret file nor under /run."""
+    return [
+        f"{name}: {key}"
+        for name, service in found.items()
+        for key, value in (service.get("environment") or {}).items()
+        if re.search(r"PASSWORD|SECRET|TOKEN|PRIVATE_KEY|ACCESS_KEY|LICEN[CS]E", key)
+        and not str(value).startswith(("/run/secrets/", "/run/"))
+        and not key.endswith("_FILE")
+    ]
+
+
 class EnvironmentTest(unittest.TestCase):
     def test_no_compose_start_script_exports_a_value(self) -> None:
         exporting = {name: exported_names(script_text(service)) for name, service in services().items() if exported_names(script_text(service))}
@@ -85,16 +105,25 @@ class EnvironmentTest(unittest.TestCase):
         self.assertEqual([], [item for item in FILE_VARIABLES if item not in present])
         self.assertTrue(all(len(reason) > 20 for reason in FILE_VARIABLES.values()))
 
-    def test_no_environment_value_of_a_service_is_a_password_a_token_or_a_key(self) -> None:
-        values = [
-            f"{name}: {key}"
-            for name, service in services().items()
-            for key, value in (service.get("environment") or {}).items()
-            if re.search(r"PASSWORD|SECRET|TOKEN|PRIVATE_KEY|ACCESS_KEY", key)
-            and not str(value).startswith(("/run/secrets/", "/run/"))
-            and not key.endswith("_FILE")
-        ]
-        self.assertEqual([], values)
+    def test_no_environment_value_of_a_service_is_a_password_a_token_a_key_or_a_licence(self) -> None:
+        self.assertEqual([], secret_values(services()))
+
+    def test_a_planted_value_is_found_in_each_spelling_and_a_file_reference_is_not(self) -> None:
+        for key in (
+            "PASSWORD",
+            "MINIO_ROOT_PASSWORD",
+            "API_TOKEN",
+            "CLIENT_SECRET",
+            "SOME_PRIVATE_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "MINIO_LICENSE",
+            "AISTOR_LICENCE",
+        ):
+            with self.subTest(key=key):
+                self.assertEqual([f"s: {key}"], secret_values({"s": {"environment": {key: "a-value"}}}))
+        for key, value in (("MINIO_LICENSE_FILE", "/run/secrets/x"), ("MINIO_LICENSE", "/run/secrets/x"), ("OTHER_NAME", "a-value")):
+            with self.subTest(key=key):
+                self.assertEqual([], secret_values({"s": {"environment": {key: value}}}))
 
 
 if __name__ == "__main__":

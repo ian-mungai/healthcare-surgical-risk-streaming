@@ -1,0 +1,37 @@
+services:
+  aistor:
+    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z@sha256:a94e1fe399bd050fe6d6148839597a4995350c0e62c9e83f0cec8b5630ed0a1e
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_AISTOR:?render the limits first}
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/aistor_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/aistor_root_password
+    command: [server, /data, --license, /run/secrets/aistor_licence]
+    secrets:
+      - aistor_licence
+      - aistor_root_user
+      - aistor_root_password
+    volumes:
+      - aistor_data:/data
+    ports:
+      - 127.0.0.1:${AISTOR_HOST_PORT:-9000}:9000
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent --max-time 4 http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+secrets:
+  aistor_licence:
+    file: ${AISTOR_LICENCE_FILE:?render the host settings first}
+  aistor_root_user:
+    file: ${SECRETS_DIR:?render the host settings first}/aistor/root_user
+  aistor_root_password:
+    file: ${SECRETS_DIR:?render the host settings first}/aistor/root_password
+
+volumes:
+  aistor_data:

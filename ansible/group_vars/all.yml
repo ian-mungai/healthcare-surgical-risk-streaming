@@ -61,6 +61,42 @@ compose_stack_services_file: "{{ compose_stack_compose_directory }}/openbao_serv
 # One line for each secret that a third party issues: its consumer, OpenBao path and form check. The launcher's intake writes the values (scripts/infra/host.py).
 compose_stack_external_secrets_file: "{{ compose_stack_compose_directory }}/external_secrets.txt"
 compose_stack_owner: root
+# The AIStor licence key file, a plain file that compose_stack_owner alone reads (mode 0400), which the owner places by hand. The Compose file mounts it read-only
+# as a Compose secret (render_environment.yml writes it as AISTOR_LICENCE_FILE), and aistor_licence.yml refuses the deploy of AIStor, and of nothing else, while it
+# is missing or empty. The services that start apart from the rest, after their own step: AIStor starts after the check of its licence file.
+compose_stack_aistor_licence_file: "{{ compose_stack_secrets_directory }}/aistor/licence"
+compose_stack_storage_services: [aistor]
+# The licence is placed by the launcher, never by a task: it reads the key at secret/aistor_licence in the owner's OpenBao and pipes it, on standard input of one SSH
+# command, to the script below, which the host playbook installs with a sudoers drop-in that turns off sudo's recording for that one command line. The folder of the
+# platform's scripts is shared with the key script of the Airbyte role. The state file says whether the AIStor step started the server or skipped it for want of a
+# licence; make storage-up reads it, and the playbook of the AIStor step writes it.
+compose_stack_bin_directory: /opt/platform/bin
+compose_stack_aistor_licence_script: "{{ compose_stack_bin_directory }}/aistor_licence_install"
+compose_stack_aistor_licence_sudoers: /etc/sudoers.d/aistor_licence_install
+compose_stack_visudo: /usr/sbin/visudo
+compose_stack_aistor_state_file: "{{ compose_stack_compose_directory }}/aistor.state"
+# The AIStor step (aistor_project_user.yml) makes the project's one user and one policy and a read-only audit identity with AIStor's root pair on the FIRST
+# bootstrap of a host only, and ends it with a root-only marker file. Every other client (Terraform, the storage command, its checks) signs in as the project user.
+# A later deploy reads the live state as the audit identity and the project user, makes no root call and no write, and fails with a fixed message that names each
+# difference. The passwords are generated root-only files beside the root files; the step keeps each sign-in in OpenBao after that pair has signed in. The project
+# user's sign-in is read by that service's own role (compose_stack_aistor_openbao_path); the audit identity's is read by the deploy's admin role alone
+# (compose_stack_aistor_audit_openbao_path). The bucket is given by the launcher as aistor_bucket (the S3_BUCKET value of the project profile). A policy name must
+# not be one of AIStor's built-in policies.
+compose_stack_aistor_service: aistor
+compose_stack_aistor_project_user: project_user
+compose_stack_aistor_project_policy: project_bucket
+compose_stack_aistor_project_password_file: "{{ compose_stack_secrets_directory }}/aistor/project_password"
+compose_stack_aistor_audit_user: project_audit
+compose_stack_aistor_audit_policy: project_audit_read
+compose_stack_aistor_audit_password_file: "{{ compose_stack_secrets_directory }}/aistor/audit_password"
+# The marker that ends the first bootstrap of this host: a root-only plain file (mode 0400) beside the state file, written last. While it is absent the next deploy is
+# the first bootstrap again. Remove it only by hand, and only to make the next deploy a first bootstrap.
+compose_stack_aistor_bootstrap_marker: "{{ compose_stack_compose_directory }}/aistor.bootstrap"
+# The paths of the sign-ins in OpenBao (version 2 secret engine). The OpenBao step gives the service's own role a policy that reads the project path and nothing
+# else, so the audit path is read and written by the admin role of the deploy only, after the sign-in has been verified.
+compose_stack_aistor_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/aistor"
+compose_stack_aistor_audit_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/audit"
+# AIStor's use of the root pair for a repair is no inventory variable: the owner approves it for one run with `python -m scripts.infra.host up --aistor-repair`, and no later run keeps it.
 compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.

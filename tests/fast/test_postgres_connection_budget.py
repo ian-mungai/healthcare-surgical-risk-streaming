@@ -101,6 +101,7 @@ NON_CLIENT_SERVICES = frozenset(
         "prometheus",
         "grafana",
         "loki",
+        "aistor",
         "spark",
         "trino",
         "kafka",

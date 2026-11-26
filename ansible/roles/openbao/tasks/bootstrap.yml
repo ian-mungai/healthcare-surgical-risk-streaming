@@ -1,4 +1,6 @@
-# Run once OpenBao is healthy. Reads openbao_services_file, openbao_tools_file, openbao_external_secrets_file, openbao_address, openbao_user, secret_files_root_owner and the token lifetimes.
+# Run once OpenBao is healthy. Reads openbao_services_file, openbao_tools_file, openbao_external_secrets_file, openbao_address, openbao_user, secret_files_root_owner,
+# the token lifetimes and openbao_client_service (the service whose role reads the one path of the AIStor project user's sign-in). The task is hidden: it handles
+# secret IDs and passwords.
 # Prints no secret.
 - name: Make OpenBao match the service list
   openbao_bootstrap:
@@ -7,6 +9,7 @@
     services_file: "{{ openbao_services_file }}"
     tools_file: "{{ openbao_tools_file }}"
     external_secrets_file: "{{ openbao_external_secrets_file }}"
+    client_service: "{{ openbao_client_service }}"
     address: "{{ openbao_address }}"
     file_owner: "{{ openbao_user }}"
     root_owner: "{{ secret_files_root_owner }}"
@@ -15,6 +18,7 @@
     token_max_ttl_seconds: "{{ openbao_token_max_ttl_seconds | int }}"
   timeout: "{{ (openbao_ready_deadline_seconds | int) + 120 }}"
   register: openbao_reconciled
+  no_log: true
 
 - name: Remember the secret files and their owners
   ansible.builtin.set_fact:

@@ -6,6 +6,8 @@ openbao_tools_file: "{{ compose_stack_tools_file }}"
 openbao_external_secrets_file: "{{ compose_stack_external_secrets_file }}"
 openbao_unlock_key_file: "{{ unlock_key_file }}"
 openbao_address: "http://127.0.0.1:{{ openbao_port }}"
+# The service whose role reads exactly one path, the AIStor project user's sign-in (see openbao_bootstrap.py). The AIStor step writes that path, not this step.
+openbao_client_service: "{{ compose_stack_aistor_service }}"
 openbao_ready_deadline_seconds: 120
 openbao_token_ttl_seconds: 3600
 openbao_token_max_ttl_seconds: 86400

@@ -1,8 +1,11 @@
 # The host playbook's part of the stack: the secret store. A service that needs its own database account cannot become healthy before the account exists, and the
 # pull of the images needs the Docker Hub token, which the launcher stores in OpenBao between the two playbooks (scripts/infra/external_intake.py). So the order is:
-# place the Compose files, write the gateway's settings, render the limits and host settings, create the password files and check them, prepare the secret
-# store's first start, start OpenBao alone (its image is public), make the secret store match the service list (each service's and each consumer's policy and login)
-# and install the intake script that the launcher runs next. deploy.yml, which the stack playbook runs after the intake, does the rest. A second run changes nothing.
+# place the Compose files, write the gateway's settings, render the limits and host settings, create the password files and check them, create the AIStor
+# credential files and install the script that places its licence, prepare the secret store's first start, start OpenBao alone (its image is public), make the
+# secret store match the service list (each service's and each consumer's policy and login) and install the intake script that the launcher runs next. deploy.yml,
+# which the stack playbook runs after the intake, does the rest but AIStor. AIStor (the services of compose_stack_storage_services start apart) needs its licence,
+# which the launcher places after the stack playbook, so it starts in the AIStor step (ansible/storage.yml, storage.yml of this role), which skips it with a
+# recorded state when the licence is missing. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
 
@@ -17,6 +20,12 @@
 
 - name: Check the password files
   ansible.builtin.include_tasks: verify_secrets.yml
+
+- name: Create the AIStor credential files
+  ansible.builtin.include_tasks: aistor_credentials.yml
+
+- name: Install the script that places AIStor's licence, which the launcher runs after the stack playbook
+  ansible.builtin.include_tasks: aistor_licence_script.yml
 
 - name: Prepare the secret store's first start
   ansible.builtin.include_role:

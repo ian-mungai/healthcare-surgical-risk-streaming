@@ -152,6 +152,111 @@ class PlanTest(unittest.TestCase):
         self.assertEqual([], planned(list(self.services), list(self.tools), state))
 
 
+class ProjectUserPolicyTest(unittest.TestCase):
+    """The AIStor project user's sign-in is kept at the service's own path, and the service's own role reads exactly that one path and nothing else."""
+
+    def plan_with(self, state: Any, services: list[str] | None = None) -> list[str]:
+        names = services or ["nessie", "aistor"]
+        return [action.description for action in bootstrap.plan(names, [], state, lambda name: "", TTL, MAX_TTL, client_service="aistor")]
+
+    def matching_state(self) -> Any:
+        state = good_state(["nessie", "aistor"], [])
+        state.policies["service_aistor"] = bootstrap.policy_text("aistor", single_path="aistor")
+        return state
+
+    def test_the_clients_policy_reads_exactly_the_one_path_and_nothing_that_lists_writes_or_reaches_another_path(self) -> None:
+        text = bootstrap.policy_text("aistor", single_path="aistor")
+        self.assertEqual(['path "secret/data/services/aistor/aistor" { capabilities = ["read"] }'], text.strip().splitlines())
+        self.assertNotIn("*", text)
+        self.assertNotIn("metadata", text)
+        self.assertNotIn("list", text)
+
+    def test_the_clients_policy_cannot_read_the_audit_identitys_path_which_only_the_deploys_admin_role_reads(self) -> None:
+        text = bootstrap.policy_text("aistor", single_path="aistor")
+        self.assertNotIn("audit", text)
+        self.assertNotIn("secret/data/services/aistor/audit", text)
+        self.assertNotIn("secret/data/services/aistor/audit", bootstrap.policy_text("nessie"))
+
+    def test_the_policy_of_a_service_that_is_not_the_client_is_what_it_was(self) -> None:
+        self.assertEqual(bootstrap.policy_text("nessie"), bootstrap.policy_text("nessie", single_path=None))
+        self.assertIn("secret/data/services/nessie/*", bootstrap.policy_text("nessie"))
+        self.assertNotIn("aistor", bootstrap.policy_text("nessie"))
+
+    def test_a_server_that_holds_the_exact_path_policy_needs_no_action(self) -> None:
+        self.assertEqual([], self.plan_with(self.matching_state()))
+
+    def test_the_wide_policy_of_the_earlier_deploy_is_written_back_as_the_exact_path_policy(self) -> None:
+        state = good_state(["nessie", "aistor"], [])
+        self.assertEqual(["write policy service_aistor"], self.plan_with(state))
+
+    def test_the_policy_that_is_written_for_the_client_is_the_exact_path_policy(self) -> None:
+        sent: list[tuple[str, str, dict[str, Any]]] = []
+
+        class Recorder:
+            def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
+                sent.append((method, path, body or {}))
+                return {}
+
+        action = bootstrap.Action("policy", "aistor", "write policy service_aistor")
+        with tempfile.TemporaryDirectory() as scratch:
+            bootstrap.apply(Recorder(), "token", action, Path(scratch), MY_OWNER, TTL, MAX_TTL, client_service="aistor")
+        self.assertEqual([("PUT", "sys/policies/acl/service_aistor", {"policy": bootstrap.policy_text("aistor", single_path="aistor")})], sent)
+
+    def test_no_client_means_the_wide_policy_for_every_service(self) -> None:
+        state = good_state(["nessie", "aistor"], [])
+        self.assertEqual([], [action.description for action in bootstrap.plan(["nessie", "aistor"], [], state, lambda name: "", TTL, MAX_TTL)])
+
+    def test_the_openbao_step_no_longer_writes_the_project_users_sign_in_because_the_aistor_step_does_after_it_verified_it(self) -> None:
+        for name in ("Client", "client_user", "client_password_file", "write the AIStor project user's sign-in"):
+            self.assertNotIn(name, MODULE.read_text(), name)
+
+    def test_the_client_must_be_a_listed_service_so_no_policy_would_name_a_path_of_a_service_that_has_no_role(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "services.txt").write_text("nessie\n")
+            (folder / "tools.txt").write_text("nessie\n")
+            params = {
+                "secrets_directory": str(folder),
+                "services_file": str(folder / "services.txt"),
+                "tools_file": str(folder / "tools.txt"),
+                "root_owner": "0:0",
+                "file_owner": "100:1000",
+                "address": "http://127.0.0.1:8200",
+                "client_service": "aistor",
+            }
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "no entry in the service list"):
+                bootstrap.reconcile(params, check_only=True)
+
+
+class FixedDiagnosticsTest(unittest.TestCase):
+    """A request of the step can carry a secret, and an answer can repeat what it was sent: a failure names the request and its status, never the answer."""
+
+    def setUp(self) -> None:
+        FakeConnection.requests = []
+        patcher = mock.patch.object(bootstrap.http.client, "HTTPConnection", FakeConnection)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.api = bootstrap.Api("http://127.0.0.1:8200")
+
+    def test_a_refused_request_is_a_fixed_message_with_the_method_the_path_and_the_status_and_no_text_of_the_answer(self) -> None:
+        FakeConnection.answer = (400, json.dumps({"errors": [f"invalid value {PLANTED_MARKER}"]}).encode())
+        error, text = raised_text(
+            partial(self.api.must, "POST", "secret/data/services/aistor/x", "a-token", {"data": {"password": PLANTED_MARKER}}), bootstrap.BootstrapError, "must"
+        )
+        self.assertEqual("POST secret/data/services/aistor/x: HTTP 400", str(error))
+        self.assertNotIn(PLANTED_MARKER, text)
+
+    def test_a_transport_failure_names_the_exception_type_only(self) -> None:
+        class Broken(FakeConnection):
+            def request(self, method: str, path: str, body: str | None, headers: dict[str, str]) -> None:
+                raise OSError(PLANTED_MARKER)
+
+        with mock.patch.object(bootstrap.http.client, "HTTPConnection", Broken):
+            error, text = raised_text(partial(self.api.call, "GET", "sys/health", "a-token"), bootstrap.BootstrapError, "call")
+        self.assertNotIn(PLANTED_MARKER, text)
+        self.assertIn("OSError", str(error))
+
+
 def secret_file(directory: Path, name: str, owner: tuple[int, int] = MY_OWNER, mode: int = 0o400) -> Path:
     path = directory / "openbao" / f"{name}.secret_id"
     path.parent.mkdir(parents=True, exist_ok=True)

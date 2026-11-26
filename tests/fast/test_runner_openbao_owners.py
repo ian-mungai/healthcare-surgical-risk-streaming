@@ -38,9 +38,10 @@ HOST_MODES = {
     "dagster": "400 10001:10001",
     "alloy": "400 0:0",
     "apicurio": "400 10002:10002",
-    # The two identities of the external secrets intake run outside Compose, so root owns their files. They are newer than the live reading above.
+    # The intake's two identities and AIStor's have no user on their list lines, so root owns their files. They are newer than the live reading above.
     "deploy": "400 0:0",
     "external_intake": "400 0:0",
+    "aistor": "400 0:0",
 }
 
 

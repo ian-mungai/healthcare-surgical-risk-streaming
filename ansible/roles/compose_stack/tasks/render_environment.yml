@@ -1,6 +1,6 @@
 # Reads compose_stack_compose_directory, compose_stack_secrets_directory, compose_stack_postgres_port, openbao_port, unlock_key_file, compose_stack_owner,
 # compose_stack_group, compose_stack_docker_socket (or compose_stack_docker_socket_gid, the group that containers see on the socket, which wins when it is
-# set), airbyte_namespace, airbyte_release, compose_stack_platform_commit, compose_stack_warehouse_location, compose_stack_heavy_memory_mib and workload_access_region.
+# set), airbyte_namespace, airbyte_release, compose_stack_platform_commit, compose_stack_warehouse_location, compose_stack_heavy_memory_mib, workload_access_region and compose_stack_aistor_licence_file.
 # The images' digests come from the tracked pin file (or compose_stack_pin_file, when set) through its renderer (scripts/images/pins.py), which stops with a fixed message when an image has no pin.
 # The limits come from the limits file through its loader on the computer that runs Ansible, so no limit is typed in a Compose file or here.
 - name: Render the memory limits from the limits file
@@ -76,6 +76,7 @@
       PLATFORM_COMMIT={{ compose_stack_platform_commit }}
       WAREHOUSE_LOCATION={{ compose_stack_warehouse_location }}
       AWS_REGION={{ workload_access_region }}
+      AISTOR_LICENCE_FILE={{ compose_stack_aistor_licence_file }}
       {{ compose_stack_image_pins.stdout | trim }}
     owner: "{{ compose_stack_owner }}"
     group: "{{ compose_stack_group }}"

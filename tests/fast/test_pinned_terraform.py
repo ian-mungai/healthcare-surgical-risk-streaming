@@ -188,7 +188,7 @@ class OneNamedExecutableTest(unittest.TestCase):
         recipe = (ROOT / "Makefile").read_text().split("check-terraform:", 1)[1].split("\ncheck-ansible:", 1)[0]
         runs = "\n".join(line for line in recipe.splitlines() if not line.startswith("\t@test -f"))
         calls = re.findall(r"\$\(TERRAFORM\) (\S+)", runs)
-        self.assertEqual(["fmt", "-chdir=infra", "-chdir=infra", "-chdir=infra"], calls)
+        self.assertEqual(["fmt", "-chdir=infra", "-chdir=infra", "-chdir=infra", "-chdir=infra/storage", "-chdir=infra/storage", "-chdir=infra/storage"], calls)
 
     def test_the_scanner_finds_a_bare_call_in_a_script_and_in_a_shell_line(self) -> None:
         self.assertEqual([3], bare_calls_in_python('import x\n\nrun_command("terraform", [])\n'))

@@ -7,6 +7,7 @@ the placed Compose files, the rendered limits and host settings, the password fi
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import pwd
@@ -62,6 +63,7 @@ def variables(folder: Path) -> dict[str, object]:
         "compose_stack_heavy_memory_mib": 11008,
         "airbyte_namespace": "airbyte",
         "airbyte_release": "airbyte",
+        "compose_stack_aistor_licence_file": str(folder / "secrets" / "aistor" / "licence"),
     }
 
 
@@ -107,6 +109,7 @@ class RenderTest(unittest.TestCase):
             f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n"
             f"DOCKER_SOCKET_GID={socket_gid}\nSTACK_K3S_NAMESPACE=airbyte\nSTACK_K3S_RELEASE=airbyte\nPLATFORM_COMMIT={'c' * 40}\n"
             "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n"
+            f"AISTOR_LICENCE_FILE={folder / 'secrets' / 'aistor' / 'licence'}\n"
             + "".join(f"IMAGE_{name}=example/project_images@sha256:{'a' * 64}\n" for name in ("DAGSTER", "REPLAY", "SPARK")),
             host,
         )
@@ -174,7 +177,8 @@ def step_order(file: str = "main.yml") -> list[str]:
     for task in tasks:
         if "ansible.builtin.include_tasks" in task:
             services = (task.get("vars") or {}).get("compose_stack_start_services")
-            steps.append(task["ansible.builtin.include_tasks"] + (f" {','.join(services) or 'all'}" if services is not None else ""))
+            named = services if isinstance(services, str) else ",".join(services or []) or "all"
+            steps.append(task["ansible.builtin.include_tasks"] + (f" {named}" if services is not None else ""))
         else:
             role = task["ansible.builtin.include_role"]
             steps.append(f"{role['name']}/{role['tasks_from']}")
@@ -190,6 +194,8 @@ class StepOrderTest(unittest.TestCase):
                 "render_environment.yml",
                 "passwords.yml",
                 "verify_secrets.yml",
+                "aistor_credentials.yml",
+                "aistor_licence_script.yml",
                 "openbao/prepare.yml",
                 "start.yml openbao",
                 "openbao/bootstrap.yml",
@@ -382,6 +388,359 @@ class GrafanaPasswordTest(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assertIn("The Grafana password file", output)
                 self.assertNotIn("a-long-random-value", output)
+
+
+class AistorCredentialsTest(unittest.TestCase):
+    """AIStor's root user and password and the project and audit passwords are four files of root, mode 0400, made once, never printed or replaced."""
+
+    FILES = ("root_user", "root_password", "project_password", "audit_password")
+
+    def values(self, folder: Path) -> dict[str, object]:
+        return variables(folder)
+
+    def test_each_file_is_made_for_root_with_mode_0400_in_a_folder_for_root_and_no_output_holds_a_value(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+            made = {name: (folder / "secrets" / "aistor" / name) for name in self.FILES}
+            statuses = {name: path.stat() for name, path in made.items()}
+            texts = {name: path.read_text() for name, path in made.items()}
+            folder_status = (folder / "secrets" / "aistor").stat()
+        self.assertEqual(0, code, output)
+        for name in self.FILES:
+            with self.subTest(name):
+                self.assertEqual((0o400, UID, GID), (stat.S_IMODE(statuses[name].st_mode), statuses[name].st_uid, statuses[name].st_gid))
+                self.assertRegex(texts[name], r"^[A-Za-z0-9_-]{40,}$")
+                self.assertNotIn(texts[name], output)
+        self.assertEqual(len(self.FILES), len(set(texts.values())), "each file has a value of its own")
+        self.assertEqual((0o700, UID, GID), (stat.S_IMODE(folder_status.st_mode), folder_status.st_uid, folder_status.st_gid))
+
+    def test_a_second_run_changes_nothing_and_keeps_both_values(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            run_tasks(["aistor_credentials.yml"], self.values(folder))
+            before = {name: (folder / "secrets" / "aistor" / name).read_text() for name in self.FILES}
+            code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+            after = {name: (folder / "secrets" / "aistor" / name).read_text() for name in self.FILES}
+        self.assertEqual(0, code, output)
+        self.assertEqual(before, after)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_file_with_another_mode_is_given_mode_0400_with_its_value_kept(self) -> None:
+        for mode in (0o600, 0o640, 0o444):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                run_tasks(["aistor_credentials.yml"], self.values(folder))
+                target = folder / "secrets" / "aistor" / "root_password"
+                value = target.read_text()
+                target.chmod(mode)
+                code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+                self.assertEqual(0, code, output)
+                self.assertEqual((0o400, value), (stat.S_IMODE(target.stat().st_mode), target.read_text()))
+
+    def refused(self, content: str) -> tuple[int, str, str]:
+        """Make the files, put ``content`` in root_user, run the task again and give the exit code, Ansible's output and the file's text afterwards."""
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            run_tasks(["aistor_credentials.yml"], self.values(folder))
+            target = folder / "secrets" / "aistor" / "root_user"
+            target.chmod(0o600)
+            target.write_text(content)
+            target.chmod(0o400)
+            code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
+            return code, output, target.read_text()
+
+    def test_an_empty_credential_file_is_refused_by_name_under_no_log_and_is_never_filled_in(self) -> None:
+        code, output, text = self.refused("")
+        self.assertNotEqual(0, code)
+        self.assertIn("the secret file root_user is empty", output)
+        self.assertEqual("", text)
+        # The task is hidden (no_log): each result of the loop is censored, so the only text about the file is the module's fixed message.
+        self.assertIn("the output has been hidden due to the fact that 'no_log: true' was specified for this result", output)
+        self.assertIn("failed: [localhost] (item=(censored due to no_log))", output)
+        self.assertNotIn("item=root_user", output, "the loop's labels are hidden with the results")
+
+    def test_a_value_with_whitespace_at_an_edge_is_refused_by_a_fixed_message_under_no_log_and_never_printed(self) -> None:
+        for content in ("  planted-value-0123456789  ", "\tplanted-value-0123456789", "planted-value-0123456789 "):
+            with self.subTest(content=content):
+                code, output, text = self.refused(content)
+                self.assertNotEqual(0, code)
+                self.assertIn("has whitespace at its start or its end", output)
+                self.assertNotIn("planted-value-0123456789", output)
+                self.assertEqual(content, text, "the value is kept as it was")
+                self.assertIn("the output has been hidden due to the fact that 'no_log: true' was specified for this result", output)
+
+
+class AistorCredentialVerifyTest(unittest.TestCase):
+    """The check after the files are made passes a plain file of root with content and mode 0400 and refuses every other file by a message that names it."""
+
+    def check(
+        self, *, mode: int = 0o400, expected: tuple[int, int] = (UID, GID), create: bool = True, content: str = "a-long-random-value", link: bool = False
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor"
+            target.mkdir(parents=True, mode=0o700)
+            for name in ("root_user", "root_password", "project_password", "audit_password"):
+                if not create and name == "root_password":
+                    continue
+                if link and name == "root_password":
+                    real = folder / "real"
+                    real.write_text(content)
+                    real.chmod(0o400)
+                    (target / name).symlink_to(real)
+                    continue
+                (target / name).write_text(content if name == "root_password" else "a-long-random-value")
+                (target / name).chmod(mode if name == "root_password" else 0o400)
+            return run_tasks(["verify_aistor_credentials.yml"], variables(folder) | {"secret_files_root_owner": f"{expected[0]}:{expected[1]}"})
+
+    def test_a_private_plain_file_of_root_with_content_passes_and_every_other_file_is_refused_by_name_with_no_value_printed(self) -> None:
+        code, output = self.check()
+        self.assertEqual(0, code, output)
+        for label, kwargs in (
+            ("mode 0600", {"mode": 0o600}),
+            ("mode 0440", {"mode": 0o440}),
+            ("mode 0444", {"mode": 0o444}),
+            ("mode 0404", {"mode": 0o404}),
+            ("another user", {"expected": (UID + 1, GID)}),
+            ("another group", {"expected": (UID, GID + 1)}),
+            ("missing", {"create": False}),
+            ("empty", {"content": ""}),
+            ("a link", {"link": True}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn("The AIStor credential file root_password", output)
+                self.assertNotIn("a-long-random-value", output)
+
+
+class AistorStatOutputTest(unittest.TestCase):
+    """A stat is printed by a verbose run (the slow runner's): for a credential or the licence file it must hold no checksum and no content type."""
+
+    def test_the_verbose_output_of_the_checks_holds_no_checksum_and_no_mime_type(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor"
+            target.mkdir(parents=True, mode=0o700)
+            for name in ("root_user", "root_password", "project_password", "audit_password", "licence"):
+                (target / name).write_text("planted-value-0123456789")
+                (target / name).chmod(0o400)
+            digest = hashlib.sha1(b"planted-value-0123456789", usedforsecurity=False).hexdigest()
+            for task_file in ("verify_aistor_credentials.yml", "aistor_licence.yml"):
+                with self.subTest(task_file=task_file):
+                    code, output = run_tasks([task_file], variables(folder))
+                    self.assertEqual(0, code, output)
+                    self.assertNotIn(digest, output)
+                    self.assertNotIn("checksum", output)
+                    self.assertNotIn("mimetype", output)
+                    self.assertNotIn("planted-value-0123456789", output)
+
+
+class AistorLicenceTest(unittest.TestCase):
+    """The licence check refuses a file that is there and empty, blank, not plain or not root's alone, by one fixed message; a missing file is no failure."""
+
+    MESSAGE = "the AIStor licence file is empty or is not a plain file that only"
+
+    def check(
+        self,
+        content: str | None,
+        *,
+        mode: int = 0o400,
+        link: bool = False,
+        variable: str | None = None,
+        unset: bool = False,
+        placement: str | None = None,
+        leftovers: tuple[str, ...] = (),
+    ) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor" / "licence"
+            target.parent.mkdir(parents=True, mode=0o700)
+            if content is not None:
+                if link:
+                    real = folder / "real"
+                    real.write_text(content)
+                    real.chmod(0o400)
+                    target.symlink_to(real)
+                else:
+                    target.write_text(content)
+                    target.chmod(mode)
+            for name in leftovers:
+                (target.parent / name).write_text("left-behind-licence-text")
+                (target.parent / name).chmod(0o400)
+            values = variables(folder)
+            if variable is not None:
+                values["compose_stack_aistor_licence_file"] = variable
+            if unset:
+                del values["compose_stack_aistor_licence_file"]
+            if placement is not None:
+                values["aistor_licence_placement"] = placement
+            result = run_tasks(["aistor_licence.yml"], values)
+            self.remaining = sorted(entry.name for entry in target.parent.iterdir())
+            return result
+
+    def test_a_private_file_with_content_passes_and_nothing_is_changed_or_printed(self) -> None:
+        code, output = self.check("a-licence-key-with-some-length\n")
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+        self.assertNotIn("a-licence-key", output)
+
+    def test_a_missing_file_is_not_a_failure_because_the_aistor_step_skips_aistor_for_it(self) -> None:
+        code, output = self.check(None)
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_an_empty_or_blank_file_a_link_or_another_mode_is_refused_by_the_fixed_message_and_no_content_is_printed(self) -> None:
+        for label, kwargs in (
+            ("empty", {"content": ""}),
+            ("spaces and line breaks only", {"content": " \n\t\n  \n"}),
+            ("mode 0600", {"content": "secret-licence-text", "mode": 0o600}),
+            ("mode 0440", {"content": "secret-licence-text", "mode": 0o440}),
+            ("mode 0444", {"content": "secret-licence-text", "mode": 0o444}),
+            ("a link", {"content": "secret-licence-text", "link": True}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn(self.MESSAGE, output)
+                self.assertNotIn("secret-licence-text", output)
+
+    def test_a_licence_that_the_launcher_placed_and_that_is_missing_on_the_host_fails_with_a_fixed_message(self) -> None:
+        code, output = self.check(None, placement="placed")
+        self.assertNotEqual(0, code)
+        self.assertIn("the launcher placed the AIStor licence, but the licence file is missing on the host", output)
+
+    def test_a_licence_that_the_launcher_placed_and_is_on_the_host_passes(self) -> None:
+        code, output = self.check("a-licence-key-with-some-length\n", placement="placed")
+        self.assertEqual(0, code, output)
+
+    def test_no_licence_from_the_launcher_is_no_failure_whether_the_host_has_a_file_or_not(self) -> None:
+        for label, content in (("no file", None), ("an older file", "a-licence-key-with-some-length\n")):
+            with self.subTest(label):
+                code, output = self.check(content, placement="absent")
+                self.assertEqual(0, code, output)
+                self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_placement_that_is_neither_placed_nor_absent_is_refused_by_a_message_that_names_the_variable(self) -> None:
+        for value in ("maybe", "", "PLACED", "unchanged"):
+            with self.subTest(value=value):
+                code, output = self.check("a-licence-key-with-some-length\n", placement=value)
+                self.assertNotEqual(0, code)
+                self.assertIn("aistor_licence_placement", output)
+
+    def test_the_second_0400_file_that_an_interrupted_write_left_is_removed_at_every_deploy_and_nothing_else_is_touched(self) -> None:
+        left = (".licence.0123abcd.new", ".licence.ffffffff.new")
+        kept = (".licence.0123abc.new", "licence.0123abcd.new", ".licence.0123abcd.old", ".other.0123abcd.new")
+        code, output = self.check("a-licence-key-with-some-length\n", leftovers=left + kept)
+        self.assertEqual(0, code, output)
+        self.assertEqual(sorted(["licence", *kept]), self.remaining)
+        self.assertNotIn("left-behind-licence-text", output)
+
+    def test_the_leftover_is_removed_even_when_the_licence_is_absent_and_a_clean_folder_changes_nothing(self) -> None:
+        code, output = self.check(None, leftovers=(".licence.0123abcd.new",))
+        self.assertEqual(0, code, output)
+        self.assertEqual([], self.remaining)
+        code, output = self.check("a-licence-key-with-some-length\n")
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_an_empty_variable_or_no_variable_is_refused_by_a_message_that_names_the_variable(self) -> None:
+        for label, kwargs in (
+            ("an empty variable", {"content": "secret-licence-text", "variable": ""}),
+            ("no variable", {"content": "secret-licence-text", "unset": True}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn("compose_stack_aistor_licence_file", output)
+                self.assertNotIn("secret-licence-text", output)
+
+    def test_a_file_that_another_user_owns_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "aistor" / "licence"
+            target.parent.mkdir(parents=True, mode=0o700)
+            target.write_text("secret-licence-text")
+            target.chmod(0o400)
+            code, output = run_tasks(["aistor_licence.yml"], variables(folder) | {"compose_stack_owner": "nobody"})
+        self.assertNotEqual(0, code)
+        self.assertIn(self.MESSAGE, output)
+
+
+class AistorStepWithoutLicenceTest(unittest.TestCase):
+    """With no licence file the AIStor step skips AIStor, records it, starts nothing and succeeds, so the rest of the deploy goes on."""
+
+    def run_step(self, folder: Path, placement: str | None = None) -> tuple[int, str]:
+        values = variables(folder) | {
+            "compose_stack_aistor_state_file": str(folder / "compose" / "aistor.state"),
+            "compose_stack_storage_services": ["aistor"],
+        }
+        if placement is not None:
+            values["aistor_licence_placement"] = placement
+        (folder / "compose").mkdir(exist_ok=True)
+        return run_tasks(["storage.yml"], values)
+
+    def test_a_missing_licence_gives_a_recorded_skip_and_a_successful_step_that_starts_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            code, output = self.run_step(folder)
+            state = folder / "compose" / "aistor.state"
+            text, mode = state.read_text(), stat.S_IMODE(state.stat().st_mode)
+        self.assertEqual(0, code, output)
+        self.assertTrue(text.startswith("skipped"))
+        self.assertEqual(0o644, mode)
+        self.assertIn("AIStor is skipped", output)
+        for name in ("Start AIStor and wait for its health", "Verify the AIStor project user as itself", "Record that AIStor started"):
+            self.assertRegex(output, rf"{name}[^\n]*\] \*+\nskipping: \[localhost\]", f"{name} is skipped")
+        self.assertNotIn("included: ", output.split("Say that AIStor is skipped")[1], "no task file is included after the skip")
+
+    def test_the_skip_notice_and_the_record_come_only_when_the_host_has_no_licence_file_and_the_launcher_sent_none(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            code, output = self.run_step(folder, "absent")
+            state = (folder / "compose" / "aistor.state").read_text()
+        self.assertEqual(0, code, output)
+        self.assertTrue(state.startswith("skipped:"))
+        self.assertIn("AIStor is skipped", output)
+
+    def test_a_launcher_that_placed_the_licence_when_the_file_is_missing_fails_the_step_with_no_skip_notice_and_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            (folder / "compose").mkdir()
+            (folder / "compose" / "aistor.state").write_text("started\n")
+            code, output = self.run_step(folder, "placed")
+            left = (folder / "compose" / "aistor.state").exists()
+        self.assertNotEqual(0, code)
+        self.assertIn("the launcher placed the AIStor licence, but the licence file is missing on the host", output)
+        self.assertNotIn("AIStor is skipped", output, "no skip is claimed for a licence that was placed")
+        self.assertFalse(left)
+
+    def test_a_second_run_with_the_licence_still_missing_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            self.run_step(folder)
+            code, output = self.run_step(folder)
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_licence_that_is_there_but_empty_fails_the_step_and_leaves_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            licence = folder / "secrets" / "aistor" / "licence"
+            licence.parent.mkdir(parents=True, mode=0o700)
+            licence.write_text("")
+            licence.chmod(0o400)
+            (folder / "compose").mkdir()
+            (folder / "compose" / "aistor.state").write_text("started\n")
+            code, output = self.run_step(folder)
+            left = (folder / "compose" / "aistor.state").exists()
+        self.assertNotEqual(0, code)
+        self.assertIn("the AIStor step failed and its record is removed", output)
+        self.assertFalse(left, "a step that fails leaves no earlier claim")
 
 
 class SecretsCheckTest(unittest.TestCase):

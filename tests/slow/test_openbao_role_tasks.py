@@ -133,6 +133,7 @@ class BootstrapTaskTest(unittest.TestCase):
             "openbao_services_file": str(self.services),
             "openbao_tools_file": str(self.tools),
             "openbao_external_secrets_file": str(EXTERNAL_LIST),
+            "openbao_client_service": "aistor",
             "openbao_address": self.server.address,
             "openbao_user": owner,
             "secret_files_root_owner": owner,

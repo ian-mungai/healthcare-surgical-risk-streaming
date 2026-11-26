@@ -7,8 +7,11 @@ and is given that owner and mode when it has others.
 ``step: reconcile`` logs in as the ``bootstrap`` AppRole and makes the running server match the service list: for each service one policy that reads
 only its own path, one AppRole named for the service with a renewable token, one secret ID in a file that only the service reads (mode 0400, owned by
 the numeric user on its list line, or by root when the line has none) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own
-path. A server that already matches needs no change and the step reports none. It reports every secret file with its owner, for the role's check. A
-service that left the list keeps its role and is reported as unlisted, never removed; its policy loses every external grant, and its other rules stay.
+path. The one service named ``client_service`` (the AIStor project user's sign-in is kept at ``secret/services/<service>/aistor`` by the AIStor step, only after
+that pair has signed in) gets a policy that reads exactly that one path: no other path, no list and no write. A server that already matches needs no change and
+the step reports none. It reports every secret file with its owner, for the role's check. A service that left the list keeps its role and is reported as
+unlisted, never removed; its policy loses every external grant, and its other rules stay. A refused request is reported by its method, its path and its status
+only: an answer can repeat a secret that the request carried.
 
 ``step: read`` returns one external secret (``compose/external_secrets.txt``) from OpenBao in its result, after the consumer logs in with its own AppRole,
 and writes no file: the pull of the images reads the Docker Hub token that way and hands it to one task's standard input. The calling task hides its result.
@@ -51,6 +54,8 @@ POLICY_RULE = re.compile(r'path\s+"([^"]+)"\s*\{[^}]*\}\n?')
 GENERATED_NAME = re.compile(r"[a-z][a-z0-9_]*(?:/[a-z][a-z0-9_]*)+")
 OPENBAO_FOLDER = "openbao"
 ADMIN_ID_FILE = "bootstrap.secret_id"
+# The one secret of the AIStor client service: ``secret/services/<service>/aistor``, written by the AIStor step after the sign-in was verified.
+CLIENT_PATH = "aistor"
 SECRET_BYTES = 32
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
@@ -76,12 +81,16 @@ def intake_policy_text(paths: Sequence[str]) -> str:
     )
 
 
-def policy_text(service: str, external_paths: Sequence[str] = ()) -> str:
+def policy_text(service: str, external_paths: Sequence[str] = (), single_path: str | None = None) -> str:
     """The one policy of a service: it reads and lists its own path, and reads each external secret that the list gives it as consumer, and nothing else.
+    With ``single_path`` it reads that one path of the service in place of its own paths.
 
     The intake role has the other form (``intake_policy_text``): it writes the declared paths and has no path of its own."""
     if service == INTAKE_ROLE:
         return intake_policy_text(external_paths)
+    granted = "".join(f'path "{path}" {{ capabilities = ["read"] }}\n' for path in external_paths)
+    if single_path is not None:
+        return f'path "secret/data/services/{service}/{single_path}" {{ capabilities = ["read"] }}\n' + granted
     return (
         f'path "secret/data/services/{service}/*" {{ capabilities = ["read"] }}\n'
         f'path "secret/metadata/services/{service}/*" {{ capabilities = ["read", "list"] }}\n'
@@ -151,12 +160,13 @@ def plan(
     token_ttl: int,
     token_max_ttl: int,
     external: Mapping[str, Sequence[str]] | None = None,
+    client_service: str | None = None,
 ) -> list[Action]:
     """The changes that make the server match the list, and none when it already does."""
     actions: list[Action] = []
     for service in services:
         stored = state.policies.get(policy_name(service))
-        if stored is None or stored.strip() != policy_text(service, (external or {}).get(service, ())).strip():
+        if stored is None or stored.strip() != service_policy(service, client_service, external).strip():
             actions.append(Action("policy", service, f"write policy {policy_name(service)}"))
         role = state.roles.get(service)
         if role is None or any(role.get(key) != value for key, value in role_settings(service, token_ttl, token_max_ttl).items()):
@@ -169,6 +179,11 @@ def plan(
         if without_external(stored) != stored:
             actions.append(Action("retire", service, f"drop the external grants of policy {policy_name(service)}", without_external(stored)))
     return actions
+
+
+def service_policy(service: str, client_service: str | None, external: Mapping[str, Sequence[str]] | None = None) -> str:
+    """The policy text of a service: the client's reads its one path of the AIStor project user's sign-in, every other one is the wide form."""
+    return policy_text(service, (external or {}).get(service, ()), CLIENT_PATH if service == client_service else None)
 
 
 def secret_file(secrets_directory: Path, name: str) -> Path:
@@ -212,14 +227,18 @@ class Api:
             raise BootstrapError("the token that OpenBao gave is not a valid token")
         connection = http.client.HTTPConnection(self.host, self.port, timeout=HTTP_SECONDS)
         headers = {"X-Vault-Token": token} if token else {}
+        failure = None
         try:
             connection.request(method, f"/v1/{path}", json.dumps(body) if body is not None else None, headers)
             response = connection.getresponse()
             raw = response.read().decode(errors="replace")
         except (OSError, http.client.HTTPException) as error:
-            raise BootstrapError(f"{method} {path}: no answer from {self.address} ({type(error).__name__})") from error
+            failure = type(error).__name__
         finally:
             connection.close()
+        if failure is not None:
+            # Raised outside the handler, so the library's text (which can repeat the request) is not chained to the message.
+            raise BootstrapError(f"{method} {path}: no answer from {self.address} ({failure})")
         try:
             document = json.loads(raw) if raw else {}
         except ValueError:
@@ -307,12 +326,13 @@ def apply(
     token_ttl: int,
     token_max_ttl: int,
     external: Mapping[str, Sequence[str]] | None = None,
+    client_service: str | None = None,
 ) -> None:
     service = action.service
     if action.kind == "retire":
         api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": action.policy})
     elif action.kind == "policy":
-        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service, (external or {}).get(service, ()))})
+        api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": service_policy(service, client_service, external)})
     elif action.kind == "role":
         api.must("POST", f"auth/approle/role/{service}", token, role_settings(service, token_ttl, token_max_ttl))
     elif action.kind == "secret_id":
@@ -461,20 +481,23 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     tools = parse_names(Path(params["tools_file"]).read_text(), "tool")
     if missing := [tool for tool in tools if tool not in services]:
         raise BootstrapError(f"PostgreSQL tool {missing[0]!r} has no entry in the service list, so its password would never reach OpenBao")
+    client_service = params.get("client_service") or None
+    if client_service is not None and client_service not in services:
+        raise BootstrapError(f"AIStor client {client_service!r} has no entry in the service list, so no policy would read its sign-in")
     external = external_paths(Path(params["external_secrets_file"]).read_text(), services) if params.get("external_secrets_file") else {}
     api = Api(params["address"])
     api.wait_ready(int(params["ready_deadline_seconds"]))
     token = api.login(ADMIN_ROLE, read_file(secret_file(secrets_directory, ADMIN_ID_FILE), "admin secret ID file"))
     ttl, max_ttl = int(params["token_ttl_seconds"]), int(params["token_max_ttl_seconds"])
     state = read_state(api, token, services, tools, secrets_directory)
-    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl, external)
+    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl, external, client_service)
     actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"], root_owner)
     if not check_only:
         for action in actions:
             if action.kind == "access":
                 set_access(secret_file(secrets_directory, f"{action.service}.secret_id"), owners[action.service])
             else:
-                apply(api, token, action, secrets_directory, owners.get(action.service, root_owner), ttl, max_ttl, external)
+                apply(api, token, action, secrets_directory, owners.get(action.service, root_owner), ttl, max_ttl, external, client_service)
     files = [
         {"path": str(path), "owner": f"{owner[0]}:{owner[1]}"} for path, owner in secret_files(secrets_directory, entries, admin_owner, root_owner).items()
     ]
@@ -500,6 +523,7 @@ def main() -> None:
             "services_file": {"type": "path"},
             "tools_file": {"type": "path"},
             "external_secrets_file": {"type": "path"},
+            "client_service": {"type": "str"},
             "address": {"type": "str"},
             "ready_deadline_seconds": {"type": "int", "default": 120},
             "token_ttl_seconds": {"type": "int", "default": 3600},

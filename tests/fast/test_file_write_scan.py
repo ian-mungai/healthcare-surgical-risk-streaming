@@ -100,6 +100,10 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
     ("scripts/infra/teardown.py", "write_progress", "os.replace"): (1, TD_REASON),
     ("scripts/infra/teardown.py", "destroy", "(removal / 'retained.json').write_text"): (1, TD_REASON),
     ("scripts/infra/teardown.py", "destroy", "(removal / 'checks.json').write_text"): (1, TD_REASON),
+    ("scripts/infra/storage.py", "prepare_configuration", "shutil.copy2"): (
+        1,
+        "A copy of the storage root's Terraform files and provider lock into the run's own work folder under .tools, as the wrapper does",
+    ),
     ("scripts/infra/terraform_wrapper.py", "save_raw", "os.open"): (1, TF_REASON),
     ("scripts/infra/terraform_wrapper.py", "save_raw", "os.fdopen"): (1, TF_REASON),
     ("scripts/infra/terraform_wrapper.py", "prepare_configuration", "shutil.copy2"): (1, TF_REASON),
