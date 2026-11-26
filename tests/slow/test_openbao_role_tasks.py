@@ -3,7 +3,7 @@
 ``intake_script.yml`` places the script that the launcher runs as root on the host, with its helper and the sudoers drop-in that keeps sudo from recording its
 input: the folder must be private to its owner, and the drop-in must pass ``visudo`` before it takes its place. ``bootstrap.yml`` hands the list of external
 secrets to the module, and the real admin policy of ``compose/openbao/openbao.hcl`` must be enough for the module to write each policy. The server is the
-stand-in of ``tests/fast/openbao_stand_in.py``, which judges every call by the policy texts.
+stand-in of ``tests/slow/openbao_stand_in.py``, which judges every call by the policy texts.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from scripts.project_config import ROOT
-from tests.fast.openbao_stand_in import ADMIN_ROLE, Role, StandIn
 from tests.slow.ansible_support import ROLES, run_role_tasks
+from tests.slow.openbao_stand_in import ADMIN_ROLE, Role, StandIn
 
 FILES = ROLES / "openbao" / "files"
 OWNER = pwd.getpwuid(os.getuid()).pw_name

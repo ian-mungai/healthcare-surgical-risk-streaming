@@ -24,8 +24,9 @@ from scripts.infra.external_intake import Ask, IntakeError, Source
 from scripts.process import run_command
 from scripts.project_config import ROOT
 from tests.fast.ansible_paths import shared_module
-from tests.fast.openbao_stand_in import Role, StandIn
-from tests.fast.test_external_intake_script import ADMIN_MARKER, LIST, NAME, OTHER, VALUE, Case
+from tests.fast.external_intake_constants import NAME, VALUE
+from tests.slow.openbao_stand_in import Role, StandIn
+from tests.slow.test_external_intake_script import ADMIN_MARKER, LIST, OTHER, Case
 
 OWNER_MARKER = "owner-login-marker-that-must-not-leak"
 

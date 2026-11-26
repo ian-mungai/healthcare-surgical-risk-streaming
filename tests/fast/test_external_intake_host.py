@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.infra import external_intake, host
 from scripts.infra.host import HostError
 from scripts.process import CompletedProcess, TimeoutExpired
-from tests.fast.test_external_intake_script import NAME, VALUE
+from tests.fast.external_intake_constants import NAME, SCRIPT, VALUE
 
 ADDRESS = "platform-dev.example.ts.net"
 POLICY_DIGEST = hashlib.sha256(host.INTAKE_POLICY_SOURCE.read_bytes()).hexdigest()
@@ -161,8 +161,6 @@ class InstalledFormTest(unittest.TestCase):
         self.assertEqual(host.INTAKE_SUDOERS, found["openbao_intake_sudoers"])
 
     def test_the_launcher_and_the_script_agree_on_the_codes_that_name_a_refusal(self) -> None:
-        from tests.fast.test_external_intake_script import SCRIPT
-
         codes = set(re.findall(r'Refusal\("(\w+)"\)', SCRIPT.read_text())) - {"unchanged"}
         known = {key.removeprefix("script_") for key in external_intake.MESSAGES if key.startswith("script_")}
         self.assertEqual(set(), codes - known, "every refusal code of the script has a fixed message in the launcher")

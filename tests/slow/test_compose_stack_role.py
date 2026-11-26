@@ -346,7 +346,7 @@ class GrafanaPasswordTest(unittest.TestCase):
         return variables(folder) | {"grafana_user": f"{owner[0]}:{owner[1]}"}
 
     def test_the_password_is_kept_in_openbao_and_written_from_there_to_the_file_of_the_grafana_user_and_then_checked(self) -> None:
-        """What the step does to OpenBao and the file is proven by ``tests/fast/test_openbao_secret_steps.py`` against a stand-in server."""
+        """What the step does to OpenBao and the file is proven by ``tests/slow/test_openbao_secret_steps.py`` against a stand-in server."""
         tasks: Any = load_yaml((ROLE / "tasks" / "grafana_password.yml").read_text())
         include = tasks[0]["ansible.builtin.include_role"]
         self.assertEqual(("openbao", "generated_secret.yml"), (include["name"], include["tasks_from"]))

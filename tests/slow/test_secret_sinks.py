@@ -44,10 +44,10 @@ from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.openbao_stand_in import ADMIN_ROLE, Role, StandIn
 from tests.fast.secret_inputs import Marker, listed_names, make_marker, scan_text, scan_tree
 from tests.fast.traceback_support import raised_text
 from tests.slow.ansible_support import ROLES, SHARED_MODULE_UTILS, environment, shared_module
+from tests.slow.openbao_stand_in import ADMIN_ROLE, Role, StandIn
 
 PLAYBOOK_SECONDS = 180
 OWNER = f"{os.getuid()}:{os.getgid()}"

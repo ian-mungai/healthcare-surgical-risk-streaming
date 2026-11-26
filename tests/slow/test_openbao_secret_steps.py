@@ -3,7 +3,7 @@
 ``read`` returns an external secret from OpenBao to the playbook for its consumer, which hands it to one task's standard input (the pull of the images reads
 the Docker Hub token that way) and writes no file. ``generated`` keeps a secret that the host makes for itself (the Grafana administrator password): made once,
 stored in OpenBao while its path is empty, and written from OpenBao to the file that its container reads. The server is the stand-in of
-``tests/fast/openbao_stand_in.py``; the values are markers.
+``tests/slow/openbao_stand_in.py``; the values are markers.
 """
 
 from __future__ import annotations
@@ -17,9 +17,10 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from tests.fast.openbao_stand_in import ADMIN_ROLE, Role, StandIn
-from tests.fast.test_external_intake_script import ADMIN_MARKER, LIST, NAME, VALUE
+from tests.fast.external_intake_constants import NAME, VALUE
 from tests.fast.test_openbao_bootstrap import MY_OWNER, bootstrap
+from tests.slow.openbao_stand_in import ADMIN_ROLE, Role, StandIn
+from tests.slow.test_external_intake_script import ADMIN_MARKER, LIST
 
 DEPLOY_MARKER = "deploy-login-marker-that-must-not-leak"
 NESSIE_MARKER = "nessie-login-marker-that-must-not-leak"

@@ -26,8 +26,8 @@ from typing import Any
 
 from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.openbao_stand_in import Role, StandIn
 from tests.slow.ansible_support import ROLES, load_variable, run_playbook
+from tests.slow.openbao_stand_in import Role, StandIn
 
 ROLE = ROLES / "compose_stack"
 CHANGED_NONE = re.compile(r"changed=0\s")

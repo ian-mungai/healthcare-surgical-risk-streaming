@@ -1,7 +1,7 @@
 """A host whose OpenBao was initialised before external secrets existed completes the intake after one deploy, and its data stays as it was.
 
 OpenBao's first start writes the admin policy once, so a host made before this change holds the old text and the volume is kept. The deploy's reconcile step
-(run here against the stand-in of ``tests/fast/openbao_stand_in.py``, which judges every call by the real policy texts) writes the intake role's policy, AppRole
+(run here against the stand-in of ``tests/slow/openbao_stand_in.py``, which judges every call by the real policy texts) writes the intake role's policy, AppRole
 and secret ID from the declared paths with the bootstrap login, and the installed intake script then logs in with that role. The values are synthetic markers.
 """
 
@@ -12,9 +12,10 @@ from typing import Any
 
 from scripts.project_config import ROOT
 from tests.fast.ansible_paths import shared_module
-from tests.fast.openbao_stand_in import ADMIN_ROLE, Role, StandIn
-from tests.fast.test_external_intake_script import ADMIN_MARKER, INTAKE_FILE_NAME, LIST, NAME, VALUE, Case
+from tests.fast.external_intake_constants import NAME, VALUE
 from tests.fast.test_openbao_bootstrap import MAX_TTL, MY_OWNER, TTL, bootstrap
+from tests.slow.openbao_stand_in import ADMIN_ROLE, Role, StandIn
+from tests.slow.test_external_intake_script import ADMIN_MARKER, INTAKE_FILE_NAME, LIST, Case
 
 # The admin policy that the first start wrote before this change: no rule for an external path.
 OLD_ADMIN_POLICY = """path "sys/policies/acl" { capabilities = ["list"] }

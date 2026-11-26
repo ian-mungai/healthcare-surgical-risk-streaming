@@ -1,7 +1,7 @@
 """A call to OpenBao that carries a secret reports a failure by its method, its path and its HTTP status, and never by the body of the answer.
 
 A real server can repeat a rejected value in its error list, and the launcher keeps the whole output of the playbook. The server here is the stand-in of
-``tests/fast/openbao_stand_in.py``, made to answer each call with an error list that holds a marker. The values are synthetic markers.
+``tests/slow/openbao_stand_in.py``, made to answer each call with an error list that holds a marker. The values are synthetic markers.
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.fast.openbao_stand_in import Role, StandIn
 from tests.fast.test_openbao_bootstrap import MAX_TTL, MY_OWNER, TTL, bootstrap
+from tests.slow.openbao_stand_in import Role, StandIn
 
 MARKER = "marker-that-a-server-error-repeats-0123"
 

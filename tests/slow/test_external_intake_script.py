@@ -1,7 +1,7 @@
 """The intake script on the host writes one external secret into OpenBao when its path is empty, and says so in one code.
 
 The script is run as the role installs it: beside its helper, in the host's interpreter in isolated mode. The server is the stand-in of
-``tests/fast/openbao_stand_in.py``. The values are synthetic markers in the form of the check, and each case looks for them in every output.
+``tests/slow/openbao_stand_in.py``. The values are synthetic markers in the form of the check, and each case looks for them in every output.
 """
 
 from __future__ import annotations
@@ -24,17 +24,15 @@ from unittest import mock
 from scripts.process import run_command
 from scripts.project_config import ROOT
 from tests.fast.ansible_paths import SHARED_MODULE_UTILS
-from tests.fast.openbao_stand_in import Role, StandIn
+from tests.fast.external_intake_constants import NAME, SCRIPT, VALUE
+from tests.slow.openbao_stand_in import Role, StandIn
 
-SCRIPT = ROOT / "ansible" / "roles" / "openbao" / "files" / "external_secret_intake.py"
 LIST = ROOT / "compose" / "external_secrets.txt"
-VALUE = "dckr_pat_" + "MarkerValueThatMustNotLeak01"
 OTHER = "dckr_pat_" + "AnotherMarkerThatMustNotLeak2"
 ADMIN_MARKER = "admin-secret-id-marker"
 INTAKE_ROLE = "external_intake"
 INTAKE_MARKER = "intake-secret-id-marker"
 INTAKE_FILE_NAME = "external_intake.secret_id"
-NAME = "dockerhub_read"
 PATH = f"secret/data/external/{NAME}"
 INTAKE_WRITES = ("secret/data/external/*",)
 
