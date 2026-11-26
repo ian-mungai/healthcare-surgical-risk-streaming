@@ -120,11 +120,29 @@ def error_answer(code: str) -> Any:
     return bootstrap.Result(1, json.dumps({"status": "error", "error": {"cause": {"error": {"Code": code, "Message": "text"}}}}))
 
 
-def no_bucket_answer(bucket: str, status: int = 1, **error: Any) -> Any:
-    """The answer of ``mc ls --json`` for a bucket that does not exist, as the pinned AIStor client gave it on the host: a message and no S3 code."""
-    return bootstrap.Result(
-        status, json.dumps({"status": "error", "error": {"message": f"Unable to list bucket. Bucket `{bucket}` does not exist."} | error}) + "\n"
-    )
+# The whole answer of ``mc ls --json`` for a bucket that does not exist, as the pinned AIStor client gave it on the host; only the bucket's name is masked.
+LIVE_NO_BUCKET = (
+    '{"status": "error", "error": {"message": "Unable to list bucket.", '
+    '"cause": {"message": "Bucket `<BUCKET>` does not exist.", "error": {"Bucket": "<BUCKET>"}}, "type": "error"}}'
+)
+REMOVED = object()
+
+
+def no_bucket_answer(bucket: str, status: int = 1) -> Any:
+    return bootstrap.Result(status, LIVE_NO_BUCKET.replace("<BUCKET>", bucket) + "\n")
+
+
+def changed_answer(*path: str, to: Any) -> Any:
+    """The live answer for the project's bucket with one field set to another value, added or removed."""
+    document = json.loads(no_bucket_answer(BUCKET).output)
+    holder = document
+    for key in path[:-1]:
+        holder = holder[key]
+    if to is REMOVED:
+        del holder[path[-1]]
+    else:
+        holder[path[-1]] = to
+    return bootstrap.Result(1, json.dumps(document) + "\n")
 
 
 @dataclass
@@ -1140,14 +1158,10 @@ class MissingBucketTest(unittest.TestCase):
 
     def test_the_clients_answer_for_the_projects_missing_bucket_is_a_sign_in(self) -> None:
         self.assertIs(True, self.answered(no_bucket_answer(BUCKET)))
-        cause = {"message": f"Bucket `{BUCKET}` does not exist.", "error": {"Bucket": BUCKET}}
-        for extra in ({"cause": cause, "type": "error"}, {"cause": {"message": "text"}}):
-            with self.subTest(extra=extra):
-                self.assertIs(True, self.answered(no_bucket_answer(BUCKET, **extra)))
 
-    def test_a_code_in_the_answer_decides_it_whatever_the_message_says(self) -> None:
+    def test_a_code_in_the_answer_decides_it_whatever_the_rest_says(self) -> None:
         def coded(code: Any) -> Any:
-            return no_bucket_answer(BUCKET, cause={"error": {"Code": code}})
+            return changed_answer("error", "cause", "error", "Code", to=code)
 
         for code in ("InvalidAccessKeyId", "SignatureDoesNotMatch"):
             with self.subTest(code=code):
@@ -1157,25 +1171,40 @@ class MissingBucketTest(unittest.TestCase):
                 self.refused_as_unknown(coded(other))
 
     def test_any_other_form_that_speaks_of_a_missing_bucket_is_not_a_sign_in(self) -> None:
-        message = f"Unable to list bucket. Bucket `{BUCKET}` does not exist."
+        sentence = f"Bucket `{BUCKET}` does not exist."
         good = no_bucket_answer(BUCKET).output
         documents: list[tuple[str, Any]] = [
             ("another bucket", no_bucket_answer("another-bucket")),
             ("a bucket whose name holds the project's", no_bucket_answer(BUCKET + "-copy")),
-            ("another exit status", no_bucket_answer(BUCKET, status=137)),
-            ("text before the message", no_bucket_answer(BUCKET, message="leaked " + message)),
-            ("text after the message", no_bucket_answer(BUCKET, message=message + " Access Denied.")),
-            ("another message", no_bucket_answer(BUCKET, message=f"Bucket `{BUCKET}` does not exist.")),
-            ("a message that is no text", no_bucket_answer(BUCKET, message=[message])),
-            ("a status of success", bootstrap.Result(1, good.replace('"status": "error"', '"status": "success"'))),
-            ("no status", bootstrap.Result(1, json.dumps({"error": {"message": message}}))),
-            ("the message outside the error", bootstrap.Result(1, json.dumps({"status": "error", "message": message}))),
-            ("an error that is no object", bootstrap.Result(1, json.dumps({"status": "error", "error": message}))),
-            ("a cause that is no object", no_bucket_answer(BUCKET, cause=message)),
-            ("a cause's error that is no object", no_bucket_answer(BUCKET, cause={"error": "InvalidAccessKeyId"})),
+            ("another exit status", no_bucket_answer(BUCKET, status=2)),
+            ("a killed call", no_bucket_answer(BUCKET, status=137)),
+            ("a status of success", changed_answer("status", to="success")),
+            ("no status", changed_answer("status", to=REMOVED)),
+            ("a field beside the error", changed_answer("other", to="text")),
+            ("the sentence in the message", changed_answer("error", "message", to="Unable to list bucket. " + sentence)),
+            ("another message", changed_answer("error", "message", to="Unable to list folder.")),
+            ("no message", changed_answer("error", "message", to=REMOVED)),
+            ("another type", changed_answer("error", "type", to="fatal")),
+            ("no type", changed_answer("error", "type", to=REMOVED)),
+            ("a field in the error", changed_answer("error", "other", to="text")),
+            ("no cause", changed_answer("error", "cause", to=REMOVED)),
+            ("a cause that is null", changed_answer("error", "cause", to=None)),
+            ("a cause that is text", changed_answer("error", "cause", to=sentence)),
+            ("the cause's message of another bucket", changed_answer("error", "cause", "message", to="Bucket `another-bucket` does not exist.")),
+            ("text after the cause's message", changed_answer("error", "cause", "message", to=sentence + " Access Denied.")),
+            ("no cause's message", changed_answer("error", "cause", "message", to=REMOVED)),
+            ("a field in the cause", changed_answer("error", "cause", "other", to="text")),
+            ("no cause's error", changed_answer("error", "cause", "error", to=REMOVED)),
+            ("a cause's error that is null", changed_answer("error", "cause", "error", to=None)),
+            ("a cause's error that is text", changed_answer("error", "cause", "error", to="InvalidAccessKeyId")),
+            ("an empty cause's error", changed_answer("error", "cause", "error", to={})),
+            ("the cause's error of another bucket", changed_answer("error", "cause", "error", "Bucket", to="another-bucket")),
+            ("a field in the cause's error", changed_answer("error", "cause", "error", "Key", to="text")),
+            ("an error that is text", changed_answer("error", to=sentence)),
+            ("the message alone", bootstrap.Result(1, json.dumps({"status": "error", "error": {"message": "Unable to list bucket. " + sentence}}))),
             ("a second line", bootstrap.Result(1, good + good)),
             ("a line before the answer", bootstrap.Result(1, "leaked\n" + good)),
-            ("the words alone", bootstrap.Result(1, message)),
+            ("the words alone", bootstrap.Result(1, sentence)),
         ]
         for label, result in documents:
             with self.subTest(label):

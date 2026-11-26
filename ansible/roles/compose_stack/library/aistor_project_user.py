@@ -20,15 +20,16 @@ document equals the desired one; it then lists the project's bucket as the proje
 same exact form.
 
 THE SIGN-IN BEFORE THE BUCKET EXISTS. ``make storage-up`` makes the bucket as the project user, after the deploy, so the listing of a host's first deploys finds
-no bucket. For that, ``mc ls --json`` of the pinned AIStor client (on the host with the server ``RELEASE.2026-09-19T17-05-25Z``) exits with 1 and one JSON error
-with no S3 code, whose message is "Unable to list bucket. Bucket `<bucket>` does not exist.". The sign-in call alone counts that answer as a sign-in, and only
-as that exact message about the module's own bucket; a code in the answer decides it instead, and every other form fails. It shows that the sign-in was
-accepted because the client says it only when the server answered ``NoSuchBucket`` (``bucketStat`` of ``cmd/client-s3.go`` lines 2301-2309 of
-github.com/minio/mc, commit 77f82e18; ``BucketExists`` of ``api-stat.go`` lines 29-57 of github.com/minio/minio-go, commit d33b8ad6), which the server answers
-only after it has checked who asks and what the policy allows (``HeadBucketHandler`` of ``cmd/bucket-handlers.go`` lines 1660-1672 of github.com/minio/minio,
-commit 7aac2a2c). Those are the public sources; the message itself is the AIStor client's. A listing at the server's root needs no bucket but does not serve:
-the project policy has no ``s3:ListAllMyBuckets`` and is not widened for it, and without that action the server answers ``AccessDenied`` when it has no bucket
-to show (``ListBucketsHandler``, lines 318-402 of the same file).
+no bucket. For that, ``mc ls --json`` of the pinned AIStor client (read on the host with the server ``RELEASE.2026-09-19T17-05-25Z``) exits with 1 and one JSON
+answer with no S3 code: ``status`` is "error", and ``error`` holds the ``message`` "Unable to list bucket.", the ``type`` "error" and a ``cause`` whose
+``message`` is "Bucket `<bucket>` does not exist." and whose ``error`` is ``{"Bucket": "<bucket>"}``. The sign-in call alone counts that answer as a sign-in,
+and only when the whole answer is exactly that about the module's own bucket, with no other field; a code in an answer decides it instead, and every other form
+fails. It shows that the sign-in was accepted because the client says it only when the server answered ``NoSuchBucket`` (``bucketStat`` of ``cmd/client-s3.go``
+lines 2301-2309 of github.com/minio/mc, commit 77f82e18; ``BucketExists`` of ``api-stat.go`` lines 29-57 of github.com/minio/minio-go, commit d33b8ad6), which
+the server answers only after it has checked who asks and what the policy allows (``HeadBucketHandler`` of ``cmd/bucket-handlers.go`` lines 1660-1672 of
+github.com/minio/minio, commit 7aac2a2c). Those are the public sources; the answer's wording is the AIStor client's. A listing at the server's root needs no
+bucket but does not serve: the project policy has no ``s3:ListAllMyBuckets`` and is not widened for it, and without that action the server answers
+``AccessDenied`` when it has no bucket to show (``ListBucketsHandler``, lines 318-402 of the same file).
 
 THE RAW USER READ. ``mc admin user info`` also fetches each group's description (``GetGroupDescription``, which needs ``admin:GetGroup``;
 ``cmd/admin-user-info.go`` lines 67-91 of github.com/minio/mc), so a user in an added group made the check fail with a bare ``AccessDenied`` that named no
@@ -95,8 +96,6 @@ NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
 # an unknown access key is written in two parts: a scan keeps the field name of an exported credential out of every deployment file.
 SIGN_IN_REFUSALS = {"Invalid" + "Access" + "KeyId", "SignatureDoesNotMatch"}
 SIGNED_IN_CODES = {"NoSuchBucket"}
-# The pinned client's answer to a listing of a bucket that does not exist holds no S3 code, so its message is matched whole (the docstring says why it counts).
-NO_BUCKET_MESSAGE = "Unable to list bucket. Bucket `{}` does not exist."
 EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 APPROVAL = "--aistor-repair on the one run of python -m scripts.infra.host up"
 PUBLISH = "write the project user's sign-in to OpenBao"
@@ -295,9 +294,15 @@ def error_code(result: Result) -> str | None:
 
 
 def says_no_bucket(result: Result, bucket: str) -> bool:
-    """Whether the answer is the client's statement that this bucket does not exist: exit status 1 and a JSON error with no code whose message names it."""
-    found = json_error(result)
-    return result.status == 1 and found is not None and "Code" not in found[1] and found[0].get("message") == NO_BUCKET_MESSAGE.format(bucket)
+    """Whether the call exited with 1 and its whole answer is the pinned client's answer for a listing of this bucket that does not exist. That answer holds no
+    S3 code, so every field is matched (the module's docstring says why it counts as a sign-in)."""
+    if result.status != 1:
+        return False
+    cause = {"message": f"Bucket `{bucket}` does not exist.", "error": {"Bucket": bucket}}
+    try:
+        return answer_of(result.output) == {"status": "error", "error": {"message": "Unable to list bucket.", "cause": cause, "type": "error"}}
+    except BootstrapError:
+        return False
 
 
 def is_absent(result: Result, code: str) -> bool:
