@@ -12,12 +12,15 @@ Failure modes covered here:
 - A recording is read with the caller's AWS access, or with no deadline.
 - A file that is already there is downloaded again.
 - A failed or slow download, a computer with no AWS command line or a file that is not the pinned one passes, or ends in an error that does not name it.
+- A folder or a file in the cache is a link to a place outside it: a recording or a table is written there, a folder is made there, or a file from there
+  passes as a file of the cache.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from collections.abc import Callable, Sequence
@@ -59,7 +62,7 @@ class Publisher:
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
-class LandedCache(unittest.TestCase):
+class CacheCase(unittest.TestCase):
     def setUp(self) -> None:
         self.module: ModuleType = import_runner("stack_replay")
         scratch = tempfile.TemporaryDirectory(prefix="landed_cache_test_")
@@ -85,6 +88,8 @@ class LandedCache(unittest.TestCase):
         ):
             return dict(self.module.fill_landed_cache(self.cache, self.cases))
 
+
+class LandedCache(CacheCase):
     def test_the_cases_of_both_stream_plans_are_candidates_and_each_plan_fills_an_empty_cache(self) -> None:
         stream = import_runner("stream_host")
         candidates = {item.case for item in read_candidates(CANDIDATES_FILE)}
@@ -143,6 +148,60 @@ class LandedCache(unittest.TestCase):
         with self.assertRaises(self.module.Blocked) as caught:
             self.fill(Publisher(other))
         self.assertIn("does not match its pinned SHA-256", str(caught.exception))
+
+
+class LinksOutOfTheCache(CacheCase):
+    """The same cache, with links in it. ``outside`` is a folder beside the cache."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = self.cache.parent / "outside"
+        self.outside.mkdir()
+        self.cache.mkdir()
+
+    def refused(self, name: str) -> Publisher:
+        published = Publisher()
+        before = sorted(str(item) for item in self.outside.rglob("*"))
+        with self.assertRaises(self.module.Blocked) as caught:
+            self.fill(published)
+        self.assertIn(f"{name} leads outside the cache folder", str(caught.exception))
+        self.assertEqual(sorted(str(item) for item in self.outside.rglob("*")), before)
+        self.assertEqual(published.calls, [])
+        return published
+
+    def test_a_folder_that_links_outside_the_cache_gets_no_recording(self) -> None:
+        (self.cache / "vital_files").symlink_to(self.outside, target_is_directory=True)
+        self.refused("vital_files/0908.vital")
+
+    def test_a_folder_link_to_a_place_that_is_not_there_makes_nothing_outside(self) -> None:
+        (self.cache / "vital_files").symlink_to(self.outside / "later", target_is_directory=True)
+        self.refused("vital_files/0908.vital")
+        self.assertFalse((self.outside / "later").exists())
+
+    def test_a_file_that_links_outside_the_cache_is_refused_even_when_it_holds_the_pinned_file(self) -> None:
+        for name in ("vital_files/1147.vital", "clinical_data.csv", "SHA256SUMS.txt"):
+            with self.subTest(name=name):
+                shutil.rmtree(self.cache)
+                held = self.outside / Path(name).name
+                held.write_text(publisher.RELEASE_PREFIX + name)
+                link = self.cache / name
+                link.parent.mkdir(parents=True)
+                link.symlink_to(held)
+                self.refused(name)
+
+    def test_a_file_link_to_a_place_that_is_not_there_gets_no_download(self) -> None:
+        (self.cache / "clinical_data.csv").symlink_to(self.outside / "clinical_data.csv")
+        self.refused("clinical_data.csv")
+
+    def test_links_that_stay_inside_the_cache_and_a_cache_that_is_itself_a_link_are_filled(self) -> None:
+        (self.cache / "recordings").mkdir()
+        (self.cache / "vital_files").symlink_to("recordings", target_is_directory=True)
+        self.assertEqual(sorted(self.fill(Publisher())), self.names)
+        self.assertEqual(len(list((self.cache / "recordings").iterdir())), 3)
+        real = self.cache.rename(self.cache.parent / "real_cache")
+        self.cache.symlink_to(real, target_is_directory=True)
+        again = Publisher()
+        self.assertEqual((sorted(self.fill(again)), again.calls), (self.names, []))
 
 
 if __name__ == "__main__":
