@@ -178,6 +178,7 @@ class AptStepTest(unittest.TestCase):
         files: dict[str, str] | None = None,
         targets: tuple[str, ...] = TARGETS,
         failing: str | None = None,
+        links: dict[str, str] | None = None,
     ) -> tuple[int, list[dict[str, Any]], Path]:
         path = DOCKERFILES[name]
         snapshot = DebianSnapshotTest().snapshot_of(name, path)
@@ -190,6 +191,8 @@ class AptStepTest(unittest.TestCase):
         (lists / "left_over").write_text("")
         for relative, content in ({"sources.list.d/debian.sources": BASE_SOURCES} if files is None else files).items():
             (etc / relative).write_text(content)
+        for relative, destination in (links or {}).items():
+            (etc / relative).symlink_to(destination)
         (record / "targets").write_text("".join(f"{line.format(snapshot=snapshot)}\n" for line in targets))
         if failing is not None:
             (record / "failing").write_text(failing)
@@ -242,6 +245,22 @@ class AptStepTest(unittest.TestCase):
                     self.assertNotEqual(0, code)
                     self.assertEqual([], calls)
 
+    def test_a_symbolic_link_where_the_base_image_holds_none_stops_the_build_before_any_apt_call(self) -> None:
+        base = "sources.list.d/debian.sources"
+        # Each case: the regular files of the APT folder, then the links with their destinations.
+        cases: dict[str, tuple[dict[str, str], dict[str, str]]] = {
+            "a dangling sources.list": ({base: BASE_SOURCES}, {"sources.list": "no_such_file"}),
+            "a dangling extra .list link": ({base: BASE_SOURCES}, {"sources.list.d/extra.list": "no_such_file"}),
+            "a dangling debian.sources": ({}, {base: "no_such_file"}),
+            "debian.sources as a link to a file with the base content": ({"base_copy": BASE_SOURCES}, {base: "../base_copy"}),
+        }
+        for name in DOCKERFILES:
+            for case, (files, links) in cases.items():
+                with self.subTest(image=name, case=case):
+                    code, calls, _ = self.run_step(name, files=files, links=links)
+                    self.assertNotEqual(0, code)
+                    self.assertEqual([], calls)
+
     def test_indexes_other_than_the_three_pinned_ones_stop_the_build_before_the_upgrade(self) -> None:
         security, main, updates = TARGETS
         cases: dict[str, tuple[str, ...]] = {
@@ -265,12 +284,15 @@ class AptStepTest(unittest.TestCase):
                     self.assertNotEqual(0, code)
                     self.assertEqual(["update", "indextargets"], [call["arguments"][0] for call in calls])
 
-    def test_a_failed_update_runs_nothing_more_and_a_failed_upgrade_fails_the_build(self) -> None:
-        for failing, expected in (("update", ["update"]), ("upgrade", ["update", "indextargets", "upgrade"])):
-            with self.subTest(failing=failing):
-                code, calls, _ = self.run_step("replay", failing=failing)
-                self.assertNotEqual(0, code)
-                self.assertEqual(expected, [call["arguments"][0] for call in calls])
+    def test_a_failed_apt_command_runs_nothing_more_and_fails_the_build(self) -> None:
+        # The stand-in prints the three pinned indexes before it fails indextargets: only the exit status can stop that build.
+        commands = ["update", "indextargets", "upgrade"]
+        for name in DOCKERFILES:
+            for position, failing in enumerate(commands):
+                with self.subTest(image=name, failing=failing):
+                    code, calls, _ = self.run_step(name, failing=failing)
+                    self.assertNotEqual(0, code)
+                    self.assertEqual(commands[: position + 1], [call["arguments"][0] for call in calls])
 
 
 class SparkJarTest(unittest.TestCase):
