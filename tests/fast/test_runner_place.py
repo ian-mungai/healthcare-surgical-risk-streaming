@@ -710,6 +710,63 @@ class ProbeImportTest(ProbeFolderCase):
         user = self.probe("user_probe.py", "from batch_helper import VALUE\n")
         self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
 
+    def test_a_relative_import_in_a_probe_is_refused_because_a_probe_runs_on_its_own_in_the_image(self) -> None:
+        support = self.probe("support_probe.py", "VALUE = 1\n")
+        for text in (
+            "from .support_probe import VALUE\n",
+            "from .support_probe import *\n",
+            "from . import support_probe\n",
+            "def later():\n    from .support_probe import VALUE\n",
+            "from ..runner_checks import anything\n",
+        ):
+            with self.subTest(text=text):
+                user = self.probe("user_probe.py", text)
+                self.assertIn(f"{user}: a probe runs on its own, so its relative import fails in the image\n", self.refused([user, support]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_a_star_import_of_a_probe_whose_all_names_what_it_does_not_hold_is_refused(self) -> None:
+        for oracle_text, absent in (
+            ("__all__ = ['never_bound']\n", "never_bound"),
+            ("__all__ = ('listed', 'gone')\nlisted = 1\ngone = 2\ndel gone\n", "gone"),
+            ("__all__: list[str] = ['typed']\ntyped: int\n", "typed"),
+            ("__all__ = ['inside']\n\ndef build():\n    inside = 1\n", "inside"),
+        ):
+            for user_text in ("from support_probe import *\n", "try:\n    from support_probe import *\nexcept ImportError:\n    pass\n"):
+                with self.subTest(oracle=oracle_text, user=user_text):
+                    support = self.probe("support_probe.py", oracle_text)
+                    user = self.probe("user_probe.py", user_text)
+                    line = f"{user}: a star import of the probe support_probe fails: its __all__ names {absent}, which it does not hold at its top level\n"
+                    self.assertIn(line, self.refused([user, support]))
+                    self.shown.truncate(0)
+                    self.shown.seek(0)
+
+    def test_a_star_import_of_a_probe_whose_all_cannot_be_read_is_refused(self) -> None:
+        for oracle_text in (
+            "names = ['listed']\n__all__ = names\nlisted = 1\n",
+            "__all__ = ['listed']\n__all__ += ['added']\nlisted = 1\nadded = 2\n",
+            "if True:\n    __all__ = ['listed']\nlisted = 1\n",
+            "__all__ = ['listed', 3]\nlisted = 1\n",
+        ):
+            with self.subTest(oracle=oracle_text):
+                support = self.probe("support_probe.py", oracle_text)
+                user = self.probe("user_probe.py", "from support_probe import *\n")
+                line = f"{user}: a star import of the probe support_probe is refused: this check cannot read its __all__ as one list of names\n"
+                self.assertIn(line, self.refused([user, support]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_a_star_import_of_a_probe_whose_all_names_only_what_it_holds_is_accepted(self) -> None:
+        for oracle_text in (
+            "__all__ = ['listed', '_named', 'dumps', 'VALUE']\nlisted = 1\n_named = 2\nfrom json import dumps\nfrom scripts.takes_image_package import *\n",
+            "__all__ = []\n",
+            "__all__ = ['never_bound']\ndel __all__\n",
+        ):
+            with self.subTest(oracle=oracle_text):
+                support = self.probe("support_probe.py", oracle_text)
+                user = self.probe("user_probe.py", "from support_probe import *\n")
+                self.assertEqual(2, len(self.place(Host(), [user, support]).placed))
+
     def test_a_star_import_from_outside_the_repository_lists_no_name_that_another_probe_can_take(self) -> None:
         oracle = self.probe("batch_oracle.py", "from json import *\n\ndef __getattr__(name):\n    return name\n")
         user = self.probe("user_probe.py", "from batch_oracle import dumps\n")

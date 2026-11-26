@@ -221,17 +221,38 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
     return names, open_ended
 
 
+def star_problems(source: Source, file: str, sibling: str, siblings: Mapping[str, str]) -> list[str]:
+    """One line for each reason why ``from <sibling> import *`` in ``file`` cannot be accepted. Python takes every name that the sibling's ``__all__`` lists
+    and fails at one that the sibling does not hold, so each listed name must be held, and an ``__all__`` that ``literal_all`` cannot read is refused. A
+    sibling without an ``__all__`` has nothing to check."""
+    path = siblings[sibling]
+    held = exported_names(source, sibling_module(path), siblings=siblings)[0]
+    if "__all__" not in held:
+        return []
+    tree = parsed(source.read(path) or "", path)
+    listed = literal_all(tree) if isinstance(tree, ast.Module) else None
+    if listed is None:
+        return [f"{file}: a star import of the probe {sibling} is refused: this check cannot read its __all__ as one list of names"]
+    return [
+        f"{file}: a star import of the probe {sibling} fails: its __all__ names {name}, which it does not hold at its top level"
+        for name in sorted(listed - held)
+    ]
+
+
 def sibling_problems(source: Source, siblings: Mapping[str, str]) -> list[str]:
-    """One line for each import that a sibling file cannot answer. ``siblings`` maps the bare name by which they import each other to each one's path. A
-    sibling is a module and not a package, so it has no submodule; a name that a ``from`` import takes from it must be one that this read lists at its top
-    level, including what it takes from another sibling, so a name that only a star import from outside the repository and the siblings or a module
-    ``__getattr__`` could give is refused. A file that is not there or is not valid Python is left to ``closure``, which reports it."""
+    """One line for each import that a sibling file cannot make or answer. ``siblings`` maps the bare name by which they import each other to each one's path.
+    A sibling runs on its own and belongs to no package, so a relative import in it fails, at any depth of the file. A sibling is a module and not a package,
+    so it has no submodule; a name that a ``from`` import takes from it must be one that this read lists at its top level, including what it takes from another
+    sibling, so a name that only a star import from outside the repository and the siblings or a module ``__getattr__`` could give is refused. A star import of
+    it must pass ``star_problems``. A file that is not there or is not valid Python is left to ``closure``, which reports it."""
     problems: list[str] = []
     for file in sorted(siblings.values()):
         text = source.read(file)
         tree = parsed(text, file) if text is not None else None
         if tree is None:
             continue
+        if any(isinstance(node, ast.ImportFrom) and node.level > 0 for node in ast.walk(tree)):
+            problems.append(f"{file}: a probe runs on its own, so its relative import fails in the image")
         for module, names in imported_names(tree, file):
             sibling, _, below = (module or "").partition(".")
             if sibling not in siblings:
@@ -241,6 +262,8 @@ def sibling_problems(source: Source, siblings: Mapping[str, str]) -> list[str]:
                 continue
             held = exported_names(source, sibling_module(siblings[sibling]), siblings=siblings)[0]
             problems += [f"{file}: the probe {sibling} has no name {name} at its top level" for name in names if name != "*" and name not in held]
+            if "*" in names:
+                problems += star_problems(source, file, sibling, siblings)
     return list(dict.fromkeys(problems))
 
 
