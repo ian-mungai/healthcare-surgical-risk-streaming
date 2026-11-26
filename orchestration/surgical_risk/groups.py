@@ -5,8 +5,11 @@ left running. The job's last step is ``stop_service_group``, with every other st
 fails that step and so the run. The stop is a step because Dagster logs a resource teardown that raises and still ends the run as a success. When a step
 before it fails, or the start itself fails, the stop step does not run and the resource's teardown stops what the run started. The run's tags record what
 the job stopped and what is left running, so a failed job's record says whether anything remains; after a failed stop that leaves no service seen as
-running, they say it is unknown. Every wait has a deadline, and a failure names the service and holds no text of a container. The job must use the
-in-process executor: the resource is set up once for the whole run.
+running, they say it is unknown. A run in the always-on group stops nothing and records what it started that still runs. A run that selects steps must select
+``stop_service_group`` with at least one other step, or it is refused before the group is touched: without the stop step a failed stop would not fail the run,
+and the stop step alone, as a re-execution from a failed stop selects it, would take what the earlier run left up for a service that ran before it. Every
+wait has a deadline, and a failure names the service and holds no text of a container. The job must use the in-process executor: the resource is set up once
+for the whole run.
 """
 
 import contextlib
@@ -18,6 +21,7 @@ from dagster import ConfigurableResource, In, InitResourceContext, Nothing, OpEx
 from pydantic import PrivateAttr
 
 from scripts.stack.groups import (
+    ALWAYS_ON_GROUPS,
     GroupError,
     Settings,
     describe_states,
@@ -34,6 +38,7 @@ from scripts.stack.limits import Limits, load_limits
 TAG_PREFIX = "surgical_risk/group"
 TAG_VALUE_LIMIT = 250
 NOTHING = "none"
+STOP_STEP = "stop_service_group"
 
 
 def current_settings() -> Settings:
@@ -42,6 +47,22 @@ def current_settings() -> Settings:
 
 def tag_text(names: list[str] | tuple[str, ...]) -> str:
     return (",".join(names) or NOTHING)[:TAG_VALUE_LIMIT]
+
+
+def refuse_partial_selection(context: InitResourceContext, group: str) -> None:
+    """Raise ``GroupError`` for a run whose selected steps are not the stop step with at least one other step. A run with no selection runs the whole job."""
+    run = context.dagster_run
+    if run is None:
+        return
+    selected = run.step_keys_to_execute if run.step_keys_to_execute is not None else run.resolved_op_selection
+    if selected is None or (STOP_STEP in selected and set(selected) != {STOP_STEP}):
+        return
+    advice = "" if group in ALWAYS_ON_GROUPS else f" If an earlier run left the group up, first stop it with the group command: down {group}."
+    raise GroupError(
+        f"refused before the group is touched: this run selects only {', '.join(sorted(selected))}. A run of a job in a service group runs {STOP_STEP} "
+        f"together with the job's other steps, because a run stops only what it started and only {STOP_STEP} fails the run when the stop fails. "
+        f"Run the whole job.{advice}"
+    )
 
 
 class GroupResource(ConfigurableResource):
@@ -65,6 +86,7 @@ class GroupResource(ConfigurableResource):
 
     @contextlib.contextmanager
     def yield_for_execution(self, context: InitResourceContext) -> Generator[GroupResource]:
+        refuse_partial_selection(context, self.group)
         settings = current_settings()
         limits = load_limits(settings.limits_file)
         self._held = (settings, limits, running_services(settings, limits))
@@ -98,11 +120,14 @@ class GroupResource(ConfigurableResource):
         stopped: tuple[str, ...] = ()
         left: list[str] | None = None
         stop_failed = False
-        try:
-            stopped = stop_group(settings, self.group, keep=before, deadline_seconds=self.stop_deadline_seconds, log=lambda message: context.log.info(message))
-        except GroupError as error:
-            problems.append(str(error))
-            stop_failed = True
+        if self.group not in ALWAYS_ON_GROUPS:
+            try:
+                stopped = stop_group(
+                    settings, self.group, keep=before, deadline_seconds=self.stop_deadline_seconds, log=lambda message: context.log.info(message)
+                )
+            except GroupError as error:
+                problems.append(str(error))
+                stop_failed = True
         try:
             left = sorted(running_services(settings, limits) - before)
         except GroupError as error:
@@ -121,7 +146,7 @@ class GroupResource(ConfigurableResource):
             raise GroupError("; ".join(problems))
 
 
-@op(ins={"after": In(Nothing)})
+@op(name=STOP_STEP, ins={"after": In(Nothing)})
 def stop_service_group(context: OpExecutionContext, group: GroupResource) -> None:
     """The last step of a job that has a group resource: wire every other step of the job into ``after``."""
     group.stop_what_this_run_started(context)
