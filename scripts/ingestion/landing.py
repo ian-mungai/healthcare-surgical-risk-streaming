@@ -7,11 +7,14 @@ records. Nothing else guesses or builds a landed key: the manifest holds the key
 
 The neutral form is a JSON list of ``{"source_key": ..., "landed_key": ..., "size": ...}``.
 
-``pairings_from_metadata`` reads the metadata record that Airbyte writes for each file of a raw copy, as JSON lines, in the form of its
-documentation: an ``_airbyte_data`` object with the file's ``file_name`` (and its ``folder`` when the sub-folders are kept), its ``bytes`` and its
-``_airbyte_file_path``, the path of the landed file below the landing prefix. The source key is the release path and the file's path in the release.
-The landed key is the landing prefix and the file path. The host's fixed-sample copy confirms the form. A wrong reading cannot pass: the check refuses
-a pairing whose landed key names no object, one whose size differs, a file with no record and a file with two.
+``pairings_from_metadata`` reads the metadata record that Airbyte writes for each file of a raw copy, as JSON lines: an ``_airbyte_data`` object with
+the file's ``file_name`` (and its ``folder``), its ``bytes`` and its ``_airbyte_file_path``. The pinned S3 source gives the folder and the name of the
+object's whole key, so together they are the source key, release path included
+(https://github.com/airbytehq/airbyte/blob/master/airbyte-integrations/connectors/source-s3/source_s3/v4/stream_reader.py, ``upload``). The pinned S3
+destination gives the whole landed key: its bucket path, which is the landing prefix, a folder of the sync's own and the source path
+(https://github.com/airbytehq/airbyte/blob/master/airbyte-cdk/bulk/toolkits/legacy-task-load-object-storage/src/main/kotlin/io/airbyte/cdk/load/pipline/object_storage/file/FileChunkTask.kt).
+Neither prefix is added here. A record of another source path or of a path outside the landing prefix is refused. A wrong reading cannot pass: the check
+refuses a pairing whose landed key names no object, one whose size differs, a file with no record and a file with two.
 """
 
 from __future__ import annotations
@@ -54,20 +57,23 @@ def load_pairing_records(text: str) -> tuple[PairingRecord, ...]:
 
 
 def landed_key_of(path: str) -> str:
-    """The landed key of the file path of a metadata record: the landing prefix and a plain relative path. Raise ``ValueError`` for any other path.
+    """The landed key of the file path of a metadata record: the path is the whole key, a plain path below the landing prefix. Raise ``ValueError`` for any
+    other path.
 
-    One leading slash is the documented form. An empty part, a ``.`` part, a ``..`` part, a backslash and a control character are refused, so no path leaves the
-    landing prefix after it is normalised.
+    One leading slash is dropped. A path that does not start with the landing prefix is refused, and so are an empty part, a ``.`` part, a ``..`` part, a
+    backslash and a control character, so no path leaves the landing prefix after it is normalised.
     """
     relative = path[1:] if path.startswith("/") else path
     parts = relative.split("/")
-    if not relative or any(part in ("", ".", "..") or "\\" in part or any(ord(character) < 32 for character in part) for part in parts):
+    if not relative.startswith(LANDING_PREFIX) or any(
+        part in ("", ".", "..") or "\\" in part or any(ord(character) < 32 for character in part) for part in parts
+    ):
         raise ValueError
-    return LANDING_PREFIX + relative
+    return relative
 
 
 def metadata_pairing(line: str, source_prefix: str) -> PairingRecord:
-    """The pairing of one metadata line. Raise ``ValueError`` when the line is not a record of the documented form."""
+    """The pairing of one metadata line. Raise ``ValueError`` when the line is not a record of the connectors' form."""
     record = parse_json(line, Subject.PAIRINGS)
     data = record["_airbyte_data"]
     name, size, landed = data["file_name"], data["bytes"], data["_airbyte_file_path"]
@@ -75,9 +81,9 @@ def metadata_pairing(line: str, source_prefix: str) -> PairingRecord:
     if type(name) is not str or type(folder) is not str or type(landed) is not str or type(size) is not int or size < 0:
         raise ValueError
     relative = f"{folder.strip('/')}/{name}" if folder.strip("/") and not name.startswith(folder.strip("/") + "/") else name
-    if not relative_path(relative):
+    if not relative_path(relative) or not relative.startswith(source_prefix):
         raise ValueError
-    return PairingRecord(source_prefix + relative, landed_key_of(landed), size)
+    return PairingRecord(relative, landed_key_of(landed), size)
 
 
 def pairings_from_metadata(texts: Iterable[str], source_prefix: str) -> tuple[PairingRecord, ...]:

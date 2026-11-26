@@ -1,8 +1,10 @@
 """The pairing records are made from the metadata records that Airbyte writes for each copied file, and the check refuses a pairing that is not true.
 
-Airbyte names a landed key from the sync that wrote it, so the key of a file is read from its metadata record. The form of that record and of the key is the
-documented one, which the host's fixed-sample copy confirms. These cases show that a wrong reading of the form can never pass the check: a path that names no
-landed object, a file copied twice and a file with no record each fail it. The store is the stand-in store of the ingestion tests.
+Airbyte names a landed key from the sync that wrote it, so the key of a file is read from its metadata record. The form is the one that the pinned connectors
+write: the S3 source (``source-s3``, ``stream_reader.upload``) gives the folder and the name of the object's whole key, and the S3 destination
+(``destination-s3``, ``FileChunkTask``) gives the whole landed key, which starts with its bucket path (``landing``) and holds a folder of its own sync. A
+fixed-sample copy on the host that was read in another form paired no selected file. These cases also show that a wrong reading can never pass the check: a
+path that names no landed object, a file copied twice and a file with no record each fail it. The store is the stand-in store of the ingestion tests.
 """
 
 from __future__ import annotations
@@ -30,15 +32,43 @@ def setUpModule() -> None:
 
 
 def record(path: str, key: str, size: int, *, joined: bool = False) -> str:
-    """One metadata line, in the form of Airbyte's documentation: a folder and a file name, a byte count and the path of the landed file."""
-    folder, _, name = path.rpartition("/")
-    data = {"file_name": path if joined else name, "bytes": size, "source_uri": "s3://example", "_airbyte_file_path": "/" + key.removeprefix("landing/")}
+    """One metadata line as the pinned connectors write it: the folder and the name of the object's whole key, a byte count and the whole landed key."""
+    folder, _, name = (SOURCE_PREFIX + path).rpartition("/")
+    data = {
+        "file_name": SOURCE_PREFIX + path if joined else name,
+        "bytes": size,
+        "source_uri": f"s3://example/{SOURCE_PREFIX}{path}",
+        "_airbyte_file_path": key,
+    }
     if not joined:
         data["folder"] = folder
     return json.dumps({"_airbyte_raw_id": "x", "_airbyte_data": data})
 
 
 class ParseTest(unittest.TestCase):
+    def test_the_record_of_the_pinned_connectors_gives_the_object_key_once_and_the_landed_key_once(self) -> None:
+        landed = "landing/vitaldb_files/2026_01_02_1767312000000_/vitaldb/1.0.0/vital_files/0001.vital"
+        line = json.dumps(
+            {
+                "_airbyte_raw_id": "x",
+                "_airbyte_data": {
+                    "folder": "vitaldb/1.0.0/vital_files",
+                    "file_name": "0001.vital",
+                    "bytes": 12,
+                    "source_uri": "s3://physionet-open/vitaldb/1.0.0/vital_files/0001.vital",
+                    "updated_at": "2026-01-02T00:00:00.000000Z",
+                    "_airbyte_file_path": landed,
+                },
+            }
+        )
+        self.assertEqual((PairingRecord("vitaldb/1.0.0/vital_files/0001.vital", landed, 12),), pairings_from_metadata([line], SOURCE_PREFIX))
+
+    def test_a_record_whose_folder_is_not_under_the_release_path_is_refused(self) -> None:
+        for folder in ("vital_files", "", "other/1.0.0/vital_files", "vitaldb/1.0.0x"):
+            with self.subTest(folder=folder), self.assertRaises(PairingError):
+                data = {"folder": folder, "file_name": "0001.vital", "bytes": 1, "_airbyte_file_path": "landing/s1/a"}
+                pairings_from_metadata([json.dumps({"_airbyte_data": data})], SOURCE_PREFIX)
+
     def test_a_record_pairs_its_source_key_its_landed_key_and_its_size(self) -> None:
         text = record("vital_files/0001.vital", "landing/Files/s1/vital_files/0001.vital", 12) + "\n"
         self.assertEqual(
@@ -70,11 +100,11 @@ class ParseTest(unittest.TestCase):
             "not json " + MARKER,
             "[]",
             json.dumps({"_airbyte_data": {"file_name": MARKER}}),
-            json.dumps({"_airbyte_data": {"file_name": "a.vital", "bytes": True, "_airbyte_file_path": "/x"}}),
-            json.dumps({"_airbyte_data": {"file_name": "a.vital", "bytes": -1, "_airbyte_file_path": "/x"}}),
-            json.dumps({"_airbyte_data": {"file_name": "../a.vital", "bytes": 1, "_airbyte_file_path": "/x"}}),
-            json.dumps({"_airbyte_data": {"file_name": "a.vital", "bytes": 1, "_airbyte_file_path": ""}}),
-            json.dumps({"_airbyte_data": {"file_name": MARKER + " a", "bytes": 1, "_airbyte_file_path": "/x"}}),
+            json.dumps({"_airbyte_data": {"file_name": "vitaldb/1.0.0/a.vital", "bytes": True, "_airbyte_file_path": "landing/x"}}),
+            json.dumps({"_airbyte_data": {"file_name": "vitaldb/1.0.0/a.vital", "bytes": -1, "_airbyte_file_path": "landing/x"}}),
+            json.dumps({"_airbyte_data": {"file_name": "vitaldb/1.0.0/../a.vital", "bytes": 1, "_airbyte_file_path": "landing/x"}}),
+            json.dumps({"_airbyte_data": {"file_name": "vitaldb/1.0.0/a.vital", "bytes": 1, "_airbyte_file_path": ""}}),
+            json.dumps({"_airbyte_data": {"file_name": "vitaldb/1.0.0/" + MARKER + " a", "bytes": 1, "_airbyte_file_path": "landing/x"}}),
         ]
         for bad in bad_lines:
             with self.subTest(bad=bad[:40]), self.assertRaises(PairingError) as raised:
@@ -87,7 +117,7 @@ class BoundaryTest(unittest.TestCase):
     """A metadata path is a path below the landing prefix, and a landed file belongs to one source."""
 
     def refused(self, path: str) -> str:
-        line = json.dumps({"_airbyte_data": {"file_name": "a.vital", "bytes": 1, "_airbyte_file_path": path}})
+        line = json.dumps({"_airbyte_data": {"file_name": f"{SOURCE_PREFIX}a.vital", "bytes": 1, "_airbyte_file_path": path}})
         good = record("vital_files/0001.vital", "landing/Files/s1/vital_files/0001.vital", 1)
         with self.assertRaises(PairingError) as raised:
             pairings_from_metadata([good + "\n" + line + "\n"], SOURCE_PREFIX)
@@ -96,16 +126,36 @@ class BoundaryTest(unittest.TestCase):
         return str(raised.exception)
 
     def test_a_file_path_that_leaves_the_landing_prefix_or_is_not_a_plain_path_is_refused(self) -> None:
-        for path in ("../x", "/../x", "/a/../b", "/a/./b", "//a/b", "/a//b", "/", "/a/b/", "/a\\b", "/a/..", "/./a", "/a/b\x00c"):
+        for path in (
+            "../x",
+            "/../x",
+            "landing/a/../b",
+            "landing/a/./b",
+            "//landing/b",
+            "landing//b",
+            "/",
+            "landing/a/b/",
+            "landing/a\\b",
+            "landing/a/..",
+            "/./landing/a",
+            "landing/a/b\x00c",
+        ):
+            with self.subTest(path=path):
+                self.refused(path)
+
+    def test_a_file_path_that_does_not_start_at_the_landing_prefix_is_refused(self) -> None:
+        for path in ("/Files/s1/a.vital", "Files/s1/a.vital", "landing", "landing/", "landingx/s1/a", "outside/landing/a"):
             with self.subTest(path=path):
                 self.refused(path)
 
     def test_a_plain_path_with_dots_and_spaces_in_a_name_is_accepted(self) -> None:
-        for path in ("/Files/2026_11_22_1763800000000_/vital_files/0001.vital", "Files/s1/a.b.c", "/Files/s 1/a-b_c.vital", "/.hidden/a..b"):
+        for path in ("/landing/files/2026_11_22_1763800000000_/vital_files/0001.vital", "landing/s1/a.b.c", "landing/s 1/a-b_c.vital", "landing/.hidden/a..b"):
             with self.subTest(path=path):
-                line = json.dumps({"_airbyte_data": {"file_name": "0001.vital", "folder": "vital_files", "bytes": 1, "_airbyte_file_path": path}})
+                line = json.dumps(
+                    {"_airbyte_data": {"file_name": "0001.vital", "folder": f"{SOURCE_PREFIX}vital_files", "bytes": 1, "_airbyte_file_path": path}}
+                )
                 found = pairings_from_metadata([line], SOURCE_PREFIX)
-                self.assertEqual("landing/" + path.lstrip("/"), found[0].landed_key)
+                self.assertEqual(path.removeprefix("/"), found[0].landed_key)
 
     def test_two_sources_pointing_at_one_landed_file_are_refused_in_the_pairing_step(self) -> None:
         one = record("vital_files/0001.vital", "landing/Files/s1/shared", 1)
