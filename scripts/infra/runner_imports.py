@@ -140,13 +140,46 @@ def top_level_statements(statements: Sequence[ast.AST]) -> Iterator[ast.AST]:
                 yield from top_level_statements(getattr(node, part, []))
 
 
-def stored_names(target: ast.AST | None) -> set[str]:
-    return {node.id for node in ast.walk(target) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)} if target is not None else set()
+def target_names(target: ast.AST | None, context: type[ast.expr_context] = ast.Store) -> set[str]:
+    """The bare names that a target stores, or with ``ast.Del`` removes. An attribute or an item of a name leaves the name as it was."""
+    return {node.id for node in ast.walk(target) if isinstance(node, ast.Name) and isinstance(node.ctx, context)} if target is not None else set()
 
 
-def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset()) -> tuple[set[str], bool]:
+def sibling_module(path: str) -> str:
+    return path.removesuffix(".py").replace("/", ".")
+
+
+def literal_all(tree: ast.Module) -> set[str] | None:
+    """The names of a module's ``__all__`` when the module holds it as one list or tuple of strings, assigned directly at its top level, and names it nowhere
+    else; otherwise None."""
+    uses = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "__all__"]
+    values = [
+        node.value
+        for node in tree.body
+        if (isinstance(node, ast.Assign) and any(target in uses for target in node.targets)) or (isinstance(node, ast.AnnAssign) and node.target in uses)
+    ]
+    if len(uses) != 1 or len(values) != 1 or not isinstance(values[0], ast.List | ast.Tuple):
+        return None
+    listed = [element.value for element in values[0].elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+    return set(listed) if len(listed) == len(values[0].elts) else None
+
+
+def star_names(source: Source, path: str, seen: frozenset[str], siblings: Mapping[str, str]) -> tuple[set[str], bool]:
+    """The names that ``from <sibling> import *`` takes from the sibling at ``path``, and whether other names may exist: with an ``__all__``, the names that it
+    lists and the sibling holds; without one, each name without a leading underscore. An ``__all__`` that ``literal_all`` cannot read lists no name."""
+    names, open_ended = exported_names(source, sibling_module(path), seen, siblings)
+    if "__all__" not in names:
+        return {name for name in names if not name.startswith("_")}, open_ended
+    tree = parsed(source.read(path) or "", path)
+    listed = literal_all(tree) if isinstance(tree, ast.Module) else None
+    return (set(), True) if listed is None else (listed & names, open_ended)
+
+
+def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset(), siblings: Mapping[str, str] | None = None) -> tuple[set[str], bool]:
     """The names that a module's file defines or imports at its top level, and whether other names may exist that this read cannot list: a star import of a
-    module that is not the repository's own or that has no readable file, and a module ``__getattr__``."""
+    module that is not the repository's own or that has no readable file, and a module ``__getattr__``. An annotation with no value defines no name, and a
+    ``del`` that is the file's own statement removes the names bound before it. ``siblings`` (see ``sibling_problems``) answers a star import by a bare name."""
+    siblings = siblings or {}
     file = module_file(source, module)
     text = source.read(file) if file is not None else None
     tree = parsed(text, file or module) if text is not None else None
@@ -154,7 +187,8 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
         return set(), True
     names: set[str] = set()
     open_ended = False
-    for node in top_level_statements(tree.body if isinstance(tree, ast.Module) else []):
+    own = tree.body if isinstance(tree, ast.Module) else []
+    for node in top_level_statements(own):
         if isinstance(node, ast.Import):
             names |= {alias.asname or alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom):
@@ -163,24 +197,51 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
                     names.add(alias.asname or alias.name)
                     continue
                 target = absolute_module(file, node.level, node.module) if node.level else node.module
-                if target and target.split(".")[0] in FIRST_PARTY:
+                if not node.level and target and target in siblings:
+                    more, wide = star_names(source, siblings[target], seen | {module}, siblings)
+                elif target and target.split(".")[0] in FIRST_PARTY:
                     more, wide = exported_names(source, target, seen | {module})
-                    names |= more
-                    open_ended = open_ended or wide
                 else:
-                    open_ended = True
+                    more, wide = set(), True
+                names |= more - {"__all__"}
+                open_ended = open_ended or wide
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             names.add(node.name)
             open_ended = open_ended or node.name == "__getattr__"
         elif isinstance(node, ast.TypeAlias):
-            names |= stored_names(node.name)
+            names |= target_names(node.name)
         elif isinstance(node, ast.Assign):
-            names |= set().union(*(stored_names(target) for target in node.targets))
-        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.For | ast.AsyncFor):
-            names |= stored_names(node.target)
+            names |= set().union(*(target_names(target) for target in node.targets))
+        elif isinstance(node, ast.AugAssign | ast.For | ast.AsyncFor) or (isinstance(node, ast.AnnAssign) and node.value is not None):
+            names |= target_names(node.target)
         elif isinstance(node, ast.With | ast.AsyncWith):
-            names |= set().union(*(stored_names(item.optional_vars) for item in node.items))
+            names |= set().union(*(target_names(item.optional_vars) for item in node.items))
+        elif isinstance(node, ast.Delete) and node in own:
+            names -= set().union(*(target_names(target, ast.Del) for target in node.targets))
     return names, open_ended
+
+
+def sibling_problems(source: Source, siblings: Mapping[str, str]) -> list[str]:
+    """One line for each import that a sibling file cannot answer. ``siblings`` maps the bare name by which they import each other to each one's path. A
+    sibling is a module and not a package, so it has no submodule; a name that a ``from`` import takes from it must be one that this read lists at its top
+    level, including what it takes from another sibling, so a name that only a star import from outside the repository and the siblings or a module
+    ``__getattr__`` could give is refused. A file that is not there or is not valid Python is left to ``closure``, which reports it."""
+    problems: list[str] = []
+    for file in sorted(siblings.values()):
+        text = source.read(file)
+        tree = parsed(text, file) if text is not None else None
+        if tree is None:
+            continue
+        for module, names in imported_names(tree, file):
+            sibling, _, below = (module or "").partition(".")
+            if sibling not in siblings:
+                continue
+            if below:
+                problems.append(f"{file}: {module} cannot be imported: the probe {sibling} is a module, not a package")
+                continue
+            held = exported_names(source, sibling_module(siblings[sibling]), siblings=siblings)[0]
+            problems += [f"{file}: the probe {sibling} has no name {name} at its top level" for name in names if name != "*" and name not in held]
+    return list(dict.fromkeys(problems))
 
 
 def closure(source: Source, entries: Sequence[str]) -> Closure:

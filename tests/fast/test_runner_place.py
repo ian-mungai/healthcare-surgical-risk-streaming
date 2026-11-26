@@ -35,6 +35,22 @@ LOCK_TEXT = "pyyaml==6.0.3 \\\n    --hash=sha256:" + "0" * 64 + "\n"
 GROUP_TEXT = "runner_checkout_requirements:\n  - requirements.txt\n"
 FIRST = "tests/e2e/silver_signals.py"
 SECOND = "tests/e2e/silver_hypotension.py"
+PROBE_FOLDER = "tests/e2e/stream_stack"
+# The Git-ignored files of the probe folder that the streaming host runner needs on the host.
+STACK_FILES = tuple(
+    f"{PROBE_FOLDER}/{name}"
+    for name in (
+        "batch_features.py",
+        "batch_oracle.py",
+        "plant_late.py",
+        "read_bounds.py",
+        "read_lake.py",
+        "read_ready.py",
+        "replay_fault.py",
+        "compose.host.yml",
+    )
+)
+OVERLAY_TEXT = "services:\n  replay:\n    image: ${REPLAY_IMAGE:?name the replay image}\n"
 
 
 def completed(code: int, out: str = "") -> CompletedProcess[str]:
@@ -105,6 +121,18 @@ class Host:
         return completed(0, f"{sent}  {relative}\n")
 
 
+class BoundedSource(runner_imports.DiskSource):
+    """The files on disk, with a limit on the reads: a read of a cycle that does not end fails the test and does not hang it."""
+
+    reads = 0
+
+    def read(self, relative: str) -> str | None:
+        self.reads += 1
+        if self.reads > 100:
+            raise AssertionError("the probes that take from each other were read again and again")
+        return super().read(relative)
+
+
 class RepositoryCase(TemporaryRepository):
     def setUp(self) -> None:
         super().setUp()
@@ -162,7 +190,7 @@ class RefusalTest(RepositoryCase):
             "requirements.txt",
             "tests/e2e/*.py",
         ):
-            with self.subTest(relative=relative), self.assertRaisesRegex(HostError, "not one Python runner"):
+            with self.subTest(relative=relative), self.assertRaisesRegex(HostError, "not one runner file"):
                 self.read(relative)
         self.assertEqual("", self.shown.getvalue())
 
@@ -418,6 +446,318 @@ class ImportCheckTest(RepositoryCase):
             self.place(Host(), [FIRST])
 
 
+class ProbeFolderCase(RepositoryCase):
+    def setUp(self) -> None:
+        super().setUp()
+        with (self.repo / ".gitignore").open("a") as handle:
+            handle.write(f"{PROBE_FOLDER}/*\n!{PROBE_FOLDER}/tracked_probe.py\n!{PROBE_FOLDER}/visible.yml\n")
+        (self.repo / PROBE_FOLDER).mkdir()
+        (self.repo / PROBE_FOLDER / "tracked_probe.py").write_text("print('tracked')\n")
+        (self.repo / "scripts" / "takes_image_package.py").write_text("import fastavro\n\nVALUE = 1\n")
+        self.commit_files(".gitignore", f"{PROBE_FOLDER}/tracked_probe.py", "scripts/takes_image_package.py")
+        (self.repo / PROBE_FOLDER / "visible.yml").write_text(OVERLAY_TEXT)
+        for relative in STACK_FILES:
+            self.probe(relative.rsplit("/", 1)[1], self.stack_text(relative))
+
+    @staticmethod
+    def stack_text(relative: str) -> str:
+        return OVERLAY_TEXT if relative.endswith(".yml") else f"{RUNNER_TEXT}# {relative.rsplit('/', 1)[1]}\n"
+
+    def commit_files(self, *names: str) -> None:
+        self.git("add", *names)
+        self.git("commit", "--quiet", "-m", "chore: more of the fixture")
+        self.commit = self.git("rev-parse", "HEAD").stdout.strip()
+
+    def probe(self, name: str, text: str) -> str:
+        (self.repo / PROBE_FOLDER / name).write_text(text)
+        return f"{PROBE_FOLDER}/{name}"
+
+    def place(self, host: Host, names: Sequence[str]) -> runner_place.Placement:
+        return runner_place.place("run", "host.example.invalid", self.commit, names, root=self.repo, env=self.env, run=host, ssh_options=OPTIONS)
+
+
+class ProbeFolderTest(ProbeFolderCase):
+    """The Git-ignored files directly under ``tests/e2e/stream_stack/``: the probes (``.py``) and the Compose overlay (``.yml``)."""
+
+    def test_each_file_that_the_streaming_runner_needs_from_the_probe_folder_is_placed_with_its_hash(self) -> None:
+        for relative in STACK_FILES:
+            with self.subTest(relative=relative):
+                host = Host()
+                placement = self.place(host, [relative])
+                self.assertEqual({relative: digest(self.stack_text(relative))}, placement.placed)
+                self.assertEqual([self.stack_text(relative)], [call[2] for call in host.files()])
+
+    def test_the_eight_go_in_one_call_beside_a_runner_and_the_record_holds_the_nested_paths_which_a_later_call_keeps(self) -> None:
+        host = Host()
+        self.place(host, list(STACK_FILES))
+        placement = self.place(host, [FIRST])
+        files = {relative: digest(self.stack_text(relative)) for relative in STACK_FILES} | {FIRST: digest(RUNNER_TEXT)}
+        self.assertEqual({"commit": self.commit, "files": dict(sorted(files.items()))}, json.loads(host.record))
+        self.assertEqual(files, placement.record)
+        checked = shlex.split(re.findall(r"for f in (.*?); do", host.commands("for f in")[0])[0])
+        self.assertEqual(sorted(STACK_FILES), checked, "each kept file of the probe folder is hashed on the host")
+
+    def test_a_deeper_folder_another_folder_another_suffix_and_an_odd_name_are_refused_even_when_the_file_is_there_and_ignored(self) -> None:
+        for relative in (
+            f"{PROBE_FOLDER}/deeper/probe.py",
+            f"{PROBE_FOLDER}/deeper/compose.host.yml",
+            "tests/e2e/other_stack/probe.py",
+            "tests/e2e/other_stack/compose.host.yml",
+            "tests/e2e/compose.host.yml",
+            "tests/e2e/overlay.yml",
+            "tests/fast/stream_stack/probe.py",
+            "stream_stack/probe.py",
+            f"{PROBE_FOLDER}/probe.sh",
+            f"{PROBE_FOLDER}/probe.json",
+            f"{PROBE_FOLDER}/compose.host.yaml",
+            f"{PROBE_FOLDER}/probe.py.bak",
+            f"{PROBE_FOLDER}/dotted.probe.py",
+            f"{PROBE_FOLDER}/compose..yml",
+            f"{PROBE_FOLDER}/compose.host..yml",
+            f"{PROBE_FOLDER}/.hidden.yml",
+            f"{PROBE_FOLDER}/Compose.yml",
+            f"{PROBE_FOLDER}/compose.host.yml ",
+            f"{PROBE_FOLDER}/compose host.yml",
+            f"{PROBE_FOLDER}/../stream_stack/read_lake.py",
+            f"{PROBE_FOLDER}/",
+            f"{PROBE_FOLDER}/*.py",
+        ):
+            if ".." not in relative.split("/") and not relative.endswith("/") and "*" not in relative:
+                (self.repo / relative).parent.mkdir(parents=True, exist_ok=True)
+                (self.repo / relative).write_text(RUNNER_TEXT)
+            with self.subTest(relative=relative), self.assertRaisesRegex(HostError, "not one runner file"):
+                self.read(relative)
+
+    def test_a_tracked_file_and_a_file_that_git_does_not_ignore_in_the_probe_folder_are_refused(self) -> None:
+        with self.assertRaisesRegex(HostError, "already in the commit"):
+            self.read(f"{PROBE_FOLDER}/tracked_probe.py")
+        with self.assertRaisesRegex(HostError, "not ignored by Git"):
+            self.read(f"{PROBE_FOLDER}/visible.yml")
+
+    def test_a_link_a_hard_link_and_a_linked_probe_folder_are_refused(self) -> None:
+        folder = self.repo / PROBE_FOLDER
+        (folder / "link.yml").symlink_to(folder / "compose.host.yml")
+        with self.assertRaisesRegex(HostError, "not a plain file"):
+            self.read(f"{PROBE_FOLDER}/link.yml")
+        os.link(folder / "compose.host.yml", folder / "second.yml")
+        with self.assertRaisesRegex(HostError, "more than one name"):
+            self.read(f"{PROBE_FOLDER}/second.yml")
+        moved = self.repo / "moved_stack"
+        folder.rename(moved)
+        folder.symlink_to(moved)
+        with self.assertRaisesRegex(HostError, "not a plain file"):
+            self.read(f"{PROBE_FOLDER}/read_lake.py")
+
+    def test_an_overlay_gets_the_privacy_scan_and_the_credential_scan_over_its_bytes(self) -> None:
+        private = self.probe("private.yml", "owner: someone" + "@personal-domain.net\n")
+        with self.assertRaisesRegex(HostError, "personal or environment-specific data"):
+            self.read(private)
+        self.assertIn(f"{private}:1: email address", self.shown.getvalue())
+        keyed = self.probe("keyed.yml", f"token: '{token()}'\n")
+        with self.assertRaisesRegex(HostError, "credential scanner found a possible secret"):
+            self.read(keyed)
+
+
+class ProbeImportTest(ProbeFolderCase):
+    """The probes run in the replay and Spark images. Their imports are resolved against the commit, but what the repository's own modules take comes from the
+    image, so the host's lock files are not asked for it."""
+
+    def refused(self, names: Sequence[str]) -> str:
+        host = Host()
+        with self.assertRaisesRegex(HostError, "the runner checkout would not hold"):
+            self.place(host, names)
+        self.assertEqual([], host.calls, "nothing is sent")
+        return self.shown.getvalue()
+
+    def test_a_package_that_a_probe_reaches_through_a_repository_module_comes_from_the_image_and_is_not_asked_of_the_hosts_lock(self) -> None:
+        name = self.probe("reaches.py", "from scripts.takes_image_package import VALUE\n")
+        self.assertEqual([name], list(self.place(Host(), [name]).placed))
+
+    def test_a_host_runner_that_reaches_the_same_module_is_still_refused_even_in_one_call_with_the_probe(self) -> None:
+        name = self.probe("reaches.py", "from scripts.takes_image_package import VALUE\n")
+        self.write("host_reaches", "from scripts.takes_image_package import VALUE\n")
+        for names in ([name, "tests/e2e/host_reaches.py"], ["tests/e2e/host_reaches.py", name]):
+            with self.subTest(names=names):
+                self.assertRegex(self.refused(names), r"fastavro: .*imported by scripts/takes_image_package\.py")
+
+    def test_a_package_that_a_probe_names_itself_must_be_pinned_as_for_a_runner(self) -> None:
+        name = self.probe("takes_boto.py", "import json\nimport yaml\n\ndef later():\n    import boto3\n")
+        shown = self.refused([name])
+        self.assertRegex(shown, rf"boto3: .*imported by {name}\)")
+        self.assertNotIn("yaml:", shown)
+
+    def test_a_probe_imports_another_probe_of_the_same_call_and_one_that_the_call_does_not_hold_is_refused(self) -> None:
+        user = self.probe("user_probe.py", "from batch_oracle import CaseBatch\n")
+        oracle = self.probe("batch_oracle.py", "class CaseBatch:\n    pass\n")
+        self.assertEqual(2, len(self.place(Host(), [user, oracle]).placed))
+        self.assertRegex(self.refused([user]), rf"batch_oracle: .*imported by {user}\)")
+
+    def test_each_kind_of_name_at_the_top_level_of_a_sibling_probe_can_be_taken_from_it(self) -> None:
+        oracle = self.probe(
+            "batch_oracle.py",
+            "from json import dumps\nimport yaml as loader\nfrom scripts.takes_image_package import *\nLIMIT: int = 3\nfirst, second = 1, 2\n"
+            "try:\n    GUARDED = 1\nexcept ValueError:\n    pass\n\ndef build():\n    pass\n\nclass CaseBatch:\n    pass\n",
+        )
+        user = self.probe(
+            "user_probe.py",
+            "import batch_oracle\nimport batch_oracle as oracle\nfrom batch_oracle import *\n"
+            "from batch_oracle import CaseBatch, build as make, dumps, loader, LIMIT, first, second, GUARDED, VALUE\n",
+        )
+        self.assertEqual(2, len(self.place(Host(), [user, oracle]).placed))
+
+    def test_a_name_that_the_sibling_probe_does_not_hold_at_its_top_level_is_refused(self) -> None:
+        oracle = self.probe("batch_oracle.py", "VALUE = 1\n\ndef build():\n    in_a_function = 1\n\nclass Holder:\n    in_a_class = 1\n")
+        for name, text in (
+            ("CaseBatch", "from batch_oracle import CaseBatch\n"),
+            ("CaseBatch", "from batch_oracle import VALUE, CaseBatch\n"),
+            ("in_a_function", "from batch_oracle import in_a_function\n"),
+            ("in_a_class", "from batch_oracle import in_a_class\n"),
+            ("CaseBatch", "def later():\n    from batch_oracle import CaseBatch\n"),
+        ):
+            with self.subTest(text=text):
+                user = self.probe("user_probe.py", text)
+                self.assertIn(f"{user}: the probe batch_oracle has no name {name} at its top level\n", self.refused([user, oracle]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def assert_each_name_is_refused(self, cases: Sequence[tuple[str, str]]) -> None:
+        """Each case is the text of ``batch_oracle`` and the name that another probe cannot take from it."""
+        for text, name in cases:
+            with self.subTest(text=text):
+                oracle = self.probe("batch_oracle.py", text)
+                user = self.probe("user_probe.py", f"from batch_oracle import {name}\n")
+                self.assertIn(f"{user}: the probe batch_oracle has no name {name} at its top level\n", self.refused([user, oracle]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_an_annotation_without_a_value_defines_no_name_that_another_probe_can_take(self) -> None:
+        self.assert_each_name_is_refused([("VALUE: int\n", "VALUE"), ("if True:\n    VALUE: int\n", "VALUE")])
+
+    def test_a_name_that_a_direct_del_removes_at_the_top_level_cannot_be_taken_from_the_probe(self) -> None:
+        self.assert_each_name_is_refused(
+            [
+                ("VALUE = 1\ndel VALUE\n", "VALUE"),
+                ("first, second = 1, 2\ndel (first, second)\n", "second"),
+                ("first, second = 1, 2\ndel second, first\n", "first"),
+                ("import json\ndel json\n", "json"),
+                ("def build():\n    pass\n\ndel build\n", "build"),
+                ("if True:\n    VALUE = 1\ndel VALUE\n", "VALUE"),
+                ("VALUE = 1\ndel VALUE\nVALUE: int\n", "VALUE"),
+            ]
+        )
+
+    def test_a_name_that_stays_bound_after_an_annotation_or_a_del_can_be_taken_from_the_probe(self) -> None:
+        oracle = self.probe(
+            "batch_oracle.py",
+            "again = 1\ndel again\nagain = 2\nkept = 1\nkept: int\nholder = {'a': 1}\ndel holder['a']\nowner = type('Owner', (), {'a': 1})\ndel owner.a\n"
+            "unmoved = 1\nif not unmoved:\n    del unmoved\n\ndef later():\n    global unmoved\n    del unmoved\n",
+        )
+        user = self.probe("user_probe.py", "from batch_oracle import again, kept, holder, owner, unmoved\n")
+        self.assertEqual(2, len(self.place(Host(), [user, oracle]).placed))
+
+    def test_a_probe_passes_on_the_names_that_it_takes_from_another_probe_by_a_star_or_by_name(self) -> None:
+        for oracle_text, helper_text, taken in (
+            ("VALUE = 1\n", "from batch_oracle import *\n", "VALUE"),
+            ("VALUE = 1\n", "from batch_oracle import VALUE\n", "VALUE"),
+            ("VALUE = 1\n", "from batch_oracle import VALUE as renamed\n", "renamed"),
+            ("__all__ = ['listed', '_named']\nlisted = 1\n_named = 2\n", "from batch_oracle import *\n", "listed, _named"),
+            ("__all__: tuple[str, ...] = ('listed',)\nlisted = 1\n", "from batch_oracle import *\n", "listed"),
+            ("__all__ = ['listed']\ndel __all__\nVALUE = 1\n", "from batch_oracle import *\n", "VALUE"),
+            ("from scripts.takes_image_package import *\n", "from batch_oracle import *\n", "VALUE"),
+        ):
+            with self.subTest(oracle=oracle_text, helper=helper_text):
+                oracle = self.probe("batch_oracle.py", oracle_text)
+                helper = self.probe("batch_helper.py", helper_text)
+                user = self.probe("user_probe.py", f"from batch_helper import {taken}\n")
+                self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
+
+    def test_a_star_from_another_probe_passes_on_only_what_python_would_take(self) -> None:
+        for oracle_text, name in (
+            ("VALUE = 1\n", "MISSING"),
+            ("_private = 1\n", "_private"),
+            ("__all__ = ['listed']\nlisted = 1\nunlisted = 2\n", "unlisted"),
+            ("__all__ = ['never_bound']\n", "never_bound"),
+            ("VALUE: int\n", "VALUE"),
+            ("VALUE = 1\ndel VALUE\n", "VALUE"),
+            ("__all__ = ['listed']\n__all__ += ['added']\nlisted = 1\nadded = 2\n", "listed"),
+            ("__all__ = ['listed']\n__all__.remove('listed')\nlisted = 1\n", "listed"),
+            ("names = ['listed']\n__all__ = names\nlisted = 1\n", "listed"),
+            ("if True:\n    __all__ = ['listed']\nlisted = 1\n", "listed"),
+        ):
+            with self.subTest(oracle=oracle_text, name=name):
+                oracle = self.probe("batch_oracle.py", oracle_text)
+                helper = self.probe("batch_helper.py", "from batch_oracle import *\n")
+                user = self.probe("user_probe.py", f"from batch_helper import {name}\n")
+                self.assertIn(f"{user}: the probe batch_helper has no name {name} at its top level\n", self.refused([user, helper, oracle]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_the_all_of_a_repository_module_does_not_limit_what_a_probe_that_takes_its_star_passes_on(self) -> None:
+        (self.repo / "scripts" / "listing.py").write_text("__all__ = ['LISTED']\nLISTED = 1\n")
+        self.commit_files("scripts/listing.py")
+        oracle = self.probe("batch_oracle.py", "from scripts.listing import *\nVALUE = 1\n")
+        helper = self.probe("batch_helper.py", "from batch_oracle import *\n")
+        user = self.probe("user_probe.py", "from batch_helper import LISTED, VALUE\n")
+        self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
+
+    def test_probes_that_take_a_star_from_each_other_are_read_once_each_and_the_read_ends(self) -> None:
+        oracle = self.probe("batch_oracle.py", "from batch_helper import *\nVALUE = 1\n")
+        helper = self.probe("batch_helper.py", "from batch_oracle import *\nfrom batch_helper import *\n")
+        user = self.probe("user_probe.py", "from batch_helper import VALUE, MISSING\n")
+        siblings = {Path(name).stem: name for name in (user, helper, oracle)}
+        problems = runner_imports.sibling_problems(BoundedSource(self.repo), siblings)
+        self.assertEqual([f"{user}: the probe batch_helper has no name MISSING at its top level"], problems)
+        user = self.probe("user_probe.py", "from batch_helper import VALUE\n")
+        self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
+
+    def test_a_star_import_from_outside_the_repository_lists_no_name_that_another_probe_can_take(self) -> None:
+        oracle = self.probe("batch_oracle.py", "from json import *\n\ndef __getattr__(name):\n    return name\n")
+        user = self.probe("user_probe.py", "from batch_oracle import dumps\n")
+        self.assertIn(f"{user}: the probe batch_oracle has no name dumps at its top level\n", self.refused([user, oracle]))
+
+    def test_a_submodule_of_a_sibling_probe_is_refused_because_a_probe_is_a_module_and_not_a_package(self) -> None:
+        oracle = self.probe("batch_oracle.py", "VALUE = 1\n")
+        for module, text in (
+            ("batch_oracle.missing", "import batch_oracle.missing\n"),
+            ("batch_oracle.VALUE", "import batch_oracle.VALUE as value\n"),
+            ("batch_oracle.missing", "from batch_oracle.missing import VALUE\n"),
+            ("batch_oracle.missing", "def later():\n    import batch_oracle.missing\n"),
+        ):
+            with self.subTest(text=text):
+                user = self.probe("user_probe.py", text)
+                self.assertIn(f"{user}: {module} cannot be imported: the probe batch_oracle is a module, not a package\n", self.refused([user, oracle]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_the_sibling_probes_own_imports_are_checked_too(self) -> None:
+        self.probe("batch_oracle.py", "import boto3\n")
+        user = self.probe("user_probe.py", "import batch_oracle\n")
+        shown = self.refused([user, f"{PROBE_FOLDER}/batch_oracle.py"])
+        self.assertRegex(shown, rf"boto3: .*imported by {PROBE_FOLDER}/batch_oracle\.py\)")
+        self.assertNotIn("batch_oracle: ", shown)
+
+    def test_a_host_runner_cannot_take_a_probe_by_the_name_that_only_the_containers_have(self) -> None:
+        self.write("takes_sibling", "import batch_oracle\n")
+        shown = self.refused(["tests/e2e/takes_sibling.py", f"{PROBE_FOLDER}/batch_oracle.py"])
+        self.assertRegex(shown, r"batch_oracle: .*imported by tests/e2e/takes_sibling\.py\)")
+
+    def test_a_probe_with_a_missing_repository_module_a_broken_text_or_a_load_at_run_time_is_refused(self) -> None:
+        for name, text, line in (
+            ("gone.py", "from scripts.gone import thing\n", "scripts.gone has no file"),
+            ("broken.py", "def (:\n", "the file is not valid Python"),
+            ("loads.py", "import importlib\nimportlib.import_module('x')\n", "loads a module at run time"),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(line, self.refused([self.probe(name, text)]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_an_overlay_is_not_read_as_python(self) -> None:
+        overlay = f"{PROBE_FOLDER}/compose.host.yml"
+        self.probe("compose.host.yml", "services:\n  - not: [python\n")
+        self.assertEqual([overlay], list(self.place(Host(), [overlay]).placed))
+
+
 class PlacementTest(RepositoryCase):
     def place(self, host: Host, names: list[str] | None = None) -> dict[str, str]:
         return runner_place.place(
@@ -556,6 +896,8 @@ class PlacedRecordTest(RepositoryCase):
             "path outside tests/e2e": json.dumps({"commit": self.commit, "files": {"../x.py": "1" * 64}}),
             "the manifest": json.dumps({"commit": self.commit, "files": {"runner_manifest.json": "1" * 64}}),
             "short hash": json.dumps({"commit": self.commit, "files": {"tests/e2e/a.py": "1"}}),
+            "a deeper path": json.dumps({"commit": self.commit, "files": {"tests/e2e/stream_stack/deeper/a.py": "1" * 64}}),
+            "an overlay outside the probe folder": json.dumps({"commit": self.commit, "files": {"tests/e2e/a.yml": "1" * 64}}),
         }
         for name, record in bad.items():
             with self.subTest(record=name):
@@ -578,7 +920,7 @@ class PlacedRecordTest(RepositoryCase):
             "placed_runners.json",
             "tests/e2e/placed_runners.py/../../runner_manifest.json",
         ):
-            with self.subTest(relative=relative), self.assertRaisesRegex(HostError, "not one Python runner"):
+            with self.subTest(relative=relative), self.assertRaisesRegex(HostError, "not one runner file"):
                 self.read(relative)
 
     def test_the_names_are_the_ones_the_role_writes(self) -> None:
@@ -810,6 +1152,39 @@ class RemoteCommandTest(unittest.TestCase):
         (self.folder / "tests" / "e2e").write_text("a file\n")
         self.assertEqual(runner_place.LINKED_CODE, self.send().returncode)
 
+    def test_the_probe_folder_is_made_for_its_owner_only_and_its_files_are_hashed_again_there(self) -> None:
+        overlay = f"{PROBE_FOLDER}/compose.host.yml"
+        result = self.send(overlay, OVERLAY_TEXT)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(f"{digest(OVERLAY_TEXT)} {overlay}", " ".join(result.stdout.split()))
+        self.assertEqual(0o700, stat.S_IMODE((self.folder / PROBE_FOLDER).stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE((self.folder / overlay).stat().st_mode))
+        self.assertEqual([runner_place.MARKER], self.leftovers())
+        check = runner_place.verify_retained_command(self.COMMIT, [overlay], str(self.directory))
+        self.assertEqual(f"{digest(OVERLAY_TEXT)} {overlay}", " ".join(self.run_remote(check).stdout.split()))
+
+    def test_a_linked_probe_folder_and_a_file_in_its_place_stop_the_command_before_anything_is_written(self) -> None:
+        probe_folder = self.folder / PROBE_FOLDER
+        self.outside.joinpath("kept").mkdir()
+
+        def link_to_a_folder() -> None:
+            probe_folder.symlink_to(self.outside / "kept")
+
+        def link_to_nothing() -> None:
+            probe_folder.symlink_to(self.outside / "absent")
+
+        def file_in_its_place() -> None:
+            probe_folder.write_text("a file\n")
+
+        for name, make in (("a link", link_to_a_folder), ("a link to nothing", link_to_nothing), ("a file", file_in_its_place)):
+            with self.subTest(case=name):
+                self.reset()
+                self.outside.joinpath("kept").mkdir(exist_ok=True)
+                make()
+                result = self.send(f"{PROBE_FOLDER}/read_lake.py")
+                self.assertEqual((runner_place.LINKED_CODE, runner_place.LINKED_WORD), (result.returncode, result.stdout.strip()), result.stderr)
+                self.assertEqual([], self.written_outside())
+
     def test_the_record_is_received_closed_to_read_only_and_a_link_at_its_name_is_replaced(self) -> None:
         victim = self.outside / "victim.txt"
         victim.write_text("untouched\n")
@@ -843,6 +1218,78 @@ class RemoteCommandTest(unittest.TestCase):
         (self.folder / FIRST).symlink_to(self.outside / "elsewhere.json")
         result = self.run_remote(check)
         self.assertEqual((runner_place.RETAINED_CODE, runner_place.RETAINED_WORD), (result.returncode, result.stdout.strip()))
+
+    def check_kept(self, *relatives: str) -> CompletedProcess[str]:
+        return self.run_remote(runner_place.verify_retained_command(self.COMMIT, relatives, str(self.directory)))
+
+    def test_a_kept_runner_below_a_linked_folder_or_a_file_in_a_folders_place_stops_the_check_before_a_hash_is_given(self) -> None:
+        probe = f"{PROBE_FOLDER}/read_lake.py"
+        elsewhere = self.outside / "elsewhere"
+
+        def link_to_the_moved_folder(folder: Path) -> None:
+            folder.rename(elsewhere)
+            folder.symlink_to(elsewhere)
+
+        def link_to_nothing(folder: Path) -> None:
+            shutil.rmtree(folder)
+            folder.symlink_to(elsewhere)
+
+        def file_in_its_place(folder: Path) -> None:
+            shutil.rmtree(folder)
+            folder.write_text("a file\n")
+
+        for relative in ("tests", "tests/e2e", PROBE_FOLDER):
+            for name, make in (("moved", link_to_the_moved_folder), ("a link to nothing", link_to_nothing), ("a file", file_in_its_place)):
+                with self.subTest(folder=relative, case=name):
+                    self.reset()
+                    self.assertEqual(0, self.send(probe).returncode)
+                    make(self.folder / relative)
+                    result = self.check_kept(probe)
+                    self.assertEqual((runner_place.LINKED_CODE, runner_place.LINKED_WORD), (result.returncode, result.stdout.strip()), result.stderr)
+
+    def test_a_linked_probe_folder_stops_the_check_when_a_runner_outside_it_is_kept_first(self) -> None:
+        probe = f"{PROBE_FOLDER}/read_lake.py"
+        self.assertEqual(0, self.send().returncode)
+        self.assertEqual(0, self.send(probe).returncode)
+        (self.folder / PROBE_FOLDER).rename(self.outside / "elsewhere")
+        (self.folder / PROBE_FOLDER).symlink_to(self.outside / "elsewhere")
+        result = self.check_kept(FIRST, probe)
+        self.assertEqual((runner_place.LINKED_CODE, runner_place.LINKED_WORD), (result.returncode, result.stdout.strip()), result.stderr)
+
+    def test_a_kept_probe_that_is_a_link_a_folder_or_missing_or_whose_folder_is_missing_stops_the_check(self) -> None:
+        probe = f"{PROBE_FOLDER}/read_lake.py"
+        same_bytes = self.outside / "same_bytes.py"
+
+        def link_to_the_same_bytes() -> None:
+            same_bytes.write_text(RUNNER_TEXT)
+            (self.folder / probe).symlink_to(same_bytes)
+
+        def link_to_nothing() -> None:
+            (self.folder / probe).symlink_to(self.outside / "absent")
+
+        def folder_in_its_place() -> None:
+            (self.folder / probe).mkdir()
+
+        def folder_gone() -> None:
+            (self.folder / PROBE_FOLDER).rmdir()
+
+        cases = {
+            "a link to the same bytes": link_to_the_same_bytes,
+            "a link to nothing": link_to_nothing,
+            "a folder": folder_in_its_place,
+            "missing": lambda: None,
+            "no probe folder": folder_gone,
+        }
+        for name, make in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.assertEqual(0, self.send().returncode)
+                self.assertEqual(0, self.send(probe).returncode)
+                (self.folder / probe).unlink()
+                make()
+                result = self.check_kept(FIRST, probe)
+                self.assertEqual((runner_place.RETAINED_CODE, runner_place.RETAINED_WORD), (result.returncode, result.stdout.strip()), result.stderr)
+                self.assertEqual(name != "no probe folder", (self.folder / PROBE_FOLDER).is_dir(), "the check makes no folder")
 
 
 class MakeTargetTest(unittest.TestCase):
@@ -898,7 +1345,7 @@ class MakeTargetTest(unittest.TestCase):
         self.assertEqual(["tests/e2e/a.py", "tests/e2e/*.py", "$(x)"], names)
         self.assertEqual([], runner_place.runner_names(arguments, {}))
         for name in names[1:]:
-            with self.subTest(name=name), self.assertRaisesRegex(HostError, "not one Python runner"):
+            with self.subTest(name=name), self.assertRaisesRegex(HostError, "not one runner file"):
                 runner_place.runner_text(name, "a" * 40)
         with self.assertRaisesRegex(HostError, "not both"):
             runner_place.runner_names(argparse.Namespace(names_from_environment=True, runners=["x"]), {variable: "y"})
