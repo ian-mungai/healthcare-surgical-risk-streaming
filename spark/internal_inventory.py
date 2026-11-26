@@ -361,13 +361,13 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     ),
     "scripts/ingestion/table_checks.py": (
         "LoadRecord", "MergeCommit", "MergeNotFound", "MergeOutcomeOpen", "Outcome", "Pending", "RunnerReply", "SearchTimeout", "Staged",
-        "StaleBaseError", "TableChecksError", "Timing", "attempt_evidence", "branch_line", "build_plan", "check_pin", "clear_pending", "closed",
-        "compose_runner", "confirm_load", "confirm_main", "deadline_for", "default_branch", "document", "drop_unfixed_output", "history_page",
-        "keep_output", "load_lock", "lock_path", "main_head", "manifest_line", "merge_branch", "merged_commit", "open_message", "output_problem",
-        "output_text", "parent_namespaces", "parse_load_record", "pending_path", "read_pending", "read_result", "read_track_pin", "receipt",
-        "record_merge", "reference_contents", "remove_staged", "require_base", "run_locked", "run_table_checks", "saved_result", "secure", "shown",
-        "source_line", "stage_verified_files", "start", "table_snapshot", "usable_checks", "wait_for_merge", "without_old_checks", "write_pending",
-        "write_plan", "write_result", "written_by_keep_output",
+        "StaleBaseError", "TableChecksError", "Timing", "arguments", "attempt_evidence", "branch_line", "build_plan", "check_pin", "clear_pending",
+        "closed", "compose_runner", "confirm_load", "confirm_main", "deadline_for", "default_branch", "document", "drop_unfixed_output",
+        "history_page", "keep_output", "load_lock", "lock_path", "main_head", "manifest_line", "merge_branch", "merged_commit", "open_message",
+        "output_problem", "output_text", "parent_namespaces", "parse_load_record", "pending_path", "read_pending", "read_result", "read_track_pin",
+        "receipt", "record_merge", "reference_contents", "remove_staged", "require_base", "run_locked", "run_table_checks", "saved_result", "secure",
+        "shown", "source_line", "stage_verified_files", "start", "table_snapshot", "usable_checks", "wait_for_merge", "without_old_checks",
+        "write_pending", "write_plan", "write_result", "written_by_keep_output",
     ),
     "scripts/ingestion/track_list.py": (
         "PinnedTrackList", "TrackListPinError", "TrackListRowError", "file_problems", "main", "pinned_track_list", "row_text", "rows_digest",
@@ -444,11 +444,11 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "summarize", "write_record",
     ),
     "scripts/stack/groups.py": (
-        "Group", "GroupError", "GroupWaits", "ServiceState", "Settings", "StartResult", "WorkloadControl", "admit", "check_stoppable",
-        "compose_arguments", "describe_states", "docker", "find_group", "groups_of", "limits_file", "main", "no_log", "parse_inspect", "parser",
-        "profile_of", "project_name", "read_states", "ready", "rendered_environment", "require_control", "running", "running_services", "say",
-        "settings_from_environment", "start", "start_compose", "start_group", "stop", "stop_arguments", "stop_compose", "stop_group", "up_arguments",
-        "wait_ready", "whole_number",
+        "Group", "GroupError", "GroupWaits", "ServiceState", "Settings", "SparkGroupRefused", "StartResult", "WorkloadControl", "admit",
+        "check_stoppable", "compose_arguments", "describe_states", "docker", "find_group", "groups_of", "limits_file", "main", "no_log",
+        "parse_inspect", "parser", "profile_of", "project_name", "read_states", "ready", "refuse_spark_group", "rendered_environment",
+        "require_control", "running", "running_services", "say", "settings_from_environment", "start", "start_compose", "start_group", "stop",
+        "stop_arguments", "stop_compose", "stop_group", "up_arguments", "wait_ready", "whole_number",
     ),
     "scripts/stack/groups_k3s.py": (
         "HttpsTransport", "KubernetesConfig", "KubernetesControl", "PinnedConnection", "Transport", "__init__", "authorization",
@@ -461,6 +461,9 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "scripts/stack/host_figures.py": (
         "CpuTimes", "DiskCounters", "FiguresError", "HostReading", "HostSources", "Memory", "device_of", "free_disk_mib", "meminfo_figure",
         "parse_cpu_times", "parse_diskstats", "parse_meminfo", "parse_size_bytes", "read_host", "read_source",
+    ),
+    "scripts/stack/job_workloads.py": (
+        "JobWorkloadError", "job_command", "profile_of_job", "refusal_of", "service_of", "workload_of",
     ),
     "scripts/stack/k3s_limits.py": (
         "Setting", "chart_problems", "check_chart", "descend", "dotted", "dump", "entry_problems", "exposure_problems", "figure", "has_memory",
@@ -477,6 +480,14 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "Initialised", "NessieClient", "NessieConflict", "NessieError", "PlainText", "Reference", "__init__", "assign_branch", "call_timeout",
         "commit", "config", "create_branch", "create_reference", "create_tag", "decode", "delete_reference", "entries", "has_namespace", "initialise",
         "main", "merge", "put_namespace", "reference", "reference_from", "request", "send",
+    ),
+    "scripts/stack/spark_run.py": (
+        "main", "parser", "positive_seconds",
+    ),
+    "scripts/stack/spark_slot.py": (
+        "SlotBusy", "SlotContainer", "SlotError", "busy_message", "call", "checked_wait", "clear_owned", "end_owned", "finite_seconds", "holder_text",
+        "local_docker", "lost_the_name", "new_owner", "read_seconds", "refused_by_name", "remove_owned", "require_free", "run_in_slot", "run_owned",
+        "settle_owned", "slot_container", "slot_options", "spark_holders",
     ),
     "scripts/stack/staging_walk.py": (
         "exists", "expand_pattern", "main", "read_staging",
@@ -641,9 +652,12 @@ INVENTORY: dict[str, tuple[str, ...]] = {
     "spark/jobs/table_maintenance.py": (
         "compact", "iceberg_table", "main", "maintain", "open_pins", "read_tagged", "refuse", "refuse_unsafe_tables", "row_dict",
     ),
+    "spark/launcher.py": (
+        "main", "refuse",
+    ),
     "spark/maintenance.py": (
-        "QuietParser", "RetentionError", "__init__", "compare_reads", "compare_tags", "error", "finite_seconds", "in_flight_branches", "parse",
-        "parser", "public_reads", "sealed_report", "table_argument", "table_identifier",
+        "QuietParser", "RetentionError", "__init__", "compare_reads", "compare_tags", "error", "finite_seconds", "in_flight_branches", "namespace_of",
+        "parse", "parser", "public_reads", "sealed_report", "select_tables", "table_argument", "table_identifier",
     ),
     "spark/preconditions.py": (
         "precondition_problems",

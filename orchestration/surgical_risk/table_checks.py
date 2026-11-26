@@ -21,6 +21,8 @@ from scripts.stack.groups import settings_from_environment
 from scripts.stack.nessie import NessieClient
 from spark.table_checks import EMPTY_FORM
 
+from .concurrency import job_tags
+
 JOB = "table_checks_job"
 DEFAULT_DEADLINE_SECONDS = 2400.0
 NESSIE_TIMEOUT_SECONDS = 60.0
@@ -74,7 +76,7 @@ def table_checks_step(context: OpExecutionContext, config: TableChecksConfig) ->
     context.log.info(f"every check passed; {record.branch} merged into {outcome.document['merged_into']} at {outcome.document['merged_hash']}")
 
 
-@job(executor_def=in_process_executor)
+@job(executor_def=in_process_executor, tags=job_tags(JOB))
 def table_checks_job() -> None:
     table_checks_step()
 

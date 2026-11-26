@@ -100,7 +100,7 @@ CHECKOUT_FILES = {
 CHECKOUT_IMAGE_FILES = "".join(f"{blob_of(CHECKOUT_FILES[path])} {path}\n" for path in ("scripts/stack/nessie.py", "spark/jobs/x.py", "spark/silver/y.py"))
 
 # Settings of the deployed stack and of Compose that a caller may have exported. None of them may reach a call of the run.
-BOUND = {"WAREHOUSE_LOCATION", "NESSIE_URI", "AWS_REGION", "POSTGRES_HOST_PORT", "MEM_LIMIT_SPARK"}
+BOUND = {"WAREHOUSE_LOCATION", "NESSIE_URI", "AWS_REGION", "POSTGRES_HOST_PORT", "MEM_LIMIT_SPARK_SILVER"}
 DEPLOYED = {
     "WAREHOUSE_LOCATION": "s3://deployed/warehouse",
     "NESSIE_URI": "http://deployed:19120/api/v2",
@@ -109,7 +109,7 @@ DEPLOYED = {
     "COMPOSE_PROJECT_NAME": "deployed",
     "COMPOSE_FILE": "/deployed/compose.yml",
     "COMPOSE_PROFILES": "all",
-    "MEM_LIMIT_SPARK": "1m",
+    "MEM_LIMIT_SPARK_SILVER": "1m",
     "SPARK_IMAGE": "deployed:1",
     "POSTGRES_HOST_PORT": "5432",
     "DOCKER_DEFAULT_PLATFORM": "linux/arm64",
@@ -160,6 +160,10 @@ class Calls:
         if isinstance(reply, BaseException):
             raise reply
         return int(self.code(list(args)))
+
+    def jobs(self) -> list[tuple[str, list[str], dict[str, Any]]]:
+        """The calls that start a job's one-off. The other calls of a job are the reads of the one Spark slot before and after it."""
+        return [item for item in self.items if "--entrypoint" in item[1]]
 
     def words(self) -> list[str]:
         return [" ".join(args) for _, args, _ in self.items]
@@ -388,13 +392,13 @@ class HostRunnerCase(unittest.TestCase):
 
     def test_a_host_job_with_the_whole_run_left_gets_its_own_limit_and_its_own_deadline(self) -> None:
         module = self.module(**{self.flag: "1"})
-        ((_, command, given),) = self.job_started(module, 4000).items
+        ((_, command, given),) = self.job_started(module, 4000).jobs()
         self.assertEqual(1800, given["timeout"])
         self.assertIn("JOB_DEADLINE_SECONDS=1700", command)
 
     def test_a_host_job_near_the_end_of_the_run_gets_only_the_rest_of_the_run_and_a_deadline_inside_it(self) -> None:
         module = self.module(**{self.flag: "1"})
-        ((_, command, given),) = self.job_started(module, 500).items
+        ((_, command, given),) = self.job_started(module, 500).jobs()
         self.assertLessEqual(given["timeout"], 500)
         self.assertGreater(given["timeout"], 450)
         deadline = int(command[command.index("--env") + 1].split("=")[1])
@@ -415,7 +419,7 @@ class HostRunnerCase(unittest.TestCase):
 
             with mock.patch.object(module.tempfile, "mkdtemp", slow):
                 stack.job(["-m", "spark.jobs.x", "build"])
-        ((_, command, given),) = calls.items
+        ((_, command, given),) = calls.jobs()
         self.assertLessEqual(given["timeout"], 400)
         deadline = int(command[command.index("--env") + 1].split("=")[1])
         self.assertLessEqual(deadline, given["timeout"] - (HOST_LIMITS.job_seconds - HOST_LIMITS.job_deadline_seconds))
@@ -471,7 +475,7 @@ class HostRunnerCase(unittest.TestCase):
 
     def test_a_local_run_has_no_deadline_however_long_it_has_run(self) -> None:
         module = self.module()
-        ((_, command, given),) = self.job_started(module, None).items
+        ((_, command, given),) = self.job_started(module, None).jobs()
         self.assertEqual(3600, given["timeout"])
         self.assertIn("JOB_DEADLINE_SECONDS=3500", command)
 
@@ -552,7 +556,9 @@ class HostRunnerCase(unittest.TestCase):
 
     def needed_mib(self) -> int:
         limits = load_limits()
-        return sum(limits.services[name].memory_limit_mib for name in ("postgres", "nessie", "spark")) + limits.host_reserve_mib
+        # One Spark job runs at a time (the one slot), so the need holds one Spark limit: the larger of the two services that the runners' jobs run in.
+        spark = max(limits.services[name].memory_limit_mib for name in ("spark_bronze", "spark_silver"))
+        return sum(limits.services[name].memory_limit_mib for name in ("postgres", "nessie")) + spark + limits.host_reserve_mib
 
     def test_the_host_preflight_needs_the_services_limits_and_the_host_reserve_free_now_and_a_free_figure(self) -> None:
         module = self.module(**{self.flag: "1"})
@@ -715,7 +721,7 @@ class HostRunnerCase(unittest.TestCase):
 
     def test_a_job_container_is_a_compose_run_in_the_project_so_that_it_carries_the_label_by_itself(self) -> None:
         module = self.module(**{self.flag: "1"})
-        ((_, command, _),) = self.job_started(module, 4000).items
+        ((_, command, _),) = self.job_started(module, 4000).jobs()
         self.assertIn("--project-name", command)
         self.assertEqual("project", command[command.index("--project-name") + 1])
 
@@ -821,7 +827,7 @@ class HostRunnerCase(unittest.TestCase):
             if args[:1] == ["ps"] and "--filter" in args:
                 reply = listings[min(position["at"], len(listings) - 1)]
                 position["at"] += 1
-                return reply if isinstance(reply, BaseException) else "".join(f"{item}\n" for item in reply)
+                return reply if isinstance(reply, BaseException) else "".join(f"{item} spark_silver\n" for item in reply)
             return ""
 
         calls = Calls(answer, lambda args: removals(args) if removals and args[:1] == ["rm"] else 0)
@@ -899,7 +905,7 @@ class HostRunnerCase(unittest.TestCase):
 
     def test_a_job_that_times_out_removes_a_container_that_only_a_later_listing_returns_and_fails_with_the_step_and_not_with_a_container_left(self) -> None:
         module = self.module(**{self.flag: "1"})
-        listings = iter([TimeoutExpired("docker", 1), "c1\n", ""])
+        listings = iter([TimeoutExpired("docker", 1), "c1 spark_silver\n", ""])
 
         def answer(args: list[str]) -> Any:
             if "--entrypoint" in args:
@@ -925,7 +931,7 @@ class HostRunnerCase(unittest.TestCase):
 
     def test_a_container_that_a_listing_of_the_run_returned_is_kept_for_the_removal(self) -> None:
         module = self.module(**{self.flag: "1"})
-        calls = Calls(lambda args: "c1\nc2\n" if args[:1] == ["ps"] and "--filter" in args else "")
+        calls = Calls(lambda args: "c1 spark_silver\nc2 spark_silver\n" if args[:1] == ["ps"] and "--filter" in args else "")
         with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module):
             stack = self.stack(module, folder)
             self.assertEqual(["c1", "c2"], stack.spark_containers())

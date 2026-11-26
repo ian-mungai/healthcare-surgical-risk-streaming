@@ -1262,14 +1262,25 @@ class WorkloadVariablesTest(unittest.TestCase):
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": expected}, workload_variables(state, "us-west-2"))
 
     def test_project_workloads_keep_their_own_group_ids_whatever_other_workloads_exist(self) -> None:
-        names = ("airbyte", "ingestion_check", "spark", "trino", "replay", "orchestrator")
+        names = ("airbyte", "ingestion_check", "trino", "replay", "orchestrator", "bronze", "silver", "gold", "stream", "maintenance")
         for others in ((), ("reader", "writer"), ("aaa_first", "dagster", "zzz_last")):
             with self.subTest(others=others):
                 roles = {name: f"arn:{name}" for name in (*names, *others)}
                 workloads = workload_variables({"values": {"outputs": {"workload_role_arns": {"value": roles}}}}, "us-west-2")["workload_access_workloads"]
                 by_name = {workload["name"]: workload["gid"] for workload in workloads}
                 self.assertEqual(
-                    {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103, "replay": 20104, "orchestrator": 20105},
+                    {
+                        "airbyte": 20100,
+                        "ingestion_check": 20101,
+                        "trino": 20103,
+                        "replay": 20104,
+                        "orchestrator": 20105,
+                        "bronze": 20106,
+                        "silver": 20107,
+                        "gold": 20108,
+                        "stream": 20109,
+                        "maintenance": 20110,
+                    },
                     {name: by_name[name] for name in names},
                 )
                 self.assertEqual(len(by_name), len(set(by_name.values())))

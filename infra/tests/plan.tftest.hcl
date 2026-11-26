@@ -379,13 +379,13 @@ run "each_workload_gets_its_own_role" {
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
     workloads = {
-      reader = { access = { landing = ["read"] } }
-      writer = { access = { warehouse = ["write"] } }
+      reader      = { access = { landing = ["read"] } }
+      maintenance = { access = { "warehouse/bronze" = ["write"] } }
     }
   }
 
   assert {
-    condition     = { for name, role in aws_iam_role.workload : name => role.name } == { reader = "example_project_workload_reader_dev", writer = "example_project_workload_writer_dev" }
+    condition     = { for name, role in aws_iam_role.workload : name => role.name } == { reader = "example_project_workload_reader_dev", maintenance = "example_project_workload_maintenance_dev" }
     error_message = "Each workload has its own role, named for the project, the workload and the environment."
   }
 
@@ -403,11 +403,11 @@ run "each_workload_gets_its_own_role" {
         { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["landing/*"] } } },
         { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/landing/*"] },
       ],
-      jsondecode(aws_iam_role_policy.workload["writer"].policy).Statement == [
-        { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+      jsondecode(aws_iam_role_policy.workload["maintenance"].policy).Statement == [
+        { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/bronze/*"] },
       ],
     ])
-    error_message = "A workload's policy holds only what its prefixes and modes give: the reader lists and reads landing and the writer writes warehouse, in the bound bucket."
+    error_message = "A workload's policy holds only what its prefixes and modes give: the reader lists and reads landing and the maintenance workload writes the Bronze folder, in the bound bucket."
   }
 }
 
@@ -528,7 +528,7 @@ run "workload_naming_another_bucket_is_refused" {
   expect_failures = [var.workloads]
 }
 
-run "warehouse_workloads_reach_only_the_warehouse_prefix" {
+run "layer_workloads_reach_exactly_their_own_prefixes" {
   command = plan
 
   module {
@@ -542,19 +542,62 @@ run "warehouse_workloads_reach_only_the_warehouse_prefix" {
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
     workloads = {
-      spark = { access = { warehouse = ["read", "write", "delete"] } }
-      trino = { access = { warehouse = ["read"] } }
+      bronze      = { access = { landing = ["read"], manifests = ["read"], "warehouse/raw_records" = ["read"], "warehouse/bronze" = ["read", "write", "delete"] } }
+      silver      = { access = { "warehouse/raw_records" = ["read"], "warehouse/bronze" = ["read"], "warehouse/silver" = ["read", "write", "delete"] } }
+      gold        = { access = { "warehouse/bronze" = ["read"], "warehouse/silver" = ["read"], "warehouse/gold" = ["read", "write", "delete"] } }
+      stream      = { access = { "warehouse/feature" = ["read", "write", "delete"], "warehouse/stream" = ["read", "write", "delete"] } }
+      maintenance = { access = { warehouse = ["read"], "warehouse/bronze" = ["write"], "warehouse/silver" = ["write"], "warehouse/gold" = ["write"], "warehouse/feature" = ["write"], "warehouse/stream" = ["write"], "warehouse/catalog_proof" = ["write"] } }
+      trino       = { access = { warehouse = ["read"] } }
     }
   }
 
   assert {
-    condition = jsondecode(aws_iam_role_policy.workload["spark"].policy).Statement == [
+    condition = jsondecode(aws_iam_role_policy.workload["bronze"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["landing/*", "manifests/*", "warehouse/bronze/*", "warehouse/raw_records/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/landing/*", "arn:aws:s3:::example-project/manifests/*", "arn:aws:s3:::example-project/warehouse/bronze/*", "arn:aws:s3:::example-project/warehouse/raw_records/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/bronze/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/bronze/*"] },
+    ]
+    error_message = "The Bronze workload reads landing, manifests and the loaded raw_records tables, and reads, writes and deletes under warehouse/bronze only."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["silver"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["warehouse/bronze/*", "warehouse/raw_records/*", "warehouse/silver/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/warehouse/bronze/*", "arn:aws:s3:::example-project/warehouse/raw_records/*", "arn:aws:s3:::example-project/warehouse/silver/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/silver/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/silver/*"] },
+    ]
+    error_message = "The Silver workload reads Bronze and the loaded raw_records tables, and reads, writes and deletes under warehouse/silver only."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["gold"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["warehouse/bronze/*", "warehouse/gold/*", "warehouse/silver/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/warehouse/bronze/*", "arn:aws:s3:::example-project/warehouse/gold/*", "arn:aws:s3:::example-project/warehouse/silver/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/gold/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/gold/*"] },
+    ]
+    error_message = "The Gold workload reads Silver and Bronze, and reads, writes and deletes under warehouse/gold only."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["stream"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["warehouse/feature/*", "warehouse/stream/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/warehouse/feature/*", "arn:aws:s3:::example-project/warehouse/stream/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/feature/*", "arn:aws:s3:::example-project/warehouse/stream/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/feature/*", "arn:aws:s3:::example-project/warehouse/stream/*"] },
+    ]
+    error_message = "The streaming workload reads, writes and deletes under the warehouse feature and stream prefixes only."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["maintenance"].policy).Statement == [
       { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["warehouse/*"] } } },
       { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
-      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
-      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = [for layer in ["bronze", "catalog_proof", "feature", "gold", "silver", "stream"] : "arn:aws:s3:::example-project/warehouse/${layer}/*"] },
     ]
-    error_message = "The Spark workload lists, reads, writes and deletes under warehouse in the bound bucket and does nothing else."
+    error_message = "The maintenance workload lists and reads the whole warehouse for its tag checks and writes only the layer folders and the catalog proof's folder: never raw_records, and it never deletes, because the owner decided that maintenance deletes nothing before teardown."
   }
 
   assert {
@@ -566,8 +609,63 @@ run "warehouse_workloads_reach_only_the_warehouse_prefix" {
   }
 
   assert {
-    condition     = alltrue([for policy in values(aws_iam_role_policy.workload) : !strcontains(policy.policy, "landing") && !strcontains(policy.policy, "manifests") && !strcontains(policy.policy, "physionet")])
-    error_message = "Neither warehouse workload lists or reaches landing, manifests or the publisher's bucket."
+    condition = alltrue([
+      for name in ["silver", "gold", "stream", "maintenance", "trino"] :
+      !strcontains(aws_iam_role_policy.workload[name].policy, "landing") && !strcontains(aws_iam_role_policy.workload[name].policy, "manifests")
+    ])
+    error_message = "No workload but Bronze lists or reaches landing or manifests."
+  }
+
+  assert {
+    condition     = alltrue([for policy in values(aws_iam_role_policy.workload) : !strcontains(policy.policy, "physionet")])
+    error_message = "No layer workload reaches the publisher's bucket."
+  }
+
+  assert {
+    condition = alltrue([
+      for layer, writer in { bronze = "bronze", silver = "silver", gold = "gold", feature = "stream", stream = "stream", catalog_proof = "maintenance" } :
+      alltrue([
+        for name, policy in aws_iam_role_policy.workload :
+        contains(flatten([for statement in jsondecode(policy.policy).Statement : flatten([statement.Resource]) if statement.Sid == "DeleteObjects"]), "arn:aws:s3:::example-project/warehouse/${layer}/*") == (name == writer && name != "maintenance")
+      ])
+    ])
+    error_message = "Each layer prefix is deleted by its own workload and by no other, and the maintenance workload deletes nowhere."
+  }
+
+  assert {
+    condition = alltrue([
+      for layer in ["bronze", "silver", "gold", "feature", "stream", "catalog_proof"] :
+      alltrue([
+        for name, policy in aws_iam_role_policy.workload :
+        contains(flatten([for statement in jsondecode(policy.policy).Statement : flatten([statement.Resource]) if statement.Sid == "WriteObjects"]), "arn:aws:s3:::example-project/warehouse/${layer}/*") == contains(
+          { bronze = ["bronze", "maintenance"], silver = ["silver", "maintenance"], gold = ["gold", "maintenance"], feature = ["stream", "maintenance"], stream = ["stream", "maintenance"], catalog_proof = ["maintenance"] }[layer], name
+        )
+      ])
+    ])
+    error_message = "Each layer prefix is written by its own workload and by the maintenance workload, which compacts it, and by no other."
+  }
+
+  # The probe is a key, not a policy string: a write or delete pattern covers the key when the key starts with the pattern without its final star, so
+  # warehouse/* covers warehouse/raw_records/... as the exact raw_records pattern does.
+  assert {
+    condition = alltrue([
+      for name, policy in aws_iam_role_policy.workload :
+      alltrue([
+        for statement in jsondecode(policy.policy).Statement :
+        alltrue([for pattern in flatten([statement.Resource]) : !startswith("arn:aws:s3:::example-project/warehouse/raw_records/airbyte_load/data/00000-0-file.parquet", trimsuffix(pattern, "*"))])
+        if contains(["WriteObjects", "DeleteObjects"], statement.Sid)
+      ])
+    ])
+    error_message = "No workload writes or deletes a raw_records key, by an exact pattern or by a wider one: the Airbyte load owns it."
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.workload["maintenance"].policy).Statement :
+      alltrue([for pattern in flatten([statement.Resource]) : startswith("arn:aws:s3:::example-project/warehouse/raw_records/airbyte_load/data/00000-0-file.parquet", trimsuffix(pattern, "*"))])
+      if statement.Sid == "ReadObjects"
+    ])
+    error_message = "The maintenance workload still reads a raw_records key, for its tag checks."
   }
 }
 
@@ -611,13 +709,13 @@ run "delete_covers_only_the_prefix_that_names_it" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    workloads     = { spark = { access = { warehouse = ["delete"], landing = ["write"] } } }
+    workloads     = { bronze = { access = { "warehouse/bronze" = ["delete"], landing = ["write"] } } }
   }
 
   assert {
-    condition = jsondecode(aws_iam_role_policy.workload["spark"].policy).Statement == [
+    condition = jsondecode(aws_iam_role_policy.workload["bronze"].policy).Statement == [
       { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/landing/*"] },
-      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/bronze/*"] },
     ]
     error_message = "The delete statement names only the prefixes that give the delete mode, never the prefixes that give write."
   }
@@ -636,7 +734,7 @@ run "delete_is_refused_on_landing" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    workloads     = { spark = { access = { warehouse = ["read", "delete"], landing = ["delete"] } } }
+    workloads     = { bronze = { access = { "warehouse/bronze" = ["read", "delete"], landing = ["delete"] } } }
   }
 
   expect_failures = [var.workloads]
@@ -1125,8 +1223,8 @@ run "a_workload_without_the_records_mode_gets_no_records_statement" {
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
     workloads = {
-      spark = { access = { warehouse = ["read", "write", "delete"] } }
-      trino = { access = { warehouse = ["read"] } }
+      bronze = { access = { "warehouse/bronze" = ["read", "write", "delete"] } }
+      trino  = { access = { warehouse = ["read"] } }
     }
   }
 
@@ -1149,7 +1247,7 @@ run "records_input_may_not_be_written_by_a_workload_that_is_not_the_records_writ
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    workloads     = { spark = { access = { records_input = ["read", "write"] } } }
+    workloads     = { bronze = { access = { records_input = ["read", "write"] } } }
   }
 
   expect_failures = [var.workloads]
@@ -1226,6 +1324,272 @@ run "a_wildcard_prefix_or_mode_is_refused_for_the_orchestrator" {
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
     workloads     = { orchestrator = { access = { "*" = ["read"], records_input = ["*"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "silver_may_not_write_the_bronze_layer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { silver = { access = { "warehouse/bronze" = ["read", "write"], "warehouse/silver" = ["read", "write", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "silver_may_not_delete_in_the_bronze_layer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { silver = { access = { "warehouse/bronze" = ["read", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "gold_may_not_write_the_silver_layer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { gold = { access = { "warehouse/silver" = ["write"], "warehouse/gold" = ["read", "write", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "bronze_may_not_write_the_gold_layer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { bronze = { access = { "warehouse/gold" = ["read", "write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "a_layer_workload_may_not_write_the_whole_warehouse" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { gold = { access = { warehouse = ["read", "write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "nobody_may_delete_in_the_whole_warehouse_not_even_maintenance" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { maintenance = { access = { warehouse = ["read", "write", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "maintenance_may_not_write_the_whole_warehouse" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { maintenance = { access = { warehouse = ["read", "write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "maintenance_may_not_delete_in_a_layer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { maintenance = { access = { "warehouse/silver" = ["write", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "maintenance_may_not_write_raw_records" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { maintenance = { access = { "warehouse/raw_records" = ["write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "only_maintenance_may_write_a_layer_it_does_not_own" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { silver = { access = { "warehouse/bronze" = ["write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "no_workload_may_write_the_raw_records_layer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { bronze = { access = { "warehouse/raw_records" = ["read", "write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "a_warehouse_sub_prefix_outside_the_layers_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { gold = { access = { "warehouse/other" = ["read"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "a_warehouse_wildcard_sub_prefix_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { gold = { access = { "warehouse/*" = ["read"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "a_layer_prefix_may_not_be_taken_by_a_second_workload_with_write" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { stream = { access = { "warehouse/gold" = ["write"] } } }
   }
 
   expect_failures = [var.workloads]

@@ -1,7 +1,7 @@
 # Reads compose_stack_docker (the Compose command, which runs with the project image settings removed from its environment), compose_stack_registry_user,
 # compose_stack_registry_config_directory (the parent of the pull's login folder), compose_stack_owner and
 # compose_stack_pull_deadline_seconds. The project's images are in one private Docker Hub repository, which the owner's computer pushed to (make images-push) and
-# which compose/image_pins.yml names by digest. The host builds nothing: it pulls every image that the Compose files name (including the batch profile's).
+# which compose/image_pins.yml names by digest. The host builds nothing: it pulls every image that the Compose files name (including those of the Spark jobs' profiles).
 # The role owns every piece of Docker state that the pull uses and changes no state that anything else shares: it runs no docker login and no docker logout. One shell
 # task (run by bash, which makes a process group for a background job with no terminal) makes a fresh folder under the parent (mode 0700, never removed, never changed), writes the folder's
 # config.json (mode 0600) with the one auth entry for Docker Hub, checks what it wrote, runs the pull in a process group of its own with DOCKER_CONFIG set to that folder and
@@ -134,7 +134,7 @@
             if IFS= read -r -d '' raw < "$folder/config.json" || [ "$raw" != "$expected"$'\n' ]; then
               refuse "the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key"
             fi
-            env -u DOCKER_AUTH_CONFIG "DOCKER_CONFIG=$folder" {{ compose_stack_docker | map('quote') | join(' ') }} --profile batch pull --quiet < /dev/null > /dev/null 2>&1 &
+            env -u DOCKER_AUTH_CONFIG "DOCKER_CONFIG=$folder" {{ compose_stack_docker | map('quote') | join(' ') }} --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet < /dev/null > /dev/null 2>&1 &
             pull=$!
             (
               trap - EXIT

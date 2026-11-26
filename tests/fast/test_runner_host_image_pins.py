@@ -33,13 +33,14 @@ import yaml
 
 from scripts.images import pins
 from scripts.process import run_command
+from scripts.stack.job_workloads import SPARK_SERVICES
 from tests.fast.runner_import import import_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 E2E = ROOT / "tests" / "e2e"
 HELPER = E2E / "pinned_images.py"
 HOST_RUNNERS = ("stream_host", "catalog_proof", "secret_sinks", "gold_dimensions", "silver_hypotension")
-# The runners that build their own Spark image and name it in a copy of ``spark.yml`` (the host modes of the two Silver runners and the six runners of the
+# The runners that build their own Spark image and name it in their Spark service files (the host modes of the two Silver runners and the six runners of the
 # local mode only).
 LOCAL_BUILDERS = (
     "gold_dimensions",
@@ -189,7 +190,7 @@ class CommittedReferences(unittest.TestCase):
 class LocalSparkImage(unittest.TestCase):
     def setUp(self) -> None:
         self.module: ModuleType = import_runner("pinned_images")
-        self.text = (ROOT / "compose" / "services" / "spark.yml").read_text()
+        self.text = (ROOT / "compose" / "services" / "spark_silver.yml").read_text()
 
     def test_the_image_line_of_the_tracked_spark_file_names_the_runners_own_image_and_nothing_else_changes(self) -> None:
         changed = self.module.local_spark_image(self.text, "surgical-risk-spark:p7-dim")
@@ -230,8 +231,9 @@ class HostModesNameNoLocalTag(unittest.TestCase):
         self.assertIsNone(LOCAL_TAG.search(source))
 
     def test_the_runners_that_build_their_own_spark_image_use_the_helper_and_not_a_replacement_of_a_line_that_is_gone(self) -> None:
-        spark = (ROOT / "compose" / "services" / "spark.yml").read_text()
-        self.assertNotIn("surgical-risk-spark", spark)
+        files = [ROOT / "compose" / "services" / f"{service}.yml" for service in SPARK_SERVICES]
+        for path in files:
+            self.assertNotIn("surgical-risk-spark", path.read_text())
         for name in LOCAL_BUILDERS:
             with self.subTest(runner=name):
                 source = self.source(name)
@@ -273,14 +275,14 @@ class ScratchProject(unittest.TestCase):
         )
 
     def test_a_project_of_postgres_nessie_and_the_spark_job_includes_those_three_and_needs_the_spark_image_only(self) -> None:
-        lines = self.module.scratch_project(self.compose, ("postgres", "nessie", "spark"), {"IMAGE_SPARK": "example.invalid/spark:run"})
-        self.assertEqual(["nessie", "postgres", "spark"], sorted(self.included()))
+        lines = self.module.scratch_project(self.compose, ("postgres", "nessie", "spark_silver"), {"IMAGE_SPARK": "example.invalid/spark:run"})
+        self.assertEqual(["nessie", "postgres", "spark_silver"], sorted(self.included()))
         self.assertEqual("IMAGE_SPARK=example.invalid/spark:run\n", lines)
         self.assertEqual(set(), {name for name in unset_variables(self.compose, lines) if name.startswith("IMAGE_")})
 
     def test_the_services_that_a_service_waits_for_are_included_with_it(self) -> None:
-        self.module.scratch_project(self.compose, ("spark",), {"IMAGE_SPARK": "example.invalid/spark:run"})
-        self.assertEqual({"nessie", "postgres", "spark"}, set(self.included()))
+        self.module.scratch_project(self.compose, ("spark_silver",), {"IMAGE_SPARK": "example.invalid/spark:run"})
+        self.assertEqual({"nessie", "postgres", "spark_silver"}, set(self.included()))
 
     def test_the_three_dagster_services_need_the_dagster_image_and_no_other(self) -> None:
         names = ("dagster_code_location", "dagster_daemon", "dagster_webserver")
@@ -301,11 +303,12 @@ class ScratchProject(unittest.TestCase):
 
     def test_a_missing_or_an_unneeded_image_setting_stops_the_run(self) -> None:
         with self.assertRaises(self.module.PinnedImagesError):
-            self.module.scratch_project(self.compose, ("spark",))
+            self.module.scratch_project(self.compose, ("spark_silver",))
         with self.assertRaises(self.module.PinnedImagesError):
             self.module.scratch_project(self.compose, ("postgres", "nessie"), {"IMAGE_SPARK": "example.invalid/spark:run"})
         with self.assertRaises(self.module.PinnedImagesError):
-            self.module.scratch_project(self.compose, ("spark",), {"IMAGE_SPARK": "example.invalid/spark:run", "IMAGE_REPLAY": "example.invalid/replay:run"})
+            both = {"IMAGE_SPARK": "example.invalid/spark:run", "IMAGE_REPLAY": "example.invalid/replay:run"}
+            self.module.scratch_project(self.compose, ("spark_silver",), both)
 
     def test_a_name_that_the_tracked_project_does_not_include_stops_the_run(self) -> None:
         with self.assertRaises(self.module.PinnedImagesError):
@@ -314,9 +317,9 @@ class ScratchProject(unittest.TestCase):
             self.module.scratch_project(self.compose, ())
 
     def test_a_spark_file_that_names_the_runners_own_image_needs_no_image_setting(self) -> None:
-        spark_file = self.compose / "services" / "spark.yml"
+        spark_file = self.compose / "services" / "spark_silver.yml"
         spark_file.write_text(self.module.local_spark_image(spark_file.read_text(), "surgical-risk-spark:p7-dim"))
-        self.assertEqual("", self.module.scratch_project(self.compose, ("postgres", "nessie", "spark")))
+        self.assertEqual("", self.module.scratch_project(self.compose, ("postgres", "nessie", "spark_silver")))
 
 
 # The runners that copy ``compose/`` and start a project of their own, and the services that each one starts. A runner that is not listed here and copies the
@@ -370,9 +373,11 @@ class EveryScratchProjectIsTrimmed(unittest.TestCase):
                 scratch = Path(tempfile.mkdtemp())
                 self.addCleanup(shutil.rmtree, scratch, True)
                 shutil.copytree(ROOT / "compose", scratch / "compose")
-                spark_file = scratch / "compose" / "services" / "spark.yml"
+                spark_services = [service for service in services if service in SPARK_SERVICES]
                 if "local_spark_image(" in source:
-                    spark_file.write_text(helper.local_spark_image(spark_file.read_text(), "surgical-risk-spark:run"))
+                    for service in spark_services:
+                        spark_file = scratch / "compose" / "services" / f"{service}.yml"
+                        spark_file.write_text(helper.local_spark_image(spark_file.read_text(), "surgical-risk-spark:run"))
                 needed = {
                     variable
                     for service in helper.closure(scratch / "compose", services)
@@ -383,7 +388,7 @@ class EveryScratchProjectIsTrimmed(unittest.TestCase):
                 if '"IMAGE_' in source:
                     self.assertRegex(source, r"\bimages\s*\+|\+\s*images\b", "the image settings that the project returns reach the host settings file")
                 if "local_spark_image(" in source or '"IMAGE_SPARK"' in source:
-                    self.assertIn("spark", services, "a runner that names a Spark image runs the Spark service")
+                    self.assertTrue(spark_services, "a runner that names a Spark image runs a Spark service")
 
 
 @unittest.skipUnless((E2E / "catalog_proof.py").is_file(), "the temporary runners are not in this checkout")
@@ -401,7 +406,7 @@ class CatalogProofHostSetup(unittest.TestCase):
         None for no image line). Returns the expectations that were recorded and the images that the host was asked about."""
         shown: list[tuple[str, bool]] = []
         inspected: list[str] = []
-        document: dict[str, Any] = {"services": {"spark": {} if rendered is None else {"image": rendered}}}
+        document: dict[str, Any] = {"services": {"spark_maintenance": {} if rendered is None else {"image": rendered}}}
 
         def docker(*arguments: str) -> tuple[int, str]:
             inspected.append(arguments[-1])
@@ -477,7 +482,8 @@ class BronzeHostMode(unittest.TestCase):
         shown: list[tuple[str, bool]] = []
         document: dict[str, Any] = {
             "services": {
-                "spark": {"environment": {"WAREHOUSE_LOCATION": "s3://example/"}} | ({} if rendered is None else {"image": rendered}),
+                "spark_bronze": {"environment": {"WAREHOUSE_LOCATION": "s3://example/"}} | ({} if rendered is None else {"image": rendered}),
+                "spark_maintenance": {"environment": {"WAREHOUSE_LOCATION": "s3://example/"}},
                 "trino": {"environment": {"WAREHOUSE_LOCATION": "s3://example/"}},
             }
         }
@@ -524,14 +530,14 @@ class BronzeHostMode(unittest.TestCase):
     def test_the_stage_judges_the_rendered_image_with_the_catalog_proofs_check_and_holds_no_copy_of_it(self) -> None:
         asked: list[object] = []
 
-        def state(stack: object) -> tuple[bool, bool]:
-            asked.append(stack)
+        def state(stack: object, job: str) -> tuple[bool, bool]:
+            asked.append(job)
             return True, False
 
         with mock.patch.object(self.module.proof, "spark_image_state", state):
             _, shown = self.stage(self.references)
-        self.assertEqual((1, [False]), (len(asked), [passed for _, passed in shown]))
-        self.assertNotIn('["services"]["spark"]["image"]', (E2E / "bronze_host.py").read_text())
+        self.assertEqual((["bronze_decode"], [False]), (asked, [passed for _, passed in shown]))
+        self.assertNotRegex((E2E / "bronze_host.py").read_text(), r'\["services"\]\[[^]]+\]\["image"\]')
 
     def test_a_commit_with_no_readable_pin_counts_as_images_that_are_not_on_the_host_and_asks_the_host_about_none(self) -> None:
         def unreadable(name: str) -> str:

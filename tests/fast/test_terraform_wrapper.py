@@ -196,9 +196,21 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 2048
-  spark:
+  spark_bronze:
     runtime: compose
-    group: batch
+    group: batch_bronze
+    memory_limit_mib: 4096
+  spark_silver:
+    runtime: compose
+    group: batch_silver
+    memory_limit_mib: 4096
+  spark_gold:
+    runtime: compose
+    group: batch_gold
+    memory_limit_mib: 4096
+  spark_maintenance:
+    runtime: compose
+    group: batch_maintenance
     memory_limit_mib: 4096
 """
 HEAVY_INPUTS = {"host_reserve_mib": 4096, "always_on_limits_mib": 3072, "spark_limit_mib": 4096}

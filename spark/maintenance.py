@@ -22,6 +22,9 @@ TABLE_NAME = re.compile(r"\w+(\.\w+)+", re.ASCII)
 # numbers that are not about patients. A table that is not listed (a table with an outcome or a label, or any new one) is sealed.
 OPEN_TABLES = frozenset({"bronze.numeric_observations", "bronze.waveform_seconds", "bronze.tracks", "bronze.string_events", "catalog_proof.numbers"})
 SEALED_FIELDS = ("rows", "checksum")
+# The namespaces whose files the maintenance workload may write (``infra/environments/dev.tfvars``): every layer and the catalog proof's own namespace. The
+# ``raw_records`` namespace is Airbyte's, so no role writes it: maintenance reads it for the tag checks and never rewrites it.
+COMPACTED_NAMESPACES = ("bronze", "silver", "gold", "feature", "stream", "catalog_proof")
 # The checks that every run makes, in order, named in the result: the trunk is Nessie's default branch, no other branch exists, the tables asked for are on it,
 # no table could lose a file that a tag needs, every tag is as it was and every tagged read is as it was.
 CHECKS_RUN = ("trunk_is_default", "no_branch_in_flight", "tables_on_trunk", "table_properties_safe", "tags_unchanged", "tagged_reads_unchanged")
@@ -74,11 +77,34 @@ class QuietParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+def namespace_of(table: str) -> str:
+    return table.split(".", 1)[0]
+
+
+def select_tables(requested: Sequence[str], on_trunk: Sequence[str]) -> tuple[list[str], list[str]]:
+    """The tables to compact and the namespaces left out. A table asked for by name must be in a namespace that ``COMPACTED_NAMESPACES`` names, else
+    ``RetentionError`` (``table_not_compactable``). With none asked for, the tables of the trunk in those namespaces are compacted and every other namespace,
+    ``raw_records`` among them, is left out and named."""
+    if requested:
+        refused = sorted(table for table in requested if namespace_of(table) not in COMPACTED_NAMESPACES)
+        if refused:
+            raise RetentionError(f"the tables {', '.join(refused)} are in namespaces that maintenance may not write", code="table_not_compactable")
+        return list(requested), []
+    return [table for table in on_trunk if namespace_of(table) in COMPACTED_NAMESPACES], sorted(
+        {namespace_of(table) for table in on_trunk} - set(COMPACTED_NAMESPACES)
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     command = QuietParser(prog="python -m spark.jobs.table_maintenance", description="Compact the tables of the trunk. Nothing is deleted.")
     command.add_argument("--trunk", default=None, help="an assertion: Nessie's default branch, whose tables are compacted, must be this one")
     command.add_argument(
-        "--table", dest="tables", action="append", default=[], type=table_argument, help="a table to compact, such as schema.table; the default is every table"
+        "--table",
+        dest="tables",
+        action="append",
+        default=[],
+        type=table_argument,
+        help="a table to compact, such as schema.table; the default is every table of a namespace that maintenance may write, never raw_records",
     )
     command.add_argument("--rewrite-all", action="store_true", help="rewrite every data file, not only the ones that the table's size rules select")
     command.add_argument("--dry-run", action="store_true", help="list what would be rewritten and change nothing")

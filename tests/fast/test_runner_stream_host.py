@@ -454,7 +454,7 @@ class Environment(HostRunnerCase):
         self.assertEqual((int(apicurio[1]), int(nessie[1])), self.module.host_ports({}))
 
     def test_the_compose_files_name_the_rendered_pin_variables_and_no_local_tag(self) -> None:
-        for file, variable in (("replay.yml", "IMAGE_REPLAY"), ("spark.yml", "IMAGE_SPARK")):
+        for file, variable in (("replay.yml", "IMAGE_REPLAY"), ("spark_silver.yml", "IMAGE_SPARK")):
             with self.subTest(file=file):
                 text = (COMPOSE / "services" / file).read_text()
                 self.assertIn(f"image: ${{{variable}:?", text)
@@ -637,7 +637,7 @@ class Overlay(unittest.TestCase):
     def test_memory_limits_come_from_the_deployed_limits_file(self) -> None:
         for name, service in self.document["services"].items():
             with self.subTest(service=name):
-                self.assertRegex(str(service["mem_limit"]), r"^\$\{MEM_LIMIT_(REPLAY|SPARK):\?")
+                self.assertRegex(str(service["mem_limit"]), r"^\$\{MEM_LIMIT_(REPLAY|SPARK_SILVER):\?")
 
     def test_the_services_reach_the_platform_by_its_own_host_names(self) -> None:
         text = OVERLAY.read_text()

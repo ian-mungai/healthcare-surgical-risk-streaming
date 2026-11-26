@@ -31,7 +31,10 @@ PROJECT_SERVICE_IMAGES = {
     "dagster_daemon": "IMAGE_DAGSTER",
     "dagster_webserver": "IMAGE_DAGSTER",
     "replay": "IMAGE_REPLAY",
-    "spark": "IMAGE_SPARK",
+    "spark_bronze": "IMAGE_SPARK",
+    "spark_silver": "IMAGE_SPARK",
+    "spark_gold": "IMAGE_SPARK",
+    "spark_maintenance": "IMAGE_SPARK",
 }
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
@@ -67,7 +70,8 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
         return [f"{name}: the file must define exactly one service, named like the file"]
     service = services[name]
     image = str(service.get("image", ""))
-    batch = service.get("profiles") == ["batch"]
+    profiles = service.get("profiles")
+    batch = isinstance(profiles, list) and len(profiles) == 1 and re.fullmatch(r"batch_[a-z][a-z0-9_]*", str(profiles[0])) is not None
     project = PROJECT_IMAGE.match(image)
     if image.startswith("${"):
         if project is None or project.group(1) not in PROJECT_VARIABLES:
@@ -292,10 +296,13 @@ class DockerSocketExceptionTest(unittest.TestCase):
 
 
 CREDENTIAL_READERS = {
-    "spark": ("spark", 20102),
     "trino": ("trino", 20103),
     "replay": ("replay", 20104),
     "dagster_code_location": ("orchestrator", 20105),
+    "spark_bronze": ("bronze", 20106),
+    "spark_silver": ("silver", 20107),
+    "spark_gold": ("gold", 20108),
+    "spark_maintenance": ("maintenance", 20110),
 }
 EXTRA_GROUPS = {"dagster_code_location": ["<DOCKER_SOCKET_GID>"]}
 """The services that read a credential folder, each bound to its folder and its workload group. The table is fixed here, not derived from the mount, so a
@@ -474,7 +481,7 @@ class WorkloadAccessTest(unittest.TestCase):
     def test_the_socket_group_is_the_only_group_besides_the_workload_s_that_a_reader_may_have(self) -> None:
         document = copy.deepcopy(load(SERVICES / "dagster_code_location.yml"))
         service = document["services"]["dagster_code_location"]
-        service["group_add"] = [*service["group_add"], "20102"]
+        service["group_add"] = [*service["group_add"], "20107"]
         self.assertEqual(1, len(access_problems("dagster_code_location", document)))
         service["group_add"] = ["${DOCKER_SOCKET_GID:?write the host settings first}"]
         self.assertEqual(1, len(access_problems("dagster_code_location", document)))
@@ -482,12 +489,12 @@ class WorkloadAccessTest(unittest.TestCase):
     def test_a_folder_and_group_changed_together_is_named(self) -> None:
         document = self.replay()
         service = document["services"]["replay"]
-        service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["spark"])]
-        service["volumes"] = [str(entry).replace("workload_access_replay", "workload_access_spark") for entry in service["volumes"]]
-        document["volumes"] = {"workload_access_spark": {"driver_opts": {"device": "${SPARK_ACCESS_DIR:-/run/workload_access/spark}"}}}
+        service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["silver"])]
+        service["volumes"] = [str(entry).replace("workload_access_replay", "workload_access_silver") for entry in service["volumes"]]
+        document["volumes"] = {"workload_access_silver": {"driver_opts": {"device": "${SILVER_ACCESS_DIR:-/run/workload_access/silver}"}}}
         problems = access_problems("replay", document)
         self.assertEqual(3, len(problems), problems)
-        self.assertIn("may read only the credential folder of replay, not spark", problems[0])
+        self.assertIn("may read only the credential folder of replay, not silver", problems[0])
 
     def test_a_missing_group_another_group_or_a_writable_mount_is_named(self) -> None:
         for change in ("no group", "other group", "extra group", "writable", "no mount"):
@@ -496,9 +503,9 @@ class WorkloadAccessTest(unittest.TestCase):
             if change == "no group":
                 del service["group_add"]
             elif change == "other group":
-                service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["spark"])]
+                service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["silver"])]
             elif change == "extra group":
-                service["group_add"] = [*service["group_add"], str(PROJECT_WORKLOAD_GIDS["spark"])]
+                service["group_add"] = [*service["group_add"], str(PROJECT_WORKLOAD_GIDS["silver"])]
             elif change == "writable":
                 service["volumes"] = [str(entry).removesuffix(":ro") for entry in service["volumes"]]
             else:
@@ -509,21 +516,21 @@ class WorkloadAccessTest(unittest.TestCase):
     def test_the_reviewers_case_a_second_credential_folder_and_another_workload_group_as_the_primary_group_is_named(self) -> None:
         document = self.replay()
         service = document["services"]["replay"]
-        service["user"] = f"10003:{PROJECT_WORKLOAD_GIDS['spark']}"
-        service["volumes"] = [*service["volumes"], "/run/workload_access/spark/:/run/workload_access/spark:ro"]
+        service["user"] = f"10003:{PROJECT_WORKLOAD_GIDS['silver']}"
+        service["volumes"] = [*service["volumes"], "/run/workload_access/silver/:/run/workload_access/silver:ro"]
         problems = access_problems("replay", document)
         self.assertEqual(2, len(problems), problems)
-        self.assertIn("not spark", problems[0])
+        self.assertIn("not silver", problems[0])
         self.assertIn("primary group", problems[1])
 
     def test_a_second_credential_folder_in_any_written_form_is_named(self) -> None:
-        long_form = {"type": "bind", "source": "/run/workload_access/spark/", "target": "/elsewhere", "read_only": True}
+        long_form = {"type": "bind", "source": "/run/workload_access/silver/", "target": "/elsewhere", "read_only": True}
         for label, entry in (
-            ("short form", "/run/workload_access/spark:/elsewhere:ro"),
-            ("trailing slash", "/run/workload_access/spark/:/elsewhere:ro"),
-            ("two trailing slashes", "/run/workload_access/spark//:/elsewhere:ro"),
-            ("dots", "/run/workload_access/replay/../spark:/elsewhere:ro"),
-            ("variable default", "${SPARK_ACCESS_DIR:-/run/workload_access/spark/}:/elsewhere:ro"),
+            ("short form", "/run/workload_access/silver:/elsewhere:ro"),
+            ("trailing slash", "/run/workload_access/silver/:/elsewhere:ro"),
+            ("two trailing slashes", "/run/workload_access/silver//:/elsewhere:ro"),
+            ("dots", "/run/workload_access/replay/../silver:/elsewhere:ro"),
+            ("variable default", "${SILVER_ACCESS_DIR:-/run/workload_access/silver/}:/elsewhere:ro"),
             ("long form", long_form),
             ("the whole folder", "/run/workload_access:/elsewhere:ro"),
             ("the whole folder with a slash", "/run/workload_access/:/elsewhere"),
@@ -546,7 +553,7 @@ class WorkloadAccessTest(unittest.TestCase):
         self.assertIn("not trino", problems[0])
 
     def test_the_own_folder_written_with_a_trailing_slash_or_dots_is_still_its_own_folder(self) -> None:
-        for device in ("${REPLAY_ACCESS_DIR:-/run/workload_access/replay/}", "/run/workload_access/replay//", "/run/workload_access/spark/../replay"):
+        for device in ("${REPLAY_ACCESS_DIR:-/run/workload_access/replay/}", "/run/workload_access/replay//", "/run/workload_access/silver/../replay"):
             with self.subTest(device=device):
                 document = self.replay()
                 document["volumes"]["workload_access_replay"]["driver_opts"]["device"] = device
@@ -560,10 +567,10 @@ class WorkloadAccessTest(unittest.TestCase):
 
     def test_the_reviewers_two_plants_a_double_slash_source_and_a_primary_group_given_as_a_default_are_named(self) -> None:
         document = self.replay()
-        document["services"]["replay"]["volumes"].append("//run/workload_access/spark/:/elsewhere:ro")
+        document["services"]["replay"]["volumes"].append("//run/workload_access/silver/:/elsewhere:ro")
         problems = access_problems("replay", document)
         self.assertEqual(1, len(problems), problems)
-        self.assertIn("not spark", problems[0])
+        self.assertIn("not silver", problems[0])
         document = self.replay()
         document["services"]["replay"]["user"] = "10003:${TEST_PRIMARY_GID:-20104}"
         problems = access_problems("replay", document)
@@ -572,14 +579,14 @@ class WorkloadAccessTest(unittest.TestCase):
 
     def test_a_bind_source_is_read_as_linux_reads_a_path(self) -> None:
         for label, source in (
-            ("slashes and a dot", "/run//workload_access/./spark"),
-            ("three slashes", "///run/workload_access///spark//"),
-            ("dots and a parent", "/run/workload_access/replay/../spark/."),
-            ("a parent above the root", "/run/workload_access/../workload_access/spark"),
-            ("a variable default with slashes", "${X:-//run/workload_access//spark}"),
-            ("a default in the middle", "/run/workload_access/${X-spark}"),
-            ("a nested default", "${A:-${B:-/run/workload_access/spark}}"),
-            ("a default followed by a path", "${DIR:-/run/workload_access}/spark"),
+            ("slashes and a dot", "/run//workload_access/./silver"),
+            ("three slashes", "///run/workload_access///silver//"),
+            ("dots and a parent", "/run/workload_access/replay/../silver/."),
+            ("a parent above the root", "/run/workload_access/../workload_access/silver"),
+            ("a variable default with slashes", "${X:-//run/workload_access//silver}"),
+            ("a default in the middle", "/run/workload_access/${X-silver}"),
+            ("a nested default", "${A:-${B:-/run/workload_access/silver}}"),
+            ("a default followed by a path", "${DIR:-/run/workload_access}/silver"),
         ):
             for form in ("short", "long", "named"):
                 with self.subTest(source=label, form=form):
@@ -593,14 +600,14 @@ class WorkloadAccessTest(unittest.TestCase):
                         document["volumes"]["other"] = {"driver_opts": {"type": "none", "o": "bind", "device": source}}
                     problems = access_problems("replay", document)
                     self.assertEqual(1, len(problems), problems)
-                    self.assertIn("may read only the credential folder of replay, not spark", problems[0])
+                    self.assertIn("may read only the credential folder of replay, not silver", problems[0])
 
     def test_the_own_folder_in_these_forms_is_still_its_own_folder_and_a_path_outside_the_root_is_no_folder(self) -> None:
         for source in (
             "//run//workload_access/./replay/",
-            "${X:-/run/workload_access/spark/../replay}",
-            "/run/workload_access_other/spark",
-            "/run/workload_accessspark",
+            "${X:-/run/workload_access/silver/../replay}",
+            "/run/workload_access_other/silver",
+            "/run/workload_accesssilver",
         ):
             with self.subTest(source=source):
                 document = self.replay()
@@ -610,11 +617,11 @@ class WorkloadAccessTest(unittest.TestCase):
 
     def test_a_group_given_as_a_default_is_read_as_its_default_in_user_and_group_add(self) -> None:
         for label, field, value, expected in (
-            ("a default in group_add", "group_add", ["20104", "${X-20102}"], "must run in the group 20104"),
-            ("a colon default in group_add", "group_add", ["20104", "${X:-20102}"], "must run in the group 20104"),
-            ("a nested default", "group_add", ["20104", "${X:-${Y:-20102}}"], "must run in the group 20104"),
-            ("the other group in place of its own", "group_add", ["${X-20102}"], "must run in the group 20104"),
-            ("a primary group", "user", "10003:${X-20102}", "must not take a workload group as its primary group"),
+            ("a default in group_add", "group_add", ["20104", "${X-20107}"], "must run in the group 20104"),
+            ("a colon default in group_add", "group_add", ["20104", "${X:-20107}"], "must run in the group 20104"),
+            ("a nested default", "group_add", ["20104", "${X:-${Y:-20107}}"], "must run in the group 20104"),
+            ("the other group in place of its own", "group_add", ["${X-20107}"], "must run in the group 20104"),
+            ("a primary group", "user", "10003:${X-20107}", "must not take a workload group as its primary group"),
             ("a primary group with a colon default", "user", "${U:-10003}:${G:-20104}", "must not take a workload group as its primary group"),
         ):
             with self.subTest(case=label):
@@ -642,7 +649,7 @@ class WorkloadAccessTest(unittest.TestCase):
                     elif field == "group_add":
                         service["group_add"] = [form]
                     else:
-                        service["volumes"].append(f"{form}/spark:/elsewhere:ro")
+                        service["volumes"].append(f"{form}/silver:/elsewhere:ro")
                     problems = access_problems("replay", document)
                     unresolvable = [problem for problem in problems if "this field must be a literal or a resolvable default" in problem]
                     self.assertEqual(1, len(unresolvable), problems)
@@ -691,10 +698,10 @@ class WorkloadAccessTest(unittest.TestCase):
 
     def test_var_run_is_the_same_folder_as_run_so_a_credential_folder_under_it_is_named(self) -> None:
         document = self.replay()
-        document["services"]["replay"]["volumes"].append("/var/run/workload_access/spark:/elsewhere:ro")
+        document["services"]["replay"]["volumes"].append("/var/run/workload_access/silver:/elsewhere:ro")
         problems = access_problems("replay", document)
         self.assertEqual(1, len(problems), problems)
-        self.assertIn("not spark", problems[0])
+        self.assertIn("not silver", problems[0])
         document = self.replay()
         document["volumes"]["workload_access_replay"]["driver_opts"]["device"] = "/var/run/workload_access/replay"
         self.assertEqual([], access_problems("replay", document))
@@ -841,7 +848,7 @@ class PlantedDefectTest(unittest.TestCase):
             ("dagster_daemon", "IMAGE_REPLAY"),
             ("dagster_code_location", "IMAGE_SPARK"),
             ("replay", "IMAGE_DAGSTER"),
-            ("spark", "IMAGE_DAGSTER"),
+            ("spark_silver", "IMAGE_DAGSTER"),
         ):
             with self.subTest(service=name):
                 problems = self.project_defect(name, lambda _document, service, wrong=wrong: service.update(image=f"${{{wrong}:?render the image pins first}}"))

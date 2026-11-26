@@ -89,9 +89,9 @@ class Codes(unittest.TestCase):
         return self.refusal(lambda: base.Rewrites(properties).run(argv, base.stand_in(side=side)))
 
     def test_each_refusal_of_maintain_has_its_code(self) -> None:
-        safe, unsafe = {"a.one": base.SAFE, "b.two": base.SAFE}, {"a.one": base.SAFE, "b.two": base.UNSAFE_GC}
+        safe, unsafe = {"bronze.one": base.SAFE, "silver.two": base.SAFE}, {"bronze.one": base.SAFE, "silver.two": base.UNSAFE_GC}
         self.assertEqual("unsafe_table", self.maintain(unsafe, []).code)
-        self.assertEqual("tables_not_on_trunk", self.maintain(safe, ["--table", "c.three"]).code)
+        self.assertEqual("tables_not_on_trunk", self.maintain(safe, ["--table", "gold.three"]).code)
         self.assertEqual("trunk_not_default", self.maintain(safe, ["--trunk", "side"], side=True).code)
         self.assertEqual("branches_in_flight", self.maintain(safe, [], side=True).code)
 
@@ -117,11 +117,11 @@ class Codes(unittest.TestCase):
 
     def test_a_tag_that_does_not_read_as_it_did_has_a_code(self) -> None:
         nessie = base.stand_in()
-        rewrites = base.Rewrites({"a.one": base.SAFE, "b.two": base.SAFE})
+        rewrites = base.Rewrites({"bronze.one": base.SAFE, "silver.two": base.SAFE})
         reads = iter(
             [
-                [{"tag": "t", "table": "a.one", "snapshot_id": 1, "rows": 1, "checksum": 1}],
-                [{"tag": "t", "table": "a.one", "snapshot_id": 2, "rows": 1, "checksum": 1}],
+                [{"tag": "t", "table": "bronze.one", "snapshot_id": 1, "rows": 1, "checksum": 1}],
+                [{"tag": "t", "table": "bronze.one", "snapshot_id": 2, "rows": 1, "checksum": 1}],
             ]
         )
         with mock.patch.object(job, "read_tagged", side_effect=lambda *_: next(reads)):

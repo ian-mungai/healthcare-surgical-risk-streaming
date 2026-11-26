@@ -157,7 +157,18 @@ PLACEMENT_FACTS = {"placed": "placed", "unchanged": "placed", "absent": "absent"
 GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
-PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103, "replay": 20104, "orchestrator": 20105}
+PROJECT_WORKLOAD_GIDS = {
+    "airbyte": 20100,
+    "ingestion_check": 20101,
+    "trino": 20103,
+    "replay": 20104,
+    "orchestrator": 20105,
+    "bronze": 20106,
+    "silver": 20107,
+    "gold": 20108,
+    "stream": 20109,
+    "maintenance": 20110,
+}
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
 

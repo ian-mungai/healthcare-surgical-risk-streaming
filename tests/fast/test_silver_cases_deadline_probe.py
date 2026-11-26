@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from tests.e2e.run_record import Record
+from tests.fast.spark_engine import with_a_free_slot
 from tests.fast.test_runner_gold_sealed import runner
 
 GOOD = {"stderr_is_stop_line": True, "exit": 124}
@@ -149,7 +150,7 @@ class StackFlag(unittest.TestCase):
                     (target.parent / name).write_text(text)
             return code, "", error
 
-        stack.run = run
+        stack.run = with_a_free_slot(run)
         stack.watch = lambda done, stalled: None
         answer = stack.job_with_flag(["-c", "pass"], None, None, {}, 300, SEALED, flag_folder)
         return answer, [*log, *record.commands], commands, sorted(os.listdir(folder))
@@ -228,7 +229,7 @@ class StackFlag(unittest.TestCase):
             commands.append(command)
             return 124, "", "silver_cases: timeout\n"
 
-        stack.run = run
+        stack.run = with_a_free_slot(run)
         stack.watch = lambda done, stalled: None
         answer = stack.job(["-c", "pass"], None, None, {}, 300, SEALED)
         self.assertEqual((124, {}, ""), answer[:3])
@@ -272,7 +273,7 @@ class ComposeProgress(unittest.TestCase):
             commands.append(command)
             return 124, "", " Container run-postgres-1  Running\n"
 
-        stack.run = run
+        stack.run = with_a_free_slot(run)
         stack.watch = lambda done, stalled: None
         return stack, commands
 

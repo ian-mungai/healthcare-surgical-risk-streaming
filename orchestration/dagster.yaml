@@ -22,6 +22,9 @@ concurrency:
     tag_concurrency_limits:
       - key: surgical_risk/heavy
         limit: 1
+      # One Spark job at a time across the four Spark groups (the key of SPARK_TAG_KEY in the same file of code).
+      - key: surgical_risk/spark
+        limit: 1
     # Each run is a process that holds up to two PostgreSQL connections at once, so this number is part of the budget in compose/postgres_connections.yml. The default is 10.
     max_concurrent_runs: 3
 

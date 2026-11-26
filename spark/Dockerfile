@@ -59,6 +59,8 @@ RUN pip install --no-cache-dir --require-hashes --only-binary :all: --no-deps --
 COPY spark /opt/jobs/spark
 COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
+# The launcher (spark/launcher.py) refuses a job that is not mapped to the service's workload, from this map.
+COPY scripts/stack/job_workloads.py /opt/jobs/scripts/stack/job_workloads.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
 COPY scripts/stack/tags.py /opt/jobs/scripts/stack/tags.py
 # The Silver jobs call the one definition of validity, of the pressure series, of the events and of the labels that the feature code shares (standard library only).

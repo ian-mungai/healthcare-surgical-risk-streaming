@@ -12,6 +12,7 @@ from typing import Any
 
 import jinja2
 
+from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import ROLES, group_variables
 
@@ -39,6 +40,19 @@ def rendered_numbers(timeout: int) -> dict[str, int]:
     if set(found) != {"deadline", "grace", "reap"}:
         raise AssertionError(f"the shell script sets {sorted(found)}")
     return found
+
+
+class PullProfilesTest(unittest.TestCase):
+    def test_the_pull_enables_every_profile_that_a_service_file_declares_so_no_images_of_a_profiled_service_are_left_out(self) -> None:
+        """Compose leaves a service out of a pull unless its profile is enabled, so a profile that the command lacks leaves its image off the host."""
+        declared: set[str] = set()
+        for path in sorted((ROOT / "compose" / "services").glob("*.yml")):
+            document: Any = load_yaml(path.read_text())
+            declared.update(profile for service in document["services"].values() for profile in service.get("profiles") or [])
+        command = shell_task()["ansible.builtin.shell"]["cmd"]
+        enabled = set(re.findall(r"--profile (\S+)", command))
+        self.assertTrue(declared)
+        self.assertEqual(declared, enabled)
 
 
 class PullBudgetTest(unittest.TestCase):

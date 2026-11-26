@@ -20,7 +20,7 @@ from unittest import mock
 
 from scripts.stack.tags import TableSnapshot
 from spark.jobs import table_maintenance as job
-from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, table_identifier
+from spark.maintenance import COMPACTED_NAMESPACES, RetentionError, compare_reads, compare_tags, in_flight_branches, parse, table_identifier
 from spark.preconditions import PROPERTY_KEYS, precondition_problems
 from tests.fast.nessie_stand_in import HASH_SIDE, HASH_TWO, NAMESPACE_ENTRY, StandIn, table_entry
 
@@ -170,7 +170,7 @@ class TagComparisonTest(unittest.TestCase):
         self.assertEqual(([], ["run-c"]), compare_tags({"run-a": "h1"}, {"run-a": "h1", "run-c": "h3"}))
 
 
-def stand_in(tables: Sequence[str] = ("a.one", "b.two"), *, side: bool = False) -> StandIn:
+def stand_in(tables: Sequence[str] = ("bronze.one", "silver.two"), *, side: bool = False) -> StandIn:
     """A Nessie with main's head holding ``tables`` (each with a snapshot) and no tag, and a side branch only when asked."""
     nessie = StandIn()
     if not side:
@@ -225,15 +225,19 @@ class MaintainTest(unittest.TestCase):
     """``maintain`` with stand-ins: what it refuses, and that a refusal comes before any rewrite."""
 
     def test_a_safe_table_and_an_unsafe_second_table_refuse_the_run_and_rewrite_nothing(self) -> None:
-        rewrites = Rewrites({"a.one": SAFE, "b.two": UNSAFE_GC})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": UNSAFE_GC})
         with self.assertRaises(RetentionError) as caught:
             rewrites.run([], stand_in())
-        self.assertIn("b.two", str(caught.exception))
-        self.assertNotIn("a.one", str(caught.exception))
+        self.assertIn("silver.two", str(caught.exception))
+        self.assertNotIn("bronze.one", str(caught.exception))
         self.assertEqual([], rewrites.compacted)
 
     def test_an_unsafe_first_table_and_a_table_that_deletes_metadata_files_refuse_the_run_and_rewrite_nothing(self) -> None:
-        for properties in ({"a.one": UNSAFE_GC, "b.two": SAFE}, {"a.one": SAFE, "b.two": UNSAFE_DELETE}, {"a.one": UNSAFE_DELETE, "b.two": UNSAFE_GC}):
+        for properties in (
+            {"bronze.one": UNSAFE_GC, "silver.two": SAFE},
+            {"bronze.one": SAFE, "silver.two": UNSAFE_DELETE},
+            {"bronze.one": UNSAFE_DELETE, "silver.two": UNSAFE_GC},
+        ):
             with self.subTest(properties=properties):
                 rewrites = Rewrites(properties)
                 with self.assertRaises(RetentionError):
@@ -242,16 +246,16 @@ class MaintainTest(unittest.TestCase):
 
     def test_every_unsafe_table_is_named_in_the_one_refusal(self) -> None:
         with self.assertRaises(RetentionError) as caught:
-            Rewrites({"a.one": UNSAFE_GC, "b.two": UNSAFE_DELETE}).run([], stand_in())
-        self.assertIn("a.one", str(caught.exception))
-        self.assertIn("b.two", str(caught.exception))
+            Rewrites({"bronze.one": UNSAFE_GC, "silver.two": UNSAFE_DELETE}).run([], stand_in())
+        self.assertIn("bronze.one", str(caught.exception))
+        self.assertIn("silver.two", str(caught.exception))
 
     def test_safe_tables_are_each_rewritten_once_in_order_and_the_result_names_the_default_branch(self) -> None:
-        rewrites = Rewrites({"a.one": SAFE, "b.two": SAFE})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": SAFE})
         result = rewrites.run(["--rewrite-all"], stand_in())
-        self.assertEqual(["a.one", "b.two"], rewrites.compacted)
+        self.assertEqual(["bronze.one", "silver.two"], rewrites.compacted)
         self.assertEqual("main", result["trunk"])
-        self.assertEqual({"compacted": True}, result["tables"]["a.one"])
+        self.assertEqual({"compacted": True}, result["tables"]["bronze.one"])
 
     def test_the_report_of_an_open_table_is_kept_and_the_report_of_any_other_table_is_one_flag(self) -> None:
         rewrites = Rewrites({"bronze.tracks": SAFE, "silver.cases": SAFE})
@@ -260,20 +264,20 @@ class MaintainTest(unittest.TestCase):
         self.assertEqual({"compacted": True}, result["tables"]["silver.cases"])
 
     def test_only_the_tables_that_are_asked_for_are_checked_and_rewritten(self) -> None:
-        rewrites = Rewrites({"a.one": SAFE, "b.two": UNSAFE_GC})
-        rewrites.run(["--table", "a.one"], stand_in())
-        self.assertEqual(["a.one"], rewrites.compacted)
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": UNSAFE_GC})
+        rewrites.run(["--table", "bronze.one"], stand_in())
+        self.assertEqual(["bronze.one"], rewrites.compacted)
 
     def test_a_table_that_is_not_on_the_trunk_is_refused_before_any_session(self) -> None:
-        rewrites = Rewrites({"a.one": SAFE, "b.two": SAFE})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": SAFE})
         with self.assertRaises(RetentionError) as caught:
-            rewrites.run(["--table", "c.three"], stand_in())
-        self.assertIn("c.three", str(caught.exception))
+            rewrites.run(["--table", "gold.three"], stand_in())
+        self.assertIn("gold.three", str(caught.exception))
         self.assertEqual(0, rewrites.sessions)
 
     def test_a_trunk_that_is_not_nessies_default_branch_is_refused_before_any_other_call_or_session(self) -> None:
         nessie = stand_in(side=True)
-        rewrites = Rewrites({"a.one": SAFE, "b.two": SAFE})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": SAFE})
         with self.assertRaises(RetentionError) as caught:
             rewrites.run(["--trunk", "side"], nessie)
         self.assertIn("default branch", str(caught.exception))
@@ -281,11 +285,11 @@ class MaintainTest(unittest.TestCase):
         self.assertEqual((0, []), (rewrites.sessions, rewrites.compacted))
 
     def test_a_trunk_that_is_the_default_branch_is_accepted_as_an_assertion(self) -> None:
-        rewrites = Rewrites({"a.one": SAFE, "b.two": SAFE})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": SAFE})
         self.assertEqual("main", rewrites.run(["--trunk", "main"], stand_in())["trunk"])
 
     def test_a_branch_other_than_the_trunk_makes_the_run_wait_before_any_session(self) -> None:
-        rewrites = Rewrites({"a.one": SAFE, "b.two": SAFE})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": SAFE})
         with self.assertRaises(RetentionError) as caught:
             rewrites.run([], stand_in(side=True))
         self.assertIn("side", str(caught.exception))
@@ -295,10 +299,55 @@ class MaintainTest(unittest.TestCase):
         nessie = stand_in(side=True)
         nessie.default_branch = "side"
         nessie.entries_at[HASH_SIDE] = nessie.entries_at[HASH_TWO]
-        rewrites = Rewrites({"a.one": SAFE, "b.two": SAFE})
+        rewrites = Rewrites({"bronze.one": SAFE, "silver.two": SAFE})
         with self.assertRaises(RetentionError) as caught:
             rewrites.run([], nessie)
         self.assertIn("the branches main exist", str(caught.exception))
+
+
+class RawRecordsTest(unittest.TestCase):
+    """Maintenance compacts only the namespaces that its role may write. ``raw_records`` is the Airbyte load's: the job reads it for the tag checks and never
+    rewrites it, so a run with the default table selection must not name it, and an explicit request for it is refused before any session."""
+
+    TABLES = (
+        "raw_records.clinical_data",
+        "bronze.tracks",
+        "silver.cases",
+        "gold.dim_case",
+        "feature.rows",
+        "stream.windows",
+        "catalog_proof.numbers",
+        "other.thing",
+    )
+    PROPERTIES = {table: SAFE for table in TABLES}
+
+    def test_the_default_selection_compacts_every_namespace_it_may_write_and_not_raw_records_or_an_unlisted_namespace(self) -> None:
+        rewrites = Rewrites(self.PROPERTIES)
+        result = rewrites.run(["--rewrite-all"], stand_in(self.TABLES))
+        self.assertEqual(["bronze.tracks", "catalog_proof.numbers", "feature.rows", "gold.dim_case", "silver.cases", "stream.windows"], rewrites.compacted)
+        self.assertEqual(["other", "raw_records"], result["skipped_namespaces"])
+        self.assertNotIn("raw_records.clinical_data", result["tables"])
+
+    def test_the_default_selection_does_not_even_check_the_properties_of_a_table_it_skips(self) -> None:
+        rewrites = Rewrites({**self.PROPERTIES, "raw_records.clinical_data": UNSAFE_GC})
+        rewrites.run([], stand_in(self.TABLES))
+        self.assertNotIn("raw_records.clinical_data", rewrites.compacted)
+
+    def test_a_table_of_raw_records_asked_for_by_name_is_refused_before_any_session_with_its_own_code(self) -> None:
+        rewrites = Rewrites(self.PROPERTIES)
+        with self.assertRaises(RetentionError) as caught:
+            rewrites.run(["--table", "bronze.tracks", "--table", "raw_records.clinical_data"], stand_in(self.TABLES))
+        self.assertEqual("table_not_compactable", caught.exception.code)
+        self.assertEqual((0, []), (rewrites.sessions, rewrites.compacted))
+
+    def test_a_dry_run_names_no_raw_records_table_either(self) -> None:
+        rewrites = Rewrites(self.PROPERTIES)
+        result = rewrites.run(["--dry-run"], stand_in(self.TABLES))
+        self.assertNotIn("raw_records.clinical_data", result["tables"])
+        self.assertTrue(result["dry_run"])
+
+    def test_the_namespaces_the_job_compacts_never_hold_raw_records(self) -> None:
+        self.assertNotIn("raw_records", COMPACTED_NAMESPACES)
 
 
 class NoSnapshotReadTest(unittest.TestCase):

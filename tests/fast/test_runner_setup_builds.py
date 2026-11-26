@@ -32,6 +32,7 @@ from unittest import mock
 from tests.fast.git_fixture import git_in
 from tests.fast.label_accept import accepted, empty_exit_ok, refusal_ok
 from tests.fast.runner_import import import_runner
+from tests.fast.spark_engine import with_a_free_slot
 from tests.fast.test_outcome_acceptance import split_run
 from tests.fast.test_silver_acceptance import written
 from tests.fast.test_silver_labels_acceptance import HEAD
@@ -292,7 +293,7 @@ def stand_in_stack(
             folders.append(placed)
         return code, out, err
 
-    stack.run = run
+    stack.run = with_a_free_slot(run)
     stack.watch = lambda done, stalled: None
     return stack, commands, folders
 
@@ -468,7 +469,7 @@ class LabelsCalls(unittest.TestCase):
             folders.append(place(command, None) or "")
             return 0, "", ""
 
-        stack.run = run
+        stack.run = with_a_free_slot(run)
         call = stack.silver("verify", BRANCH)
         self.assertIsNone(call.document)
         self.assertFalse(call.present)
@@ -495,7 +496,7 @@ class LabelsCalls(unittest.TestCase):
             if len(watched) == 1:
                 stalled.set()
 
-        stack.run, stack.watch = run, watch
+        stack.run, stack.watch = with_a_free_slot(run), watch
         call = stack.silver("build", BRANCH, base="trunk")
         self.assertEqual(2, len(spark_calls))
         self.assertEqual(2, len(set(folders)))

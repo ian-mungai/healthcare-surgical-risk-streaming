@@ -55,7 +55,7 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -67,11 +67,13 @@ from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.output_file import replace_owned_file
 from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
-from scripts.process import TimeoutExpired, run_command
+from scripts.process import TimeoutExpired
 from scripts.sample.candidates import RELEASE_FILE
-from scripts.stack.groups import Settings, compose_arguments, rendered_environment
+from scripts.stack.groups import Settings, compose_arguments, rendered_environment, running_services
+from scripts.stack.job_workloads import job_command, profile_of_job
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.spark_slot import Running, SlotError, run_in_slot
 from scripts.stack.tags import paged
 from spark import table_checks as rules
 
@@ -101,6 +103,7 @@ REBUILT_NOTE = "the checks of the run that merged this load are not in this rece
 STATE_DIRECTORY = Path("/opt/dagster/data/table_checks")
 # The job runs as the Spark user of the Spark image, with the launcher's own group as its primary group. The staged folder is 0750 and each staged file 0640
 # in that group, set by the launcher, so the job reads them and no other user does.
+JOB = "table_checks"
 SPARK_UID = 10100
 STAGING_GID = 10001
 STAGING_FOLDER_MODE = 0o750
@@ -202,28 +205,48 @@ class Outcome:
 Runner = Callable[[Path], RunnerReply]
 
 
-def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_seconds: float) -> Runner:
-    """A runner that starts the job as a one-off of the stack's ``spark`` service, in the ``batch`` profile and with no service it depends on started.
+def compose_runner(
+    settings: Settings,
+    *,
+    volume: str,
+    directory: str,
+    deadline_seconds: float,
+    running: Running | None = None,
+) -> Runner:
+    """A runner that starts the job as a one-off of the Bronze service that ``scripts/stack/job_workloads.py`` names, in that service's own profile and with no
+    service it depends on started. The job reads the loaded tables with the Bronze credentials, which cannot write them.
 
     The staging folders are subfolders of ``directory``, which this process sees and which is the Docker volume ``volume``; the job sees that volume,
     read-only, at ``/staging``. The job runs as ``SPARK_UID`` with ``STAGING_GID`` as its group, the group of the staged files. The environment of the command
     is the one the group commands use: the memory limits that ``scripts.stack.limits`` renders from the limits file, then the process's own variables. A job
     that passes its deadline is stopped by the launcher and its reply carries the exit code 124.
+
+    The container is named ``spark_slot.SLOT_NAME``, which Docker allows once at a time on the engine, so the job holds the one Spark slot
+    (``scripts/stack/spark_slot.py``) as long as its container exists: it does not start while a Spark container of any launcher is alive, and no other Spark
+    job starts before this container is gone, even if this process is killed or the code location restarts. This process removes the container when the job
+    ends (``run_owned``), also after a deadline or a failure; after a kill or a restart the exited container stays and is removed by hand.
+    ``running`` reads the live services within the seconds it is given and defaults to the stack's own.
     """
     root = Path(directory)
+    read_running = running or (lambda timeout: running_services(settings, load_limits(settings.limits_file), timeout))
 
     def start(staging: Path) -> RunnerReply:
         if staging.parent != root:
             raise TableChecksError("the staging folder is not a folder of the staging volume, which the job could not see")
-        arguments = compose_arguments(
-            settings,
-            "batch",
-            *["run", "--rm", "--no-TTY", "--no-deps", "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
-            *["--entrypoint", "python", "spark", "-m", "spark.jobs.table_checks", "--staging", f"/staging/{staging.name}"],
-        )
+
+        def arguments(options: Sequence[str]) -> list[str]:
+            return compose_arguments(
+                settings,
+                profile_of_job(JOB),
+                *["run", "--no-TTY", "--no-deps", *options, "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
+                *job_command(JOB, "--staging", f"/staging/{staging.name}"),
+            )
+
         environment = rendered_environment(load_limits(settings.limits_file))
         try:
-            result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
+            result = run_in_slot(arguments, running=read_running, deadline_seconds=deadline_seconds, env=environment)
+        except SlotError as error:
+            raise TableChecksError(f"the table checks do not start: {error}") from None
         except TimeoutExpired:
             return RunnerReply(124, "")
         return RunnerReply(result.returncode, result.stdout)

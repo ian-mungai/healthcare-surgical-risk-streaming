@@ -111,6 +111,12 @@ class HostNessie(StandIn):
         ]
 
 
+def launch_of(args: list[str]) -> str:
+    """The name of the launch that a container's command records: the value of its launch label (a Spark container's Docker name is the one slot's name)."""
+    (value,) = [word.split("=", 1)[1] for word in args if word.startswith("p5h_launch=")]
+    return value
+
+
 class FakeTarget:
     """The host's command line as the runner sees it: it answers each command that the cleanup, the folder and the listing use."""
 
@@ -143,7 +149,7 @@ class FakeTarget:
         self.advance()
         head = args[0]
         if head == "docker" and "run" in args and "--name" in args:
-            name = args[args.index("--name") + 1]
+            name = launch_of(args)
             self.launches.append(name)
             if self.timeouts:
                 self.timeouts -= 1
@@ -521,7 +527,7 @@ class Reservation(Hosted):
         self.host.stack.replay(["/out/y.py"], replay_access=False)
         self.assertEqual(2, len(seen))
         for number, (recorded, args) in enumerate(seen, start=1):
-            name = args[args.index("--name") + 1]
+            name = launch_of(args)
             self.assertEqual(number, len(recorded))
             self.assertEqual(name, recorded[-1])
             self.assertTrue(name.startswith(f"{PREFIX}_"))
@@ -840,7 +846,7 @@ class PendingLaunch(Hosted):
         def failing(args: list[str], **options: Any) -> tuple[int, str, str]:
             code, out, err = original(args, **options)
             if "--name" in args and not failed:
-                failed.append(args[args.index("--name") + 1])
+                failed.append(launch_of(args))
                 return 1, out, err
             return code, out, err
 
@@ -866,7 +872,7 @@ class PendingLaunch(Hosted):
 
         def watching(args: list[str], **options: Any) -> tuple[int, str, str]:
             if "--name" in args and "run" in args:
-                seen.append(args[args.index("--name") + 1] in self.host.stack.pending)
+                seen.append(launch_of(args) in self.host.stack.pending)
             return original(args, **options)
 
         self.target.run = watching  # type: ignore[method-assign]

@@ -501,7 +501,10 @@ class PullTest(unittest.TestCase):
             holders = (stand_in.parent / "token_files.log").read_text()
         self.assertEqual(0, code, output)
         self.assertEqual([], running, "the task left a process of its own: the pull, the shell or its watchdog")
-        self.assertEqual(["compose --project-name sample --profile batch pull --quiet"], logged)
+        self.assertEqual(
+            ["compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet"],
+            logged,
+        )
         self.assertEqual(1, len(seen))
         used_folder, mode = seen[0]
         self.assertRegex(used_folder, re.escape(str(parent)) + "/" + self.SHAPE + "$")
@@ -524,7 +527,11 @@ class PullTest(unittest.TestCase):
         for name, text in {**seen, "output": output}.items():
             self.assertNotIn(self.TOKEN, text, name)
             self.assertNotIn(auth, text, name)
-        self.assertIn("compose --project-name sample --profile batch pull --quiet", seen["ps.log"], "the process list was read while the pull ran")
+        self.assertIn(
+            "compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet",
+            seen["ps.log"],
+            "the process list was read while the pull ran",
+        )
 
     def test_the_pull_sees_neither_a_docker_auth_setting_nor_a_project_image_setting_of_the_hosts_environment(self) -> None:
         planted = {"DOCKER_AUTH_CONFIG": '{"auths": {}}', "IMAGE_SPARK": "stale/x@sha256:" + "a" * 64, "IMAGE_DAGSTER": "stale/y", "IMAGE_REPLAY": "stale/z"}
@@ -544,7 +551,10 @@ class PullTest(unittest.TestCase):
             logged = calls(stand_in)
             used = json.loads((stand_in.parent / "pull_config.json").read_text())
         self.assertEqual(0, code, output)
-        self.assertEqual(["compose --project-name sample --profile batch pull --quiet"], logged)
+        self.assertEqual(
+            ["compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet"],
+            logged,
+        )
         self.assertEqual(["auths"], list(used))
         self.assertEqual(1, len(used["auths"]))
 
@@ -917,7 +927,9 @@ class PullTest(unittest.TestCase):
             listing = (stand_in.parent / "ps.log").read_text()
         self.assertEqual(0, code, output)
         self.assertNotIn("sleep 4711", listing, "a process outside the run's groups is in the list")
-        self.assertIn("compose --project-name sample --profile batch pull --quiet", listing)
+        self.assertIn(
+            "compose --project-name sample --profile batch_bronze --profile batch_silver --profile batch_gold --profile batch_maintenance pull --quiet", listing
+        )
 
     def test_a_second_run_changes_nothing_on_the_host_and_runs_the_same_pull(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

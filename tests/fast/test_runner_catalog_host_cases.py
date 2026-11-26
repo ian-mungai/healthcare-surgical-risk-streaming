@@ -37,6 +37,7 @@ from unittest import mock
 from urllib.parse import unquote, urlsplit
 
 from scripts.project_config import ROOT
+from scripts.stack.job_workloads import service_of
 from scripts.stack.nessie import NessieError
 from scripts.stack.trino import TrinoError
 from tests.e2e.run_record import Record
@@ -46,6 +47,8 @@ from tests.fast.runner_import import import_runner
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 BUCKET = "bucket-x"
 PINNED_SPARK = "example.invalid/spark@sha256:" + "a" * 64
+# The Compose service of the catalog proof's Spark job: the service of its workload.
+SERVICE = "spark_maintenance"
 TAG_STATE = "ready"
 
 
@@ -224,8 +227,9 @@ class DeadlineLine(unittest.TestCase):
         module = runner()
         name = spark_name(module)
         self.assertEqual(name, "catalog_proof")
-        entrypoint = (ROOT / "compose" / "services" / "spark.yml").read_text()
-        self.assertIn(f"spark.jobs.{name}", entrypoint)
+        service = (ROOT / "compose" / "services" / f"{service_of(name)}.yml").read_text()
+        self.assertEqual(SERVICE, service_of(name))
+        self.assertIn(f"\n  {SERVICE}:\n", service)
         self.assertIn(f'JOB = "{name}"', (ROOT / "spark" / "jobs" / f"{name}.py").read_text())
 
     def test_the_fixed_line_after_other_stderr_lines_passes(self) -> None:
@@ -296,9 +300,9 @@ def rendered_config(trino: str | None, spark: str | None) -> str:
     """The standard output of ``docker compose config --format json``: the WAREHOUSE_LOCATION of each engine's service, or none when its value is None."""
     services: dict[str, dict[str, Any]] = {
         name: {"environment": {"WAREHOUSE_LOCATION": value, "AWS_REGION": "us-east-1"} if value is not None else {"AWS_REGION": "us-east-1"}}
-        for name, value in (("trino", trino), ("spark", spark))
+        for name, value in (("trino", trino), (SERVICE, spark))
     }
-    services["spark"]["image"] = PINNED_SPARK
+    services[SERVICE]["image"] = PINNED_SPARK
     return json.dumps({"name": "p", "services": services})
 
 
@@ -341,7 +345,7 @@ class AwsOfTheHost:
     def __call__(self, arguments: tuple[str, ...]) -> tuple[int, str, str]:
         words = list(arguments)
         text = " ".join(words)
-        workload = re.search(r"/run/workload_access/(spark|trino):", text)
+        workload = re.search(r"/run/workload_access/(maintenance|trino):", text)
         if workload is None:
             raise AssertionError(text)
         after = words[words.index("public.ecr.aws/aws-cli/aws-cli:2.37.10") + 1 :]
@@ -359,9 +363,12 @@ class AwsOfTheHost:
         if put is None:
             return 0, "", ""
         self.calls.append((workload, "put"))
-        self.put_key = put.group(2)
         if put.group(3) == "/dev/null" or "printf" not in script or f"> {put.group(3)}" not in script:
             return 252, "", PARAMETER
+        if workload == "maintenance":
+            # The write into raw_records, which the bucket refuses. The planted answers of these cases are the Trino write's.
+            return 254, "", DENIED_PUT
+        self.put_key = put.group(2)
         if self.accept_write:
             self.bucket.add(self.put_key)
             return 0, '{"ETag": "x"}\n', ""
@@ -380,6 +387,8 @@ class AwsOfTheHost:
                 return 254, "", self.state_error
             if "--query" in after:
                 self.calls.append((workload, "probe list"))
+                if workload == "maintenance":
+                    return 0, "0\n", ""
                 self.listed_keys.append(prefix)
                 if self.listing_exit:
                     return self.listing_exit, "", self.listing_error
@@ -460,9 +469,11 @@ class TrinoWorkloadWrite(unittest.TestCase):
         self.assertEqual(
             aws.calls,
             [
-                ("spark", "identity"),
-                ("spark", "warehouse list"),
-                ("spark", "state list"),
+                ("maintenance", "identity"),
+                ("maintenance", "warehouse list"),
+                ("maintenance", "state list"),
+                ("maintenance", "put"),
+                ("maintenance", "probe list"),
                 ("trino", "warehouse list"),
                 ("trino", "put"),
                 ("trino", "probe list"),
@@ -492,7 +503,7 @@ class TrinoWorkloadWrite(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 run, _ = self.run_case(AwsOfTheHost(state_error=text))
-                self.assertEqual(failed(run), ["the Spark workload's own access"])
+                self.assertEqual(failed(run), ["the maintenance workload's own access"])
 
     def test_a_refusal_with_another_code_does_not_pass_for_the_trino_write(self) -> None:
         for text in (
@@ -513,7 +524,7 @@ class TrinoWorkloadWrite(unittest.TestCase):
                 return code, out + err, ""
 
         run, _ = self.run_case(OnStdout())
-        self.assertEqual(failed(run), ["the Spark workload's own access"])
+        self.assertEqual(failed(run), ["the maintenance workload's own access"])
 
     def test_the_observation_holds_exit_codes_and_flags_only(self) -> None:
         run, _ = self.run_case(AwsOfTheHost())
@@ -800,12 +811,12 @@ class WarehouseSettings(unittest.TestCase):
 
         found = module.engine_locations(SimpleNamespace(compose_out=compose_out))
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][:2], ("--profile", "batch"))
+        self.assertEqual(calls[0][:2], ("--profile", "batch_maintenance"))
         self.assertIn("config", calls[0])
         return found
 
     def test_the_settings_of_both_engines_are_read_from_a_read_that_exited_0(self) -> None:
-        self.assertEqual(self.locations(0, rendered_config("s3://a/", "s3://b/")), {"trino": "s3://a/", "spark": "s3://b/"})
+        self.assertEqual(self.locations(0, rendered_config("s3://a/", "s3://b/")), {"trino": "s3://a/", SERVICE: "s3://b/"})
 
     def test_a_read_that_failed_is_a_failure_whatever_it_printed(self) -> None:
         unread = runner().Unread
@@ -868,7 +879,7 @@ class WarehouseSettings(unittest.TestCase):
 
     def test_an_engine_with_no_setting_fails_the_setup_case_although_the_location_is_in_the_text(self) -> None:
         self.assertEqual(failed(self.run_host("s3://wh/", None)), ["deployed stack"])
-        text = json.dumps({"services": {"trino": {"environment": {"WAREHOUSE_LOCATION": "s3://wh/"}}, "spark": {"labels": {"x": "s3://wh/"}}}})
+        text = json.dumps({"services": {"trino": {"environment": {"WAREHOUSE_LOCATION": "s3://wh/"}}, SERVICE: {"labels": {"x": "s3://wh/"}}}})
         self.assertEqual(failed(self.run_host("s3://wh/", "s3://wh/", text=text)), ["deployed stack"])
 
     def test_the_observation_shows_flags_and_no_location(self) -> None:
@@ -897,7 +908,7 @@ class WarehouseSettings(unittest.TestCase):
 
         self.assertTrue(module.spark_stopped(stack(0, "postgres\nnessie\n")))
         self.assertTrue(module.spark_stopped(stack(0, "")))
-        self.assertFalse(module.spark_stopped(stack(0, "postgres\nspark\n")))
+        self.assertFalse(module.spark_stopped(stack(0, f"postgres\n{SERVICE}\n")))
         self.assertFalse(module.spark_stopped(stack(1, "")))
         self.assertFalse(module.spark_stopped(stack(255, "postgres\n")))
 

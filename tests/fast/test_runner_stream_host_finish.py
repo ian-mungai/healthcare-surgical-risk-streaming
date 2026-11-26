@@ -217,7 +217,7 @@ class Interrupts(FinishCase):
 
 
 class Memory(FinishCase):
-    LIMITS = {"MEM_LIMIT_REPLAY": "1024m", "MEM_LIMIT_SPARK": "4096m", "MEM_LIMIT_KAFKA": "9999m"}
+    LIMITS = {"MEM_LIMIT_REPLAY": "1024m", "MEM_LIMIT_SPARK_SILVER": "4096m", "MEM_LIMIT_KAFKA": "9999m"}
 
     def reserve(self) -> int:
         return load_limits().host_reserve_mib
@@ -236,7 +236,7 @@ class Memory(FinishCase):
 
     def test_a_limit_that_is_not_in_mib_is_refused(self) -> None:
         with self.assertRaises(ValueError):
-            self.host.memory_gate({"MEM_LIMIT_REPLAY": "1g", "MEM_LIMIT_SPARK": "4096m"}, 100000)
+            self.host.memory_gate({"MEM_LIMIT_REPLAY": "1g", "MEM_LIMIT_SPARK_SILVER": "4096m"}, 100000)
 
 
 class Remaining(FinishCase):

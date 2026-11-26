@@ -158,7 +158,10 @@ not_clients:
   - grafana
   - loki
   - aistor
-  - spark
+  - spark_bronze
+  - spark_silver
+  - spark_gold
+  - spark_maintenance
   - trino
   - kafka
   - replay

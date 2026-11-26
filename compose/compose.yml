@@ -12,7 +12,10 @@ include:
   - services/grafana.yml
   - services/loki.yml
   - services/alloy.yml
-  - services/spark.yml
+  - services/spark_bronze.yml
+  - services/spark_silver.yml
+  - services/spark_gold.yml
+  - services/spark_maintenance.yml
   - services/trino.yml
   - services/kafka.yml
   - services/apicurio.yml

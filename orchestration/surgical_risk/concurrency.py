@@ -3,11 +3,14 @@
 A job runs one service group. It is heavy when the memory limits of that group's services in the limits file add up to more than the figure in the environment
 variable ``HEAVY_MEMORY_MIB``. Terraform calculates that figure from the host's memory, the reserve, the always-on limits and one Spark job's limit, and the
 deploy writes it to the host settings. The code has no default: a missing or invalid figure stops the code location with its reason.
+A job that runs a Spark group (``batch_<workload>``) also carries the tag ``SPARK_TAG_KEY``, which the same setting limits to one run: the host's memory figure
+assumes one Spark job, and each Spark workload is its own group, so the groups must share the one slot (``scripts/stack/spark_slot.py`` holds it at the launch).
 A heavy job carries the tag ``HEAVY_TAG_KEY``. The instance setting ``concurrency.runs.tag_concurrency_limits`` in ``dagster.yaml`` lets one run with that tag
 be in progress, so a second heavy job stays queued until the first ends. A job below the figure has no tag and is never held.
 
 Each job that runs a service group is declared in ``JOB_GROUPS`` with its group, and takes its tags from ``job_tags``. A fast test holds every group named
-there to the limits file. The record load is the first.
+there to the limits file. The record load is the first. The table checks job runs one Spark container, so it is declared with ``batch_bronze`` and takes the
+Spark tag.
 
 The limits file and the figure are read when the code location starts. After either changes, restart the code location so that the tags follow it.
 """
@@ -22,14 +25,18 @@ from types import MappingProxyType
 
 import yaml
 
+from scripts.stack.job_workloads import SPARK_GROUPS
+
 # The environment variable that holds the figure: a job above this many MiB is heavy.
 HEAVY_MEMORY_ENVIRONMENT = "HEAVY_MEMORY_MIB"
 WHOLE_NUMBER = re.compile(r"[0-9]+")
 HEAVY_TAG_KEY = "surgical_risk/heavy"
 HEAVY_TAG_VALUE = "true"
+SPARK_TAG_KEY = "surgical_risk/spark"
+SPARK_TAG_VALUE = "true"
 LIMITS_FILE = Path(os.environ.get("LIMITS_FILE", "/opt/dagster/limits.yml"))
 # Each job that runs a service group, by job name, with the group of the limits file that it runs.
-JOB_GROUPS: Mapping[str, str] = MappingProxyType({"record_load_job": "ingestion"})
+JOB_GROUPS: Mapping[str, str] = MappingProxyType({"record_load_job": "ingestion", "table_checks_job": "batch_bronze"})
 
 
 class ConcurrencyError(ValueError):
@@ -94,4 +101,5 @@ def job_tags(
     """The run tags of a declared group job. Raise ``ConcurrencyError`` for a job that ``job_groups`` does not declare."""
     if job not in job_groups:
         raise ConcurrencyError(f"the job {job} is not declared in JOB_GROUPS, so its group and weight are unknown")
-    return heavy_job_tags(job_groups[job], limits_file, environment)
+    group = job_groups[job]
+    return heavy_job_tags(group, limits_file, environment) | ({SPARK_TAG_KEY: SPARK_TAG_VALUE} if group in SPARK_GROUPS else {})
