@@ -27,6 +27,7 @@ from types import ModuleType
 from unittest import mock
 
 from scripts.images import pins
+from scripts.infra import runner_place
 from tests.fast.runner_import import import_runner, safe_execute
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -105,7 +106,8 @@ class HostCheckout(unittest.TestCase):
             "files that are a list": json.dumps({"commit": commit, "files": []}),
             "a path outside tests/e2e": json.dumps({"commit": commit, "files": {"compose/services/kafka.yml": "1" * 64}}),
             "a path with a parent step": json.dumps({"commit": commit, "files": {"tests/e2e/../x.py": "1" * 64}}),
-            "a path in a folder below tests/e2e": json.dumps({"commit": commit, "files": {"tests/e2e/stream_stack/read_lake.py": "1" * 64}}),
+            "a path deeper than the stream stack's folder": json.dumps({"commit": commit, "files": {"tests/e2e/stream_stack/deeper/read_lake.py": "1" * 64}}),
+            "a path in another folder below tests/e2e": json.dumps({"commit": commit, "files": {"tests/e2e/other/read_lake.py": "1" * 64}}),
             "a short hash": json.dumps({"commit": commit, "files": {"tests/e2e/silver_signals.py": "1"}}),
         }
         for label, text in documents.items():
@@ -113,6 +115,15 @@ class HostCheckout(unittest.TestCase):
                 (self.root / "placed_runners.json").write_text(text)
                 with self.assertRaisesRegex(self.module.HostCheckoutError, "^the placement record placed_runners.json is not "):
                     self.module.checkout_state(self.root, True, ())
+
+    def test_a_probe_and_the_overlay_of_the_stream_stack_folder_are_read_from_the_placement_record(self) -> None:
+        commit = "a" * 40
+        files = {"tests/e2e/stream_stack/read_lake.py": "1" * 64, "tests/e2e/stream_stack/compose.override.yml": "2" * 64}
+        (self.root / "placed_runners.json").write_text(json.dumps({"commit": commit, "files": files}))
+        self.assertEqual(files, self.module.read_placed_record(commit, self.root))
+
+    def test_the_reader_accepts_exactly_the_form_that_the_placement_command_sends(self) -> None:
+        self.assertEqual(runner_place.RUNNER_FORM.pattern, self.module.PLACED_TEXT)
 
     def test_the_pinned_reference_is_the_one_that_the_compose_stack_renders_from_the_pin_file(self) -> None:
         names = [image["name"] for image in pins.load_images()]
