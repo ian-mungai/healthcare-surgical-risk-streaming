@@ -121,6 +121,18 @@ class Host:
         return completed(0, f"{sent}  {relative}\n")
 
 
+class BoundedSource(runner_imports.DiskSource):
+    """The files on disk, with a limit on the reads: a read of a cycle that does not end fails the test and does not hang it."""
+
+    reads = 0
+
+    def read(self, relative: str) -> str | None:
+        self.reads += 1
+        if self.reads > 100:
+            raise AssertionError("the probes that take from each other were read again and again")
+        return super().read(relative)
+
+
 class RepositoryCase(TemporaryRepository):
     def setUp(self) -> None:
         super().setUp()
@@ -607,6 +619,96 @@ class ProbeImportTest(ProbeFolderCase):
                 self.assertIn(f"{user}: the probe batch_oracle has no name {name} at its top level\n", self.refused([user, oracle]))
                 self.shown.truncate(0)
                 self.shown.seek(0)
+
+    def assert_each_name_is_refused(self, cases: Sequence[tuple[str, str]]) -> None:
+        """Each case is the text of ``batch_oracle`` and the name that another probe cannot take from it."""
+        for text, name in cases:
+            with self.subTest(text=text):
+                oracle = self.probe("batch_oracle.py", text)
+                user = self.probe("user_probe.py", f"from batch_oracle import {name}\n")
+                self.assertIn(f"{user}: the probe batch_oracle has no name {name} at its top level\n", self.refused([user, oracle]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_an_annotation_without_a_value_defines_no_name_that_another_probe_can_take(self) -> None:
+        self.assert_each_name_is_refused([("VALUE: int\n", "VALUE"), ("if True:\n    VALUE: int\n", "VALUE")])
+
+    def test_a_name_that_a_direct_del_removes_at_the_top_level_cannot_be_taken_from_the_probe(self) -> None:
+        self.assert_each_name_is_refused(
+            [
+                ("VALUE = 1\ndel VALUE\n", "VALUE"),
+                ("first, second = 1, 2\ndel (first, second)\n", "second"),
+                ("first, second = 1, 2\ndel second, first\n", "first"),
+                ("import json\ndel json\n", "json"),
+                ("def build():\n    pass\n\ndel build\n", "build"),
+                ("if True:\n    VALUE = 1\ndel VALUE\n", "VALUE"),
+                ("VALUE = 1\ndel VALUE\nVALUE: int\n", "VALUE"),
+            ]
+        )
+
+    def test_a_name_that_stays_bound_after_an_annotation_or_a_del_can_be_taken_from_the_probe(self) -> None:
+        oracle = self.probe(
+            "batch_oracle.py",
+            "again = 1\ndel again\nagain = 2\nkept = 1\nkept: int\nholder = {'a': 1}\ndel holder['a']\nowner = type('Owner', (), {'a': 1})\ndel owner.a\n"
+            "unmoved = 1\nif not unmoved:\n    del unmoved\n\ndef later():\n    global unmoved\n    del unmoved\n",
+        )
+        user = self.probe("user_probe.py", "from batch_oracle import again, kept, holder, owner, unmoved\n")
+        self.assertEqual(2, len(self.place(Host(), [user, oracle]).placed))
+
+    def test_a_probe_passes_on_the_names_that_it_takes_from_another_probe_by_a_star_or_by_name(self) -> None:
+        for oracle_text, helper_text, taken in (
+            ("VALUE = 1\n", "from batch_oracle import *\n", "VALUE"),
+            ("VALUE = 1\n", "from batch_oracle import VALUE\n", "VALUE"),
+            ("VALUE = 1\n", "from batch_oracle import VALUE as renamed\n", "renamed"),
+            ("__all__ = ['listed', '_named']\nlisted = 1\n_named = 2\n", "from batch_oracle import *\n", "listed, _named"),
+            ("__all__: tuple[str, ...] = ('listed',)\nlisted = 1\n", "from batch_oracle import *\n", "listed"),
+            ("__all__ = ['listed']\ndel __all__\nVALUE = 1\n", "from batch_oracle import *\n", "VALUE"),
+            ("from scripts.takes_image_package import *\n", "from batch_oracle import *\n", "VALUE"),
+        ):
+            with self.subTest(oracle=oracle_text, helper=helper_text):
+                oracle = self.probe("batch_oracle.py", oracle_text)
+                helper = self.probe("batch_helper.py", helper_text)
+                user = self.probe("user_probe.py", f"from batch_helper import {taken}\n")
+                self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
+
+    def test_a_star_from_another_probe_passes_on_only_what_python_would_take(self) -> None:
+        for oracle_text, name in (
+            ("VALUE = 1\n", "MISSING"),
+            ("_private = 1\n", "_private"),
+            ("__all__ = ['listed']\nlisted = 1\nunlisted = 2\n", "unlisted"),
+            ("__all__ = ['never_bound']\n", "never_bound"),
+            ("VALUE: int\n", "VALUE"),
+            ("VALUE = 1\ndel VALUE\n", "VALUE"),
+            ("__all__ = ['listed']\n__all__ += ['added']\nlisted = 1\nadded = 2\n", "listed"),
+            ("__all__ = ['listed']\n__all__.remove('listed')\nlisted = 1\n", "listed"),
+            ("names = ['listed']\n__all__ = names\nlisted = 1\n", "listed"),
+            ("if True:\n    __all__ = ['listed']\nlisted = 1\n", "listed"),
+        ):
+            with self.subTest(oracle=oracle_text, name=name):
+                oracle = self.probe("batch_oracle.py", oracle_text)
+                helper = self.probe("batch_helper.py", "from batch_oracle import *\n")
+                user = self.probe("user_probe.py", f"from batch_helper import {name}\n")
+                self.assertIn(f"{user}: the probe batch_helper has no name {name} at its top level\n", self.refused([user, helper, oracle]))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_the_all_of_a_repository_module_does_not_limit_what_a_probe_that_takes_its_star_passes_on(self) -> None:
+        (self.repo / "scripts" / "listing.py").write_text("__all__ = ['LISTED']\nLISTED = 1\n")
+        self.commit_files("scripts/listing.py")
+        oracle = self.probe("batch_oracle.py", "from scripts.listing import *\nVALUE = 1\n")
+        helper = self.probe("batch_helper.py", "from batch_oracle import *\n")
+        user = self.probe("user_probe.py", "from batch_helper import LISTED, VALUE\n")
+        self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
+
+    def test_probes_that_take_a_star_from_each_other_are_read_once_each_and_the_read_ends(self) -> None:
+        oracle = self.probe("batch_oracle.py", "from batch_helper import *\nVALUE = 1\n")
+        helper = self.probe("batch_helper.py", "from batch_oracle import *\nfrom batch_helper import *\n")
+        user = self.probe("user_probe.py", "from batch_helper import VALUE, MISSING\n")
+        siblings = {Path(name).stem: name for name in (user, helper, oracle)}
+        problems = runner_imports.sibling_problems(BoundedSource(self.repo), siblings)
+        self.assertEqual([f"{user}: the probe batch_helper has no name MISSING at its top level"], problems)
+        user = self.probe("user_probe.py", "from batch_helper import VALUE\n")
+        self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
 
     def test_a_star_import_from_outside_the_repository_lists_no_name_that_another_probe_can_take(self) -> None:
         oracle = self.probe("batch_oracle.py", "from json import *\n\ndef __getattr__(name):\n    return name\n")
