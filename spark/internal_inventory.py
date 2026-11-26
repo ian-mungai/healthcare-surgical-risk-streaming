@@ -199,8 +199,13 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "PinError", "load", "load_images", "main", "render_environment", "validate", "variable_name", "write",
     ),
     "scripts/images/publish.py": (
-        "PublishError", "Settings", "__init__", "build_arguments", "build_image", "default_settings", "docker", "git", "git_environment", "image_tag",
-        "main", "pin_path", "publish", "publish_image", "push_image", "pushed_digest", "require_clean", "stage",
+        "PublishError", "Settings", "__init__", "build_and_scan", "build_arguments", "build_image", "default_settings", "docker", "git",
+        "git_environment", "image_tag", "main", "pin_path", "prepare_image", "publish", "push_image", "pushed_digest", "refused_findings",
+        "require_clean", "stage",
+    ),
+    "scripts/images/scan.py": (
+        "Accepted", "Finding", "ScanError", "accepted_entry", "checked", "checked_artifact", "load_accepted", "located", "read_report",
+        "refused_constant", "reported", "require_success", "scan_arguments", "shown", "unaccepted", "unique_keys",
     ),
     "scripts/infra/__init__.py": (),
     "scripts/infra/aistor_licence.py": (

@@ -101,6 +101,7 @@ PROJECT_CLASSES = (
     "scripts.aws_cli.AwsTimeout",
     "scripts.images.pins.PinError",
     "scripts.images.publish.PublishError",
+    "scripts.images.scan.ScanError",
     "scripts.infra.aistor_licence.LicenceError",
     "scripts.infra.aistor_licence.NoLicenceSource",
     "scripts.infra.external_intake.IntakeError",

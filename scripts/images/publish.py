@@ -1,4 +1,4 @@
-"""Build each project image on this computer from the tracked files of HEAD, push it to the private Docker Hub repository and pin its pushed digest.
+"""Build each project image on this computer from the tracked files of HEAD, scan it, push it to the private Docker Hub repository and pin its pushed digest.
 
 The images come from ``compose_stack_built_images`` in the group variables. Each image's folder is staged from ``git archive`` of HEAD, so an untracked
 file and a Git-ignored file (the handoff, the project standard, ``.env``) cannot enter an image. The pin file is left out of every folder, because a pin of an
@@ -16,8 +16,14 @@ no host pulls it.
 Accepted limit (owner, Nov 25 2026): two publishes at the same time can replace the digest of a pinned tag, because each reads the pin file before the other has
 written it. The command takes no lock. Trigger to revisit: more than one person or process publishes. Today only the owner publishes, by hand.
 
-The command relies on the ``docker login`` that this computer already has. It reads, prints and writes no token, and every message is fixed text: no output
-of Docker or Git is ever shown.
+Scan gate: every image that the run builds is scanned with Docker Scout before any image is pushed (``scripts.images.scan``). One fixable finding that the
+committed list ``image_scan/accepted_findings.yml`` does not name, in any of them, refuses the whole push, and so does a scan that fails or writes no
+complete report. The refusal names each such finding of each image. An image whose tag the pin file already holds is not pushed and is not scanned again, so
+a finding published after its push shows only at a scan run by hand or when its sources change.
+
+The command relies on the ``docker login`` that this computer already has, which Docker Scout uses too. It reads, prints and writes no token, and every
+message is fixed text: no output of Docker or Git is ever shown. The one exception is a refused finding's vulnerability ID, package URL and artifact paths,
+each shown only when it matches its form.
 """
 
 from __future__ import annotations
@@ -34,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.images import pins
+from scripts.images import pins, scan
 from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ENV_FILE, ConfigurationError, load_configuration
@@ -43,16 +49,19 @@ PLATFORM = "linux/amd64"
 GIT_SECONDS = 120
 BUILD_SECONDS = 1800
 PUSH_SECONDS = 1800
+SCAN_SECONDS = 900
 STARTED_TEXT = "could not be started: it is not installed, not on the path or not executable"
 NOT_PLAIN = "a source holds a symbolic link or another file that is not a plain file"
 
 
 class PublishError(FixedTextError):
-    """A fixed-text failure. The text holds no output of Docker or Git. ``exit_status`` is the exit status of the Docker command that failed, if any."""
+    """A fixed-text failure. The text holds no output of Docker or Git. ``exit_status`` is the exit status of the Docker command that failed, if any.
+    ``findings`` holds one line for each finding that refused a push."""
 
-    def __init__(self, message: str, exit_status: int | None = None) -> None:
+    def __init__(self, message: str, exit_status: int | None = None, findings: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.exit_status = exit_status
+        self.findings = findings
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,7 @@ class Settings:
     repository: str
     pin_file: Path
     images: list[dict[str, Any]]
+    accepted_file: Path = scan.ACCEPTED_FILE
 
 
 def default_settings(env_file: Path = ENV_FILE) -> Settings:
@@ -178,35 +188,79 @@ def push_image(settings: Settings, name: str, tag: str) -> str:
     return pushed_digest(name, tag, out)
 
 
-def publish_image(settings: Settings, image: dict[str, Any], found: dict[str, dict[str, str]], scratch: Path) -> tuple[dict[str, dict[str, str]], str]:
-    """The pins with this image resolved, and the message. A tag that the pin file holds keeps its pin and runs no Docker command."""
+def prepare_image(settings: Settings, image: dict[str, Any], found: dict[str, dict[str, str]], scratch: Path) -> str | None:
+    """Build the image and return its tag. A tag that the pin file holds keeps its pin: nothing is built and None comes back."""
     name = image["name"]
     folder = scratch / name
     folder.mkdir()
     tag = image_tag(settings, image, stage(settings, image, folder))
     if found.get(name, {}).get("tag") == tag:
-        return found, f"{name}: already pinned"
+        return None
     build_image(settings, image, folder, tag)
-    digest = push_image(settings, name, tag)
-    return {**found, name: {"tag": tag, "digest": f"{settings.repository}@{digest}"}}, f"{name}: pushed and pinned"
+    return tag
+
+
+def refused_findings(settings: Settings, name: str, tag: str, accepted: frozenset[scan.Accepted], scratch: Path) -> list[scan.Finding]:
+    """Scan the built image into a new report and return its fixable findings that the accepted list does not name for this image and their artifacts."""
+    report = scratch / f"{name}.sarif"
+    code, _, _ = docker(settings, scan.scan_arguments(tag, report), SCAN_SECONDS, "docker scout cves")
+    if code != 0:
+        raise PublishError(
+            f"{name}: the scan failed with the exit status {code} of docker: check that docker scout works and is signed in on this computer", code
+        )
+    try:
+        found = scan.read_report(report.read_text(), code)
+    except (OSError, UnicodeDecodeError) as error:
+        raise PublishError(f"{name}: the scan wrote no readable report") from error
+    except scan.ScanError as error:
+        raise PublishError(f"{name}: {error}") from error
+    return scan.unaccepted(name, found, accepted)
+
+
+def build_and_scan(settings: Settings, found: dict[str, dict[str, str]], accepted: frozenset[scan.Accepted], scratch: Path) -> dict[str, str]:
+    """Build and scan every image whose tag the pin file lacks, and return each one's tag by its name. Every image is scanned before the refusal, so that
+    it names every finding at once."""
+    built: dict[str, str] = {}
+    refused: list[str] = []
+    for image in settings.images:
+        tag = prepare_image(settings, image, found, scratch)
+        if tag is None:
+            continue
+        name = image["name"]
+        built[name] = tag
+        refused += [f"{name}: {scan.shown(finding)}" for finding in refused_findings(settings, name, tag, accepted, scratch)]
+    if refused:
+        raise PublishError(
+            "nothing was pushed: the scan found fixable findings that image_scan/accepted_findings.yml does not name: fix each one, or accept one that no "
+            "release can fix with its reason and date",
+            findings=tuple(refused),
+        )
+    return built
 
 
 def publish(settings: Settings) -> list[str]:
-    """Publish every image of the list in order and write the pin file once, after the last image. A failure before then changes no pin: the next run pushes
-    again every tag that the pin file still lacks."""
+    """Publish every image of the list in order and write the pin file once, after the last image. Every image is built and scanned before the first push.
+    A failure before the pin file is written changes no pin: the next run pushes again every tag that the pin file still lacks."""
     require_clean(settings)
     try:
         found = pins.load(settings.pin_file)
-    except pins.PinError as error:
+        accepted = scan.load_accepted(settings.accepted_file)
+    except (pins.PinError, scan.ScanError) as error:
         raise PublishError(str(error)) from error
     if any(not value["digest"].startswith(settings.repository + "@") for value in found.values()):
         raise PublishError("the pin file holds another repository than IMAGE_REPOSITORY")
-    resolved = found
+    resolved = dict(found)
     messages: list[str] = []
     with tempfile.TemporaryDirectory(prefix="images_") as scratch:
+        built = build_and_scan(settings, found, accepted, Path(scratch))
         for image in settings.images:
-            resolved, message = publish_image(settings, image, resolved, Path(scratch))
-            messages.append(message)
+            name = image["name"]
+            if name not in built:
+                messages.append(f"{name}: already pinned")
+                continue
+            digest = push_image(settings, name, built[name])
+            resolved[name] = {"tag": built[name], "digest": f"{settings.repository}@{digest}"}
+            messages.append(f"{name}: pushed and pinned")
     if resolved != found:
         try:
             pins.write(settings.pin_file, resolved)
@@ -224,6 +278,8 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
             sys.stdout.write(message + "\n")
     except PublishError as error:
         sys.stderr.write(f"publish: {describe_error(error)}\n")
+        for line in error.findings:
+            sys.stderr.write(f"publish: {line}\n")
         status = error.exit_status
         return status if status is not None and 0 < status < 256 else 1
     return 0
