@@ -207,37 +207,80 @@ class HeldRead:
         self.outcome = outcome
 
 
+KAFKA, POSTGRES, OPENBAO, OTHER = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+KAFKA_ROW = (KAFKA, "p2_join3_test-kafka-1", "512MiB / 1GiB")
+OPENBAO_ROW = (OPENBAO, "p2_join3_test-openbao-1", "64MiB / 1GiB")
+# What Docker CLI 29.9.3 prints for a running container whose first stats response timed out: no name and no figure.
+NAMELESS_ROW = (OPENBAO, "--", "-- / --")
+
+
+class Sample:
+    """One read of the sampler: the rows of ``docker stats``, each as container ID, name and memory usage, and the IDs that the listing of the project's
+    running containers names before the stats command and after it. A listing can also be a failed answer or an exception."""
+
+    def __init__(self, *rows: tuple[str, str, str], before: Any = (KAFKA,), after: Any = None) -> None:
+        self.rows, self.before, self.after = rows, before, before if after is None else after
+
+
 class Stats:
-    """The ``docker stats`` command of the memory sampler. It answers the planted reads in their order, an exception being raised, and then complete samples.
-    ``answered`` is set at the first read after the planted ones, or at a held one, when the sampler has finished each read before it."""
+    """The Docker commands of the memory sampler. It answers the planted reads in their order, an exception being raised, and then complete samples. Each
+    row of ``docker stats`` is printed as the runner's own ``--format`` asks for it. ``answered`` is set at the first read after the planted ones, or at a held
+    one, when the sampler has finished each read before it."""
+
+    LISTING = ["ps", "-q", "--no-trunc", "--filter", "label=com.docker.compose.project=p2_join3_test"]
 
     def __init__(self, *reads: Any) -> None:
         self.reads = list(reads)
         self.answered = threading.Event()
+        self.after: Any = None
 
     @staticmethod
     def completed(code: int, out: str, error: str = "") -> CompletedProcess[str]:
         return CompletedProcess(["docker", "stats"], code, out, error)
 
     @classmethod
-    def sample(cls) -> CompletedProcess[str]:
-        return cls.completed(0, "p2_join3_test-kafka-1\t512MiB / 1GiB\n")
+    def sample(cls) -> Sample:
+        return Sample(KAFKA_ROW)
+
+    def listing(self, listed: Any) -> CompletedProcess[str]:
+        if isinstance(listed, BaseException):
+            raise listed
+        if isinstance(listed, CompletedProcess):
+            return listed
+        return self.completed(0, "".join(f"{identifier}\n" for identifier in listed))
 
     def __call__(self, program: str, arguments: list[str], **_: object) -> CompletedProcess[str]:
+        if program == "docker" and arguments == self.LISTING:
+            if self.after is not None:
+                listed, self.after = self.after, None
+                return self.listing(listed)
+            upcoming = self.reads[0] if self.reads and isinstance(self.reads[0], Sample) else self.sample()
+            if isinstance(upcoming.before, (BaseException, CompletedProcess)):
+                self.reads.pop(0)  # a listing that fails ends its read before the stats command
+            return self.listing(upcoming.before)
         if (program, arguments[0]) != ("docker", "stats"):
-            raise AssertionError("no command of the computer runs in this test")
+            raise AssertionError("no other command of the computer runs in this test")
+        self.after = None
         if not self.reads:
             self.answered.set()
-            return self.sample()
-        planted = self.reads.pop(0)
+            planted: Any = self.sample()
+        else:
+            planted = self.reads.pop(0)
         if isinstance(planted, HeldRead):
             self.answered.set()
             planted.release.wait(30)
             planted = planted.outcome
         if isinstance(planted, BaseException):
             raise planted
-        answer: CompletedProcess[str] = planted
-        return answer
+        if isinstance(planted, CompletedProcess):
+            return planted
+        self.after = planted.after
+        template = arguments[arguments.index("--format") + 1]
+        lines = []
+        for identifier, name, usage in planted.rows:
+            line = template.replace("{{.Container}}", identifier).replace("{{.Name}}", name).replace("{{.MemUsage}}", usage)
+            lines.append(f"{line}\n")
+        return self.completed(0, "".join(lines))
 
 
 @unittest.skipUnless(present("stack_joined"), ABSENT)
@@ -413,15 +456,42 @@ class JoinedStackCleanup(unittest.TestCase):
             ("a deadline", TimeoutExpired("docker", 120), "TimeoutExpired"),
             ("a command that cannot start", OSError("planted"), "OSError: planted"),
             ("an exit that is not zero", Stats.completed(1, "", "Cannot connect to the Docker daemon"), "exit 1: Cannot connect to the Docker daemon"),
-            ("a figure that is no number", Stats.completed(0, "p2_join3_test-kafka-1\t1.2.3MiB / 1GiB\n"), "ValueError"),
-            ("no figure for a container", Stats.completed(0, "p2_join3_test-kafka-1\tN/A / 1GiB\n"), "p2_join3_test-kafka-1: 'N/A / 1GiB'"),
-            ("a dash for a container", Stats.completed(0, "p2_join3_test-kafka-1\t-- / --\n"), "p2_join3_test-kafka-1: '-- / --'"),
-            ("a unit that is not known", Stats.completed(0, "p2_join3_test-kafka-1\t5PiB / 9PiB\n"), "p2_join3_test-kafka-1: '5PiB / 9PiB'"),
-            ("a row with no usage", Stats.completed(0, "p2_join3_test-kafka-1\n"), "p2_join3_test-kafka-1: ''"),
+            ("a figure that is no number", Sample((KAFKA, "p2_join3_test-kafka-1", "1.2.3MiB / 1GiB")), "ValueError"),
+            ("no figure for a container", Sample((KAFKA, "p2_join3_test-kafka-1", "N/A / 1GiB")), "p2_join3_test-kafka-1: 'N/A / 1GiB'"),
+            ("a dash for a container", Sample((KAFKA, "p2_join3_test-kafka-1", "-- / --")), "p2_join3_test-kafka-1: '-- / --'"),
+            ("a unit that is not known", Sample((KAFKA, "p2_join3_test-kafka-1", "5PiB / 9PiB")), "p2_join3_test-kafka-1: '5PiB / 9PiB'"),
+            ("a row with no usage", Sample((KAFKA, "p2_join3_test-kafka-1", "")), "p2_join3_test-kafka-1: ''"),
             (
                 "one container without a figure beside one with it",
-                Stats.completed(0, "p2_join3_test-postgres-1\t64MiB / 1GiB\np2_join3_test-kafka-1\tN/A / 1GiB\n"),
+                Sample((POSTGRES, "p2_join3_test-postgres-1", "64MiB / 1GiB"), (KAFKA, "p2_join3_test-kafka-1", "N/A / 1GiB"), before=(KAFKA, POSTGRES)),
                 "p2_join3_test-kafka-1: 'N/A / 1GiB'",
+            ),
+            (
+                "the nameless row of a running container whose first stats response timed out",
+                Sample(KAFKA_ROW, NAMELESS_ROW, before=(KAFKA, OPENBAO)),
+                f"--: '-- / --' (container {OPENBAO[:12]})",
+            ),
+            (
+                "a figure with no name for a running container",
+                Sample(KAFKA_ROW, (OPENBAO, "--", "64MiB / 1GiB"), before=(KAFKA, OPENBAO)),
+                f"--: '64MiB / 1GiB' (container {OPENBAO[:12]})",
+            ),
+            (
+                "a nameless row of a container that started during the read and still runs",
+                Sample(KAFKA_ROW, NAMELESS_ROW, before=(KAFKA,), after=(KAFKA, OPENBAO)),
+                f"--: '-- / --' (container {OPENBAO[:12]})",
+            ),
+            ("no row for a running container", Sample(KAFKA_ROW, before=(KAFKA, OPENBAO)), f"no row for the running containers {OPENBAO[:12]}"),
+            ("no row at all while a container runs", Sample(), f"no row for the running containers {KAFKA[:12]}"),
+            (
+                "a listing before the read that fails",
+                Sample(KAFKA_ROW, before=Stats.completed(1, "", "Cannot connect to the Docker daemon")),
+                "docker ps exit 1: Cannot connect to the Docker daemon",
+            ),
+            (
+                "a listing after the read that passes its deadline",
+                Sample(KAFKA_ROW, before=(KAFKA,), after=TimeoutExpired("docker", 120)),
+                "TimeoutExpired",
             ),
         ):
             with self.subTest(words):
@@ -438,12 +508,44 @@ class JoinedStackCleanup(unittest.TestCase):
                 self.assertEqual([], stats.reads, "the sampler reads on after a failed read")
 
     def test_sampling_with_no_failed_read_lets_the_memory_peaks_be_evaluated_and_the_run_passes(self) -> None:
-        other = Stats.completed(0, "another_project-kafka-1\tN/A / 1GiB\np2_join3_test-kafka-1\t512MiB / 1GiB\n")
-        self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), other)))
+        self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), Stats.sample())))
         document = self.saved()
         self.assertEqual("", self.failed(document))
         self.assertEqual([{"kafka": 512.0}], [run.peaks for run in self.peaks_evaluated])
         self.assertEqual([True], self.read_checks(document))
+
+    def test_the_rows_of_containers_outside_the_project_are_ignored_whatever_their_names_and_figures(self) -> None:
+        for words, row in (
+            ("another project", (OTHER, "another_project-kafka-1", "N/A / 1GiB")),
+            ("no name and no figure", (OTHER, "--", "-- / --")),
+            ("a name that starts as the project's names do", (OTHER, "p2_join3_test-kafka-9", "N/A / 1GiB")),
+            ("a name of the project and a large figure", (OTHER, "p2_join3_test-kafka-9", "900GiB / 900GiB")),
+        ):
+            with self.subTest(words):
+                self.again()
+                other = Sample(KAFKA_ROW, row)
+                self.assertEqual(0, self.main(nothing_left, stats=Stats(Stats.sample(), other, Stats.sample())))
+                document = self.saved()
+                self.assertEqual("", self.failed(document))
+                self.assertEqual([{"kafka": 512.0}], [run.peaks for run in self.peaks_evaluated])
+
+    def test_a_container_that_stops_or_starts_during_a_read_needs_no_row_and_one_that_stopped_needs_no_figure(self) -> None:
+        for words, read, peaks in (
+            ("stopped, with no row", Sample(KAFKA_ROW, before=(KAFKA, OPENBAO), after=(KAFKA,)), {"kafka": 512.0}),
+            ("stopped, with a nameless row", Sample(KAFKA_ROW, NAMELESS_ROW, before=(KAFKA, OPENBAO), after=(KAFKA,)), {"kafka": 512.0}),
+            ("stopped, with a figure", Sample(KAFKA_ROW, OPENBAO_ROW, before=(KAFKA, OPENBAO), after=(KAFKA,)), {"kafka": 512.0, "openbao": 64.0}),
+            ("started, with no row", Sample(KAFKA_ROW, before=(KAFKA,), after=(KAFKA, OPENBAO)), {"kafka": 512.0}),
+            ("started, with a figure", Sample(KAFKA_ROW, OPENBAO_ROW, before=(KAFKA,), after=(KAFKA, OPENBAO)), {"kafka": 512.0, "openbao": 64.0}),
+            ("no container yet", Sample(before=()), {"kafka": 512.0}),
+        ):
+            with self.subTest(words):
+                self.again()
+                stats = Stats(Stats.sample(), read, Stats.sample())
+                self.assertEqual(0, self.main(nothing_left, stats=stats))
+                document = self.saved()
+                self.assertEqual("", self.failed(document))
+                self.assertEqual([peaks], [run.peaks for run in self.peaks_evaluated])
+                self.assertEqual([], stats.reads)
 
     def test_a_listing_that_times_out_while_a_container_remains_is_a_cleanup_failure_and_the_record_is_saved(self) -> None:
         docker = ProjectDocker(("volume ls", 2))
