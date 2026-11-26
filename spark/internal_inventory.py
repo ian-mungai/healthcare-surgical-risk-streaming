@@ -204,7 +204,8 @@ INVENTORY: dict[str, tuple[str, ...]] = {
         "require_clean", "stage",
     ),
     "scripts/images/scan.py": (
-        "Finding", "ScanError", "checked", "load_accepted", "read_report", "reported", "scan_arguments", "unaccepted",
+        "Finding", "ScanError", "checked", "load_accepted", "read_report", "reported", "require_success", "scan_arguments", "unaccepted",
+        "unique_keys",
     ),
     "scripts/infra/__init__.py": (),
     "scripts/infra/created.py": (

@@ -5,8 +5,11 @@ for its push. A finding is the vulnerability's ID and the package URL with its v
 names that exact pair, so an entry never carries over to another version of the package. ``image_scan/accepted_findings.yml`` is outside every image's
 sources, so a change in it changes no image tag.
 
-Everything that is not a complete report is refused and is never read as a clean image: a missing or unreadable file, another format or tool, and a result
-that does not name exactly one package. Only an ID and a package URL that match their forms are ever shown.
+Everything that is not a complete report is refused and is never read as a clean image: a missing or unreadable file, another format or tool, an object that
+holds a key twice (a second, empty list of results would hide the first), a run without invocations that all report ``executionSuccessful`` as true, and a
+result that does not name exactly one package. Only an ID and a package URL that match their forms are ever shown.
+
+Known conflict (open, Nov 25 2026): the Docker Scout 1.28.0 reports that were read on that day hold no ``invocations`` at all, so this gate refuses them.
 """
 
 from __future__ import annotations
@@ -63,18 +66,35 @@ def reported(result: Any) -> Finding:
     return checked(cve, urllib.parse.unquote(packages[0].partition("?")[0]))
 
 
+def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """One JSON object. ``json.loads`` keeps the last value of a repeated key without a word, so a repeated key is refused."""
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ScanError("the scan report holds a key twice in one object")
+    return found
+
+
+def require_success(run: dict[str, Any]) -> None:
+    invocations = run.get("invocations")
+    if not (isinstance(invocations, list) and invocations and all(isinstance(one, dict) and one.get("executionSuccessful") is True for one in invocations)):
+        raise ScanError("the scan report does not say that its execution succeeded")
+
+
 def read_report(text: str) -> frozenset[Finding]:
     """The findings of a complete SARIF 2.1.0 report of Docker Scout."""
     try:
-        document = json.loads(text)
+        document = json.loads(text, object_pairs_hook=unique_keys)
         version = document["version"]
         (run,) = document["runs"]
         tool = run["tool"]["driver"]["name"]
         results = run["results"]
-    except (ValueError, KeyError, TypeError) as error:
+    except ScanError:
+        raise
+    except (ValueError, KeyError, TypeError, RecursionError) as error:
         raise ScanError("the scan report is not one complete SARIF run") from error
     if version != "2.1.0" or tool != "docker scout" or not isinstance(results, list):
         raise ScanError("the scan report is not a SARIF 2.1.0 report of docker scout with a list of results")
+    require_success(run)
     return frozenset(reported(result) for result in results)
 
 

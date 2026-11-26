@@ -26,7 +26,8 @@ def result(cve: str = "CVE-2026-1111", purl: str = NETTY) -> dict[str, Any]:
 
 
 def report(*results: dict[str, Any]) -> dict[str, Any]:
-    return {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "docker scout", "rules": []}}, "results": list(results)}]}
+    run = {"tool": {"driver": {"name": "docker scout", "rules": []}}, "invocations": [{"executionSuccessful": True}], "results": list(results)}
+    return {"version": "2.1.0", "runs": [run]}
 
 
 def accepted_text(*entries: str) -> str:
@@ -75,6 +76,56 @@ class ReportTest(unittest.TestCase):
         for name, text in cases.items():
             with self.subTest(report=name), self.assertRaises(ScanError):
                 scan.read_report(text)
+
+
+class CompletionTest(unittest.TestCase):
+    def refused(self, text: str) -> None:
+        with self.assertRaises(ScanError):
+            scan.read_report(text)
+
+    def test_a_run_passes_only_when_every_invocation_says_that_its_execution_succeeded(self) -> None:
+        good = {"executionSuccessful": True}
+        cases: dict[str, Any] = {
+            "no invocation in the list": [],
+            "not a list": good,
+            "null": None,
+            "an invocation that is text": ["x"],
+            "no statement": [{}],
+            "failed": [{"executionSuccessful": False}],
+            "the text true": [{"executionSuccessful": "true"}],
+            "the number 1": [{"executionSuccessful": 1}],
+            "the second one failed": [good, {"executionSuccessful": False}],
+        }
+        for name, invocations in cases.items():
+            for results in ((), (result(),)):
+                with self.subTest(case=name, results=len(results)):
+                    document = report(*results)
+                    document["runs"][0]["invocations"] = invocations
+                    self.refused(json.dumps(document))
+        two = report()
+        two["runs"][0]["invocations"] = [good, good]
+        self.assertEqual(frozenset(), scan.read_report(json.dumps(two)))
+
+    def test_a_run_without_invocations_is_refused_which_is_the_shape_that_scout_1_28_0_wrote_on_nov_25_2026(self) -> None:
+        """The reports that were read then held no invocations at all, so the gate refuses what that version writes until the owner decides otherwise."""
+        document = report()
+        del document["runs"][0]["invocations"]
+        self.refused(json.dumps(document))
+
+    def test_a_key_that_one_object_holds_twice_is_refused_because_the_last_value_would_hide_the_first(self) -> None:
+        text = json.dumps(report())
+        finding = json.dumps([result()])
+        cases = {
+            "two result lists, the last one empty": text.replace('"results": []', f'"results": {finding}, "results": []'),
+            "two statements of success": text.replace('"executionSuccessful": true', '"executionSuccessful": false, "executionSuccessful": true'),
+            "two run lists": text.replace('"runs": ', '"runs": [], "runs": '),
+            "two rules in one result": json.dumps(report(result())).replace('"ruleId": ', '"ruleId": "CVE-2026-2222", "ruleId": '),
+        }
+        for name, changed in cases.items():
+            with self.subTest(case=name):
+                self.assertNotIn(changed, (text, json.dumps(report(result()))), "the case changed the report")
+                with self.assertRaisesRegex(ScanError, "a key twice"):
+                    scan.read_report(changed)
 
 
 class AcceptedListTest(unittest.TestCase):

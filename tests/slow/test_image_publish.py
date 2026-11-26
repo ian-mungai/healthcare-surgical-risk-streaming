@@ -53,7 +53,8 @@ if args[:2] == ["scout", "cves"]:
         sys.exit(int((here / ("scan_fails_" + image)).read_text()))
     if not (here / ("no_report_" + image)).exists():
         planted = here / ("report_" + image)
-        clean = {{"version": "2.1.0", "runs": [{{"tool": {{"driver": {{"name": "docker scout"}}}}, "results": []}}]}}
+        run = {{"tool": {{"driver": {{"name": "docker scout"}}}}, "invocations": [{{"executionSuccessful": True}}], "results": []}}
+        clean = {{"version": "2.1.0", "runs": [run]}}
         Path(args[args.index("--output") + 1]).write_text(planted.read_text() if planted.exists() else json.dumps(clean))
     sys.exit(0)
 if args[:1] == ["push"]:
@@ -438,7 +439,11 @@ FINDING_PACKAGE = "pkg:maven/io.netty/netty-handler@4.2.7"
 class ScanGateTest(Case):
     def plant(self, image: str, cve: str) -> None:
         text = f"Vulnerability    :{cve}  \nPackage          :{FINDING_PACKAGE}  \nFixed version    :9  \n"
-        run = {"tool": {"driver": {"name": "docker scout"}}, "results": [{"ruleId": cve, "message": {"text": text}}]}
+        self.plant_report(image, [{"ruleId": cve, "message": {"text": text}}])
+
+    def plant_report(self, image: str, results: list[dict[str, Any]], invocations: list[dict[str, Any]] | None = None) -> None:
+        run: dict[str, Any] = {"tool": {"driver": {"name": "docker scout"}}, "results": results}
+        run["invocations"] = [{"executionSuccessful": True}] if invocations is None else invocations
         (self.bin / f"report_{image}").write_text(json.dumps({"version": "2.1.0", "runs": [run]}))
 
     def refusal(self) -> PublishError:
@@ -492,6 +497,24 @@ class ScanGateTest(Case):
                 self.assertNotIn(CANARY_TEXT, text)
                 self.assert_nothing_pushed_or_pinned()
                 (self.bin / marker).unlink()
+
+    def test_a_clean_report_of_an_execution_that_did_not_succeed_or_that_does_not_say_so_pushes_nothing(self) -> None:
+        cases: dict[str, list[dict[str, Any]]] = {"failed": [{"executionSuccessful": False}], "no invocation": [], "no statement": [{}]}
+        for label, invocations in cases.items():
+            with self.subTest(case=label):
+                self.plant_report("tool", [], invocations)
+                self.assertIn("tool: the scan report does not say that its execution succeeded", str(self.refusal()))
+                self.assert_nothing_pushed_or_pinned()
+
+    def test_a_report_that_holds_a_second_empty_result_list_after_a_finding_pushes_nothing(self) -> None:
+        self.plant("tool", "CVE-2026-1111")
+        path = self.bin / "report_tool"
+        text = path.read_text()
+        changed = text.replace('], "invocations": ', '], "results": [], "invocations": ')
+        self.assertNotEqual(text, changed)
+        path.write_text(changed)
+        self.assertIn("tool: the scan report holds a key twice in one object", str(self.refusal()))
+        self.assert_nothing_pushed_or_pinned()
 
     def test_an_unreadable_accepted_list_stops_the_command_before_any_docker_call(self) -> None:
         self.accepted_file.write_text("findings:\n")
