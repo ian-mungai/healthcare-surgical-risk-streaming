@@ -72,29 +72,98 @@ class JoinedStackSteps(unittest.TestCase):
         self.assertEqual([("image", "inspect", references["IMAGE_DAGSTER"])], asked)
 
 
+class Listings:
+    """What the two Docker listings of the runner answer: the running services of the project, and the containers of one service (none)."""
+
+    def __init__(self, running: list[str], *, services: tuple[int, str] | None = None, containers: tuple[int, str] = (0, "")) -> None:
+        self.services = services if services is not None else (0, "".join(f"{name}\n" for name in running))
+        self.containers = containers
+        self.asked: list[tuple[str, ...]] = []
+
+    def __call__(self, *arguments: str) -> tuple[int, str]:
+        self.asked.append(arguments)
+        return self.containers if "-aq" in arguments else self.services
+
+
+FAILED_ANSWERS = ((1, "Cannot connect to the Docker daemon"), (1, ""))
+
+
 @unittest.skipUnless(present("stack_joined"), ABSENT)
 class JoinedStackAdmission(unittest.TestCase):
-    def test_the_boundary_and_the_spark_group_refusal_hold_against_the_real_commands_with_aistor_skipped(self) -> None:
-        runner: Any = import_runner("stack_joined")
+    def setUp(self) -> None:
+        self.runner: Any = import_runner("stack_joined")
         limits = load_limits()
-        running = sorted(name for name, entry in limits.services.items() if entry.group == "supporting" and name not in LICENSED_SERVICES)
-        observed: list[tuple[str, bool, str]] = []
+        self.running = sorted(name for name, entry in limits.services.items() if entry.group == "supporting" and name not in LICENSED_SERVICES)
+        self.observed: list[tuple[str, bool, str]] = []
+
+    def run_with(self, listings: Listings) -> Any:
+        """The runner's own ``Run`` with its Docker command replaced, so its lookups are the ones that the host's check uses."""
 
         def expect(case: str, kind: str, expected: str, seen: str, passed: bool) -> bool:
-            observed.append((case, passed, seen))
+            self.observed.append((case, passed, seen))
             return passed
 
-        run = types.SimpleNamespace(
-            record=types.SimpleNamespace(expect=expect),
-            docker=lambda *arguments: (0, "\n".join(running)),
-            container=lambda service: "",
-            compose=ROOT / "compose",
-            project="p2_join3_test",
-            environment={},
-        )
-        runner.admission_cases(run)
-        self.assertEqual(3, len(observed))
-        self.assertEqual([], [(case, seen) for case, passed, seen in observed if not passed])
+        run = self.runner.Run.__new__(self.runner.Run)
+        run.record = types.SimpleNamespace(expect=expect)
+        run.docker = listings
+        run.compose, run.project, run.environment = ROOT / "compose", "p2_join3_test", {}
+        return run
+
+    def passed(self) -> list[str]:
+        return [case for case, passed, _ in self.observed if passed]
+
+    def test_the_boundary_and_the_spark_group_refusal_hold_against_the_real_commands_with_aistor_skipped(self) -> None:
+        self.runner.admission_cases(self.run_with(Listings(self.running)))
+        self.assertEqual(4, len(self.observed), self.observed)
+        self.assertEqual([], [(case, seen) for case, passed, seen in self.observed if not passed])
+
+    def test_a_listing_of_the_running_services_that_fails_stops_the_cases_before_the_boundary(self) -> None:
+        for answer in FAILED_ANSWERS:
+            with self.subTest(answer=answer), mock.patch.object(self.runner, "run_command") as command:
+                self.observed.clear()
+                self.runner.admission_cases(self.run_with(Listings(self.running, services=answer, containers=answer)))
+                self.assertEqual([False], [passed for _, passed, _ in self.observed], self.observed)
+                self.assertIn("listing exit 1", self.observed[0][2])
+                command.assert_not_called()
+
+    def test_running_services_other_than_the_always_on_ones_stop_the_cases_before_the_boundary(self) -> None:
+        for words, running, named in (
+            ("one missing", self.running[1:], f"missing: ['{self.running[0]}']"),
+            ("one more", [*self.running, "spark_bronze"], "unexpected: ['spark_bronze']"),
+            ("none", [], f"missing: {self.running}"),
+        ):
+            with self.subTest(words), mock.patch.object(self.runner, "run_command") as command:
+                self.observed.clear()
+                self.runner.admission_cases(self.run_with(Listings(running)))
+                self.assertEqual([False], [passed for _, passed, _ in self.observed], self.observed)
+                self.assertIn(named, self.observed[0][2])
+                command.assert_not_called()
+
+    def test_a_container_lookup_that_fails_is_an_error_and_never_proof_that_no_container_exists(self) -> None:
+        self.assertTrue(issubclass(self.runner.ListingFailed, RuntimeError), "the run's own handler records it as a failed run")
+        for answer in FAILED_ANSWERS:
+            with self.subTest(answer=answer):
+                self.observed.clear()
+                run = self.run_with(Listings(self.running, containers=answer))
+                with self.assertRaisesRegex(self.runner.ListingFailed, "exit 1"):
+                    run.container("spark_bronze")
+                with self.assertRaisesRegex(self.runner.ListingFailed, "exit 1"):
+                    self.runner.admission_cases(run)
+                self.assertNotIn("group command on the Spark group (planted)", self.passed())
+
+    def test_the_removal_of_the_project_is_proven_only_by_listings_that_succeed_and_are_empty(self) -> None:
+        for words, answer, removed in (("empty", (0, ""), True), *((f"failed {text!r}", (code, text), False) for code, text in FAILED_ANSWERS)):
+            with self.subTest(words):
+                asked: list[tuple[str, ...]] = []
+
+                def docker(*arguments: str, answer: tuple[int, str] = answer, asked: list[tuple[str, ...]] = asked) -> tuple[int, str]:
+                    asked.append(arguments)
+                    return answer
+
+                run = self.run_with(Listings(self.running))
+                run.docker = docker
+                self.assertIs(removed, run.remove_project())
+                self.assertEqual([], [words for words in asked if "rm" in words], "the words of a failed listing are no names to remove")
 
 
 @unittest.skipUnless(present("stack_monitoring"), ABSENT)
