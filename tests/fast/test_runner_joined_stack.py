@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -203,8 +204,20 @@ class JoinedStackCleanup(unittest.TestCase):
         self.root = Path(folder.name).resolve()
         (self.root / "manifest_reference.json").write_text("{}")
         self.scratch: list[Path] = []
+        self.peaks_evaluated: list[Any] = []
 
-    def main(self, docker: ProjectDocker, step: BaseException | None = None) -> int:
+    def sampler(self, *, ends: bool) -> threading.Thread:
+        """A thread in the place of the memory sampler. With ``ends`` False it stays alive, as a sampler does whose command outlasts the runner's wait."""
+        release = threading.Event()
+        thread = threading.Thread(target=release.wait, args=(30,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(release.set)
+        if ends:
+            release.set()
+        return thread
+
+    def main(self, docker: ProjectDocker, step: BaseException | None = None, sampler: threading.Thread | None = None) -> int:
         real_run = self.runner.Run
 
         def make_run(record: Any, log: list[str], scratch: Path, *others: object) -> Any:
@@ -212,7 +225,7 @@ class JoinedStackCleanup(unittest.TestCase):
             self.addCleanup(shutil.rmtree, scratch, True)
             run = real_run.__new__(real_run)
             run.record, run.log, run.scratch, run.project, run.docker = record, log, scratch, "p2_join3_test", docker
-            run.sampling, run.sampler = self.runner.threading.Event(), None
+            run.sampling, run.sampler = self.runner.threading.Event(), sampler
             run.place_k3s_stand_ins = run.start_sampling = lambda: None
             run.peaks, run.grafana_mib = {}, None
             return run
@@ -225,7 +238,8 @@ class JoinedStackCleanup(unittest.TestCase):
         replaced: dict[str, Any] = {
             "Run": make_run,
             "first_deploy": first_deploy,
-            "peak_memory": lambda run: None,
+            "peak_memory": self.peaks_evaluated.append,
+            "COMMAND_SECONDS": 0.2 if sampler is not None else self.runner.COMMAND_SECONDS,
             "require_pinned_images": lambda docker: None,
             "recorded_state": lambda root: ("0" * 40, "0" * 64),
             "fill_landed_cache": lambda folder, cases: {},
@@ -250,6 +264,22 @@ class JoinedStackCleanup(unittest.TestCase):
     @staticmethod
     def failed(document: dict[str, Any]) -> str:
         return "\n".join(f"{item['case']}: {item['observed']}" for item in document["observations"] if not item["passed"])
+
+    def test_a_sampler_that_misses_its_deadline_fails_the_run_before_the_memory_peaks_are_evaluated(self) -> None:
+        self.assertEqual(1, self.main(ProjectDocker(), sampler=self.sampler(ends=False)))
+        document = self.saved()
+        self.assertEqual("fail", document["outcome"])
+        self.assertEqual([], self.peaks_evaluated, "peaks that the sampler can still change are not evaluated")
+        self.assertIn("memory sampling ended before the peaks: the sampler is still running", self.failed(document))
+        self.assertIn("sampling stopped: stopped: False", self.failed(document))
+        self.assertRegex(document["cleanup"], r"^cleanup failed \(sampling stopped\b")
+
+    def test_a_sampler_that_ends_in_time_lets_the_memory_peaks_be_evaluated_and_is_a_clean_stop(self) -> None:
+        self.main(ProjectDocker(), sampler=self.sampler(ends=True))
+        document = self.saved()
+        self.assertEqual(1, len(self.peaks_evaluated))
+        self.assertNotIn("sampl", self.failed(document))
+        self.assertIn("sampling stopped: True", document["cleanup"])
 
     def test_a_listing_that_times_out_while_a_container_remains_is_a_cleanup_failure_and_the_record_is_saved(self) -> None:
         docker = ProjectDocker(("volume ls", 2))
