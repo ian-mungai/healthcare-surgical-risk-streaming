@@ -1616,7 +1616,12 @@ class PlaybookTest(unittest.TestCase):
         if not isinstance(playbook, list):
             self.fail("the playbook must be a list")
         roles = [str(role) for role in playbook[0]["roles"]]
-        self.assertEqual("compose_stack", roles[-1], "the host playbook ends with the part that prepares OpenBao and installs the intake script")
+        self.assertEqual(
+            ["compose_stack", "runner_checkout"],
+            roles[-2:],
+            "the part that prepares OpenBao and installs the intake script runs before the runner checkout, which reads nothing of the stack and writes only "
+            "its own folders: a checkout that fails cannot leave the secret store unprepared",
+        )
         self.assertNotIn("airbyte", roles, "the role needs the images that the stack playbook pulls with the token that the intake stores")
         self.assertEqual([("compose_stack", "deploy.yml"), ("airbyte", "main.yml")], included_roles("stack.yml"))
 
