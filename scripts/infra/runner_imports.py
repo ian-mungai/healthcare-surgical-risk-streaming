@@ -181,7 +181,8 @@ def plain_targets(target: ast.expr) -> set[str]:
 
 def unconditional_names(source: Source, tree: ast.Module, file: str, siblings: Mapping[str, str], seen: frozenset[str]) -> set[str]:
     """The names that a probe binds by a statement of its own top level: a ``def``, a ``class``, a plain assignment or an import, less those that a later such
-    ``del`` removes. A binding inside any other statement and a walrus bind nothing here. A star import of a repository module gives every name of it."""
+    ``del`` removes. A binding inside any other statement and a walrus bind nothing here. A name that a ``from`` import takes from another probe counts only
+    when that probe binds it in the same way (``probe_names``). A star import of a repository module gives every name of it."""
     names: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
@@ -191,9 +192,12 @@ def unconditional_names(source: Source, tree: ast.Module, file: str, siblings: M
         elif isinstance(node, ast.Import):
             names |= {alias.asname or alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom):
+            sibling = node.module if not node.level and node.module in siblings else None
+            held = probe_names(source, siblings[sibling], siblings, seen) if sibling else None
             for alias in node.names:
                 if alias.name != "*":
-                    names.add(alias.asname or alias.name)
+                    if held is None or alias.name in held:
+                        names.add(alias.asname or alias.name)
                     continue
                 target = absolute_module(file, node.level, node.module) if node.level else node.module
                 if not node.level and target and target in siblings:
@@ -203,6 +207,14 @@ def unconditional_names(source: Source, tree: ast.Module, file: str, siblings: M
         elif isinstance(node, ast.Delete):
             names -= set().union(*(target_names(target, ast.Del) for target in node.targets))
     return names
+
+
+def probe_names(source: Source, path: str, siblings: Mapping[str, str], seen: frozenset[str]) -> set[str]:
+    """The names that the probe at ``path`` is shown to bind (``unconditional_names``), and none when it cannot be read or is already being read, because a
+    cycle of imports shows nothing."""
+    text = None if path in seen else source.read(path)
+    tree = parsed(text, path) if text is not None else None
+    return unconditional_names(source, tree, path, siblings, seen | {path}) if isinstance(tree, ast.Module) else set()
 
 
 def star_names(source: Source, path: str, siblings: Mapping[str, str], seen: frozenset[str] = frozenset()) -> set[str]:
@@ -262,13 +274,53 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
     return names, open_ended
 
 
+def imports_reach(source: Source, start: str, goal: str, siblings: Mapping[str, str]) -> bool:
+    """Whether the probe at ``start`` is ``goal``, or imports it, directly or through other probes, by any import at any depth."""
+    pending: list[str] = [start]
+    seen: set[str] = set()
+    while pending:
+        path = pending.pop()
+        if path == goal:
+            return True
+        if path in seen:
+            continue
+        seen.add(path)
+        text = source.read(path)
+        tree = parsed(text, path) if text is not None else None
+        if tree is not None:
+            pending += [siblings[top] for module, _ in imported_names(tree, path) if (top := (module or "").partition(".")[0]) in siblings]
+    return False
+
+
+def listed_import_problems(source: Source, file: str, tree: ast.AST, siblings: Mapping[str, str]) -> list[str]:
+    """One line for each entry of the ``plain_all`` of ``file`` that a top-level ``from`` import takes from a probe that is not shown to bind it
+    (``probe_names``), so the import can fail. An entry is named by its position."""
+    listed = plain_all(tree)
+    if not isinstance(tree, ast.Module) or listed is None:
+        return []
+    problems: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and not node.level and (module := node.module or "") in siblings:
+            held = probe_names(source, siblings[module], siblings, frozenset({file}))
+            problems += [
+                f"{file}: entry {listed.index(bound) + 1} of its __all__ is taken from the probe {module}, "
+                "which is not shown to bind it by an unconditional top-level statement"
+                for alias in node.names
+                if alias.name != "*" and (bound := alias.asname or alias.name) in listed and alias.name not in held
+            ]
+    return problems
+
+
 def star_problems(source: Source, file: str, sibling: str, siblings: Mapping[str, str]) -> list[str]:
-    """One line for each reason why ``from <sibling> import *`` in ``file`` is refused. It is accepted only when the sibling has a ``plain_all`` and binds each
-    entry of it unconditionally (``unconditional_names``). An entry is named by its position: its text is source text and is never shown."""
+    """One line for each reason why ``from <sibling> import *`` in ``file`` is refused. It is accepted only when the sibling does not import ``file`` again,
+    directly or through other probes (a star import from a module that is not fully imported takes only what it holds so far), has a ``plain_all`` and binds
+    each entry of it unconditionally (``unconditional_names``). An entry is named by its position: its text is source text and is never shown."""
     path = siblings[sibling]
     text = source.read(path)
     tree = parsed(text, path) if text is not None else None
     refused = f"{file}: a star import of the probe {sibling} is refused:"
+    if imports_reach(source, path, file, siblings):
+        return [f"{refused} it is on an import cycle among the probes"]
     listed = plain_all(tree)
     if not isinstance(tree, ast.Module) or listed is None:
         return [f"{refused} it needs one __all__, a plain top-level list or tuple of string literals, and no other mention of that name"]
@@ -285,7 +337,8 @@ def sibling_problems(source: Source, siblings: Mapping[str, str]) -> list[str]:
     A sibling runs on its own and belongs to no package, so a relative import in it fails, at any depth of the file. A sibling is a module and not a package,
     so it has no submodule; a name that a ``from`` import takes from it must be one that this read lists at its top level, including what it takes from another
     sibling, so a name that only a star import from outside the repository and the siblings or a module ``__getattr__`` could give is refused. A star import of
-    it must pass ``star_problems``. A file that is not there or is not valid Python is left to ``closure``, which reports it."""
+    it must pass ``star_problems``, and an ``__all__`` entry that a file takes from it must pass ``listed_import_problems``. A file that is not there or is not
+    valid Python is left to ``closure``, which reports it."""
     problems: list[str] = []
     for file in sorted(siblings.values()):
         text = source.read(file)
@@ -294,6 +347,7 @@ def sibling_problems(source: Source, siblings: Mapping[str, str]) -> list[str]:
             continue
         if any(isinstance(node, ast.ImportFrom) and node.level > 0 for node in ast.walk(tree)):
             problems.append(f"{file}: a probe runs on its own, so its relative import fails in the image")
+        problems += listed_import_problems(source, file, tree, siblings)
         for module, names in imported_names(tree, file):
             sibling, _, below = (module or "").partition(".")
             if sibling not in siblings:

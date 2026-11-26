@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import stat
+import sys
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -699,15 +700,80 @@ class ProbeImportTest(ProbeFolderCase):
         user = self.probe("user_probe.py", "from batch_helper import LISTED, VALUE\n")
         self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
 
-    def test_probes_that_take_a_star_from_each_other_are_read_once_each_and_the_read_ends(self) -> None:
+    def assert_python_refuses(self, statement: str) -> None:
+        """The same files, imported by Python itself from the probe folder, as the images run them."""
+        code = f"import sys; sys.path.insert(0, '.'); {statement}"
+        result = run_command(sys.executable, ["-I", "-B", "-c", code], cwd=self.repo / PROBE_FOLDER, timeout=30)
+        self.assertRegex(result.stderr, r"(ImportError|AttributeError)")
+        self.assertNotEqual(0, result.returncode)
+
+    def test_probes_that_take_a_star_from_each_other_are_refused_as_a_cycle_and_the_read_ends(self) -> None:
         oracle = self.probe("batch_oracle.py", "from batch_helper import *\n__all__ = ['VALUE']\nVALUE = 1\n")
-        helper = self.probe("batch_helper.py", "from batch_oracle import *\nfrom batch_helper import *\n__all__ = ['VALUE']\n")
-        user = self.probe("user_probe.py", "from batch_helper import VALUE, MISSING\n")
+        helper = self.probe("batch_helper.py", "from batch_oracle import *\n__all__ = ['VALUE']\n")
+        user = self.probe("user_probe.py", "from batch_helper import VALUE\n")
+        self.assert_python_refuses("import batch_oracle")
         siblings = {Path(name).stem: name for name in (user, helper, oracle)}
         problems = runner_imports.sibling_problems(BoundedSource(self.repo), siblings)
-        self.assertEqual([f"{user}: the probe batch_helper has no name MISSING at its top level"], problems)
-        user = self.probe("user_probe.py", "from batch_helper import VALUE\n")
-        self.assertEqual(3, len(self.place(Host(), [user, helper, oracle]).placed))
+        for file, other in ((oracle, "batch_helper"), (helper, "batch_oracle")):
+            self.assertIn(f"{file}: a star import of the probe {other} is refused: it is on an import cycle among the probes", problems)
+        self.assertIn("it is on an import cycle", self.refused([user, helper, oracle]))
+
+    def test_a_star_import_on_any_import_cycle_among_the_probes_is_refused(self) -> None:
+        for texts in (
+            {"batch_oracle": "__all__ = ['VALUE']\nVALUE = 1\nfrom batch_oracle import *\n"},
+            {"batch_oracle": "from batch_middle import *\n", "batch_middle": "from batch_helper import *\n", "batch_helper": "from batch_oracle import *\n"},
+            {"batch_oracle": "from batch_helper import *\n__all__ = ['VALUE']\nVALUE = 1\n", "batch_helper": "from batch_oracle import VALUE\n"},
+            {"batch_oracle": "from batch_helper import *\n", "batch_helper": "def later():\n    import batch_oracle\n"},
+        ):
+            with self.subTest(texts=texts):
+                names = [self.probe(f"{name}.py", f"{text}" if "__all__" in text else f"{text}__all__ = []\n") for name, text in texts.items()]
+                self.assertIn("is refused: it is on an import cycle among the probes\n", self.refused(names))
+                self.shown.truncate(0)
+                self.shown.seek(0)
+
+    def test_a_listed_name_taken_from_a_probe_that_does_not_bind_it_unconditionally_is_refused(self) -> None:
+        typed = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from json import dumps as hidden\n"
+        takes = "from batch_oracle import hidden\n__all__ = ['hidden']\n"
+        middle = "from batch_oracle import hidden\n"
+        through = "from batch_middle import hidden\n__all__ = ['hidden']\n"
+        for texts in (
+            {"batch_oracle": typed, "batch_helper": takes},
+            {"batch_oracle": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    class hidden:\n        pass\n", "batch_helper": takes},
+            {"batch_oracle": "try:\n    hidden = 1\nexcept ValueError:\n    pass\n", "batch_helper": takes},
+            {"batch_oracle": "visible = 1\n", "batch_helper": "from batch_oracle import hidden as visible\n__all__ = ['visible']\n"},
+            {"batch_oracle": typed, "batch_helper": "from batch_oracle import hidden\n__all__ = ['hidden']\nhidden = 1\n"},
+            {"batch_oracle": typed, "batch_middle": middle, "batch_helper": through},
+            {"batch_oracle": "from batch_helper import hidden\n", "batch_helper": takes},
+            {"batch_oracle": "from batch_middle import hidden\n", "batch_middle": middle, "batch_helper": through},
+            {"batch_helper": "from batch_helper import hidden\n__all__ = ['hidden']\n"},
+        ):
+            for user_text in ("from batch_helper import *\n", "from batch_helper import {name}\n", "import batch_helper\n"):
+                name = "visible" if "'visible'" in texts["batch_helper"] else "hidden"
+                with self.subTest(texts=texts, user=user_text):
+                    names = [self.probe(f"{module}.py", text) for module, text in texts.items()]
+                    user = self.probe("user_probe.py", user_text.format(name=name))
+                    helper = f"{PROBE_FOLDER}/batch_helper.py"
+                    source = texts["batch_helper"].split()[1]
+                    self.assertIn(
+                        f"{helper}: entry 1 of its __all__ is taken from the probe {source}, which is not shown to bind it by an unconditional top-level "
+                        "statement\n",
+                        self.refused([user, *names]),
+                    )
+                    self.shown.truncate(0)
+                    self.shown.seek(0)
+        self.probe("batch_oracle.py", typed)
+        self.probe("batch_helper.py", takes)
+        self.assert_python_refuses("import batch_helper")
+
+    def test_a_listed_name_passed_along_a_chain_of_probes_that_each_bind_it_unconditionally_is_accepted(self) -> None:
+        names = [
+            self.probe("batch_oracle.py", "from json import dumps as hidden\n"),
+            self.probe("batch_middle.py", "from batch_oracle import hidden\n"),
+            self.probe("batch_helper.py", "from batch_middle import hidden as shown\nimport batch_oracle\n__all__ = ['shown', 'batch_oracle']\n"),
+            self.probe("user_probe.py", "from batch_helper import *\n"),
+            self.probe("second_user.py", "from batch_helper import shown\n"),
+        ]
+        self.assertEqual(5, len(self.place(Host(), names).placed))
 
     def test_a_relative_import_in_a_probe_is_refused_because_a_probe_runs_on_its_own_in_the_image(self) -> None:
         support = self.probe("support_probe.py", "VALUE = 1\n")
