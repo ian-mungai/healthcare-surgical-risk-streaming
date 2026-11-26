@@ -76,11 +76,39 @@ class EveryImageTest(unittest.TestCase):
         for name, path in DOCKERFILES.items():
             text = "\n".join(final_stage(path))
             with self.subTest(image=name):
-                self.assertRegex(text, r"apt-get update && apt-get upgrade --yes")
+                self.assertRegex(text, r"apt-get update --error-on=any .*&& apt-get .*upgrade --yes")
                 self.assertIn("rm -rf /var/lib/apt/lists/*", text)
                 self.assertIn("python -m pip uninstall --yes pip", text)
                 self.assertIn("/usr/local/lib/python3.14/ensurepip/_bundled/pip-", text)
                 self.assertLess(text.index("--requirement"), text.index("pip uninstall"), "the requirements are installed before pip goes")
+
+
+class DebianSnapshotTest(unittest.TestCase):
+    def snapshot_of(self, name: str, path: Path) -> str:
+        final = final_stage(path)
+        (declared,) = [line for line in final if line.startswith("ARG DEBIAN_SNAPSHOT")]
+        self.assertRegex(declared, r"^ARG DEBIAN_SNAPSHOT=20[0-9]{6}T[0-9]{6}Z$", name)
+        return declared.partition("=")[2]
+
+    def test_the_three_images_name_one_snapshot_timestamp(self) -> None:
+        self.assertEqual(1, len({self.snapshot_of(name, path) for name, path in DOCKERFILES.items()}))
+
+    def test_apt_reads_both_archives_from_the_snapshot_and_a_failed_index_stops_the_build(self) -> None:
+        for name, path in DOCKERFILES.items():
+            with self.subTest(image=name):
+                (run,) = [line for line in final_stage(path) if "apt-get" in line]
+                pinned = "URIs: http://snapshot.debian.org/archive/\\1/${DEBIAN_SNAPSHOT}\\nCheck-Valid-Until: no"
+                self.assertIn(f'sed -i -E "s|^URIs: http://deb.debian.org/(debian(-security)?)$|{pinned}|" /etc/apt/sources.list.d/debian.sources', run)
+                counted = 'grep -c "^URIs: http://snapshot.debian.org/archive/debian.*/${DEBIAN_SNAPSHOT}$" /etc/apt/sources.list.d/debian.sources'
+                self.assertIn(f'test "$({counted})" = 2', run, "the build stops unless both entries of the base image were rewritten")
+                self.assertIn("! grep -q deb.debian.org /etc/apt/sources.list.d/debian.sources", run)
+                self.assertLess(run.index("sed -i"), run.index("apt-get"))
+                self.assertIn("apt-get update --error-on=any -o Acquire::Retries=5 -o Acquire::http::Timeout=60 &&", run)
+
+    def test_no_other_stage_installs_a_debian_package(self) -> None:
+        for name, path in DOCKERFILES.items():
+            with self.subTest(image=name):
+                self.assertEqual(1, len([line for line in instructions(path) if re.search(r"\bapt(-get)?\b", line)]))
 
 
 class SparkJarTest(unittest.TestCase):

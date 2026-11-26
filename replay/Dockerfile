@@ -10,8 +10,16 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/opt/replay/app
 
-# Debian's security and point-release updates that the base image does not hold yet.
-RUN apt-get update && apt-get upgrade --yes --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# Debian's security and point-release updates that the base image does not hold yet, from one dated snapshot of both archives (snapshot.debian.org), so that a
+# rebuild installs the same packages. The three images name the same timestamp. A snapshot keeps the old Valid-Until date of its index files, so apt does not check
+# that date; it still checks their signatures. apt-get update exits with 0 when a download fails, so --error-on=any stops the build there.
+ARG DEBIAN_SNAPSHOT=20261125T230000Z
+RUN sed -i -E "s|^URIs: http://deb.debian.org/(debian(-security)?)$|URIs: http://snapshot.debian.org/archive/\1/${DEBIAN_SNAPSHOT}\nCheck-Valid-Until: no|" /etc/apt/sources.list.d/debian.sources \
+    && test "$(grep -c "^URIs: http://snapshot.debian.org/archive/debian.*/${DEBIAN_SNAPSHOT}$" /etc/apt/sources.list.d/debian.sources)" = 2 \
+    && ! grep -q deb.debian.org /etc/apt/sources.list.d/debian.sources \
+    && apt-get update --error-on=any -o Acquire::Retries=5 -o Acquire::http::Timeout=60 \
+    && apt-get upgrade --yes --no-install-recommends -o Acquire::Retries=5 -o Acquire::http::Timeout=60 \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 10003 --user-group --no-create-home --shell /usr/sbin/nologin replay \
     && mkdir -p /opt/replay/app /opt/replay/state /opt/replay/run \
