@@ -17,6 +17,9 @@ Failure modes covered here:
   The attempts have no bound or no pause between them, the output of a failed attempt is not searched, the record does not say how many attempts each read
   took or which processes stayed unread, or a read with no successful attempt leaves no failed command.
 - A paused container, whose processes cannot answer, counts as the running consumer of its service, or its processes are no longer searched.
+- A command whose process group survived the launcher's clean-up is read again, the next read succeeds and the sweep passes with no failed command. A
+  call that declares an expected failure takes the survived group for that failure.
+- A later attempt succeeds and the record no longer says which processes an earlier attempt left unread, or why it failed.
 - Two containers of one Compose service (a one-off beside a retained one) are taken for one, so only one of them is inspected and its processes read. A
   retained stopped container, which has no process, fails the sweep or hides a service that has no running container. A line of the container listing that
   is not understood is dropped and the sweep passes.
@@ -38,7 +41,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest import mock
 
-from scripts.process import run_command
+from scripts.process import ProcessGroupSurvived, run_command
 from tests.e2e.run_record import Record
 from tests.fast.runner_import import import_runner
 from tests.fast.secret_inputs import Marker, make_marker
@@ -125,6 +128,17 @@ class FakeHost:
 
     def entered(self) -> list[list[str]]:
         return [args for args in self.sent if args[:2] == ["docker", "compose"] and "exec" in args]
+
+
+def nth_command(number: int) -> Callable[[list[str]], bool]:
+    """A choice that picks the ``number``th command that it is asked about, counted from one."""
+    seen: list[list[str]] = []
+
+    def picked(args: list[str]) -> bool:
+        seen.append(args)
+        return len(seen) == number
+
+    return picked
 
 
 class HostCase(unittest.TestCase):
@@ -234,11 +248,75 @@ class ContainerProcesses(HostCase):
         self.assertEqual((code, out.count("KEPT=one")), (0, 1))
         self.assertEqual((stack.attempts, stack.unread, stack.failures, len(self.pauses)), ({"loki": 2}, {}, [], 1))
 
+    def test_each_failed_attempt_keeps_its_unread_processes_and_its_fixed_reasons_after_a_success(self) -> None:
+        host, stack = self.host(loki=["101", "102"])
+        host.process("101")
+        host.top_reply = lambda service, call: (1, "") if call == 1 else (0, "PID\n101\n102\n" if call <= 3 else "PID\n101\n")
+        self.assertEqual(self.read(stack)[0], 0)
+        self.assertEqual(
+            stack.failed_attempts,
+            {
+                "loki": [
+                    {"attempt": 1, "unread": ["no usable listing"], "reasons": ["first listing not usable (code 1)"]},
+                    {"attempt": 2, "unread": ["102"], "reasons": ["processes unread"]},
+                ]
+            },
+        )
+        self.assertEqual((stack.attempts, stack.unread, stack.failures), ({"loki": 3}, {}, []))
+
+    def test_a_read_or_a_second_listing_that_fails_gives_its_code_as_the_reason(self) -> None:
+        host, stack = self.host(loki=["101"])
+        host.process("101", environment=None)
+        host.top_reply = lambda service, call: (1, "") if call == 2 else (0, "PID\n101\n")
+        self.assertNotEqual(self.read(stack)[0], 0)
+        reasons = [entry["reasons"] for entry in stack.failed_attempts["loki"]]
+        self.assertEqual(reasons[0], ["read failed (code 1)", "second listing not usable (code 1)", "processes unread"])
+        self.assertEqual(reasons[1], ["read failed (code 1)", "read failed (code 1)", "processes unread"])
+
+    def survive(self, host: FakeHost, when: Callable[[list[str]], bool]) -> list[list[str]]:
+        """The first command that ``when`` picks leaves a process group that survives the clean-up. Every later command runs as before. Return the commands
+        that were sent after that one."""
+        original = host.capture
+        later: list[list[str]] = []
+        survived: list[bool] = []
+
+        def capture(args: list[str], **options: Any) -> tuple[int, str, str]:
+            if survived:
+                later.append(list(args))
+            elif when(args):
+                survived.append(True)
+                raise ProcessGroupSurvived("process group 4242 still had a process")
+            return original(args, **options)
+
+        host.capture = capture  # type: ignore[method-assign]
+        return later
+
+    def test_a_survived_process_group_ends_the_read_at_once_with_its_fixed_reason(self) -> None:
+        for name, nth in (("the first listing", 1), ("the first read", 2), ("the second listing", 3)):
+            with self.subTest(command=name):
+                self.reset()
+                host, stack = self.host(loki=["101"])
+                host.process("101")
+                later = self.survive(host, nth_command(nth))
+                code, _ = self.read(stack)
+                self.assertNotEqual(code, 0)
+                self.assertEqual((later, stack.attempts, self.pauses), ([], {"loki": 1}, []))
+                self.assertEqual(stack.failed_attempts["loki"][-1]["reasons"][-1], "ProcessGroupSurvived")
+                self.assertIn("loki", stack.unread)
+                self.assertTrue(stack.failures)
+
+    def test_a_survived_process_group_is_a_failed_command_even_where_a_failure_was_expected(self) -> None:
+        host, stack = self.host(loki=["101"])
+        self.survive(host, lambda args: True)
+        stack.docker("inspect", "id_loki", expected_failure=True)
+        self.assertEqual(len(stack.failures), 1)
+
     def test_a_read_that_succeeds_at_once_takes_one_attempt_and_no_pause(self) -> None:
         host, stack = self.host(loki=["101"])
         host.process("101")
         self.assertEqual(self.read(stack)[0], 0)
         self.assertEqual((stack.attempts, stack.unread, self.pauses), ({"loki": 1}, {}, []))
+        self.assertEqual(stack.failed_attempts, {})
 
     def test_the_reads_of_two_attempts_are_never_added_together(self) -> None:
         host, stack = self.host(loki=["101", "102"])
@@ -290,24 +368,50 @@ class ContainerProcesses(HostCase):
         labels = {f"{read} of {service}" for read in ("command lines", "environment") for service in (SHELL_LESS, "openbao")}
         self.assertEqual(stack.attempts, dict.fromkeys(labels, 1))
 
+    def sweep(self, host: FakeHost) -> dict[str, Any]:
+        """The record's cases of a whole host sweep against the stand-in, with ten values to search for."""
+        host.configuration = {"AWS_PROFILE": "p", "AWS_REGION": "r", "ENVIRONMENT": "dev"}  # type: ignore[attr-defined]
+        record = Record(feature="x", slug="x", rerun="x")
+        binding = SimpleNamespace(run_id="run", bucket="bucket", state_keys=[], region="r")
+        held = {f"/opt/platform/secrets/{number}": make_marker("urlsafe").value for number in range(10)}
+        with (
+            mock.patch.object(self.module, "Remote", lambda: host),
+            mock.patch.object(self.module, "inventory_case"),
+            mock.patch.object(self.module, "HostValues", return_value=SimpleNamespace(secret_files=lambda: held)),
+            mock.patch.object(self.module, "learn_project_key"),
+            mock.patch.object(self.module, "load_run", return_value=binding),
+            mock.patch.object(self.module, "archive_text", return_value=[]),
+            mock.patch.object(self.module, "read_state_objects", return_value=(["5"], [])),
+        ):
+            self.module.run_host_sweep(record, [])
+        return {item.case: item for item in record.observations}
+
+    def test_a_sweep_that_passes_keeps_the_unread_processes_and_the_reasons_of_its_failed_attempts_in_its_record(self) -> None:
+        host, _ = self.host(loki=["101"])
+        host.process("101")
+        host.top_reply = lambda service, call: (0, "PID\n101\n102\n" if call <= 2 else "PID\n101\n")
+        cases = self.sweep(host)
+        self.assertTrue(cases["host sinks"].passed, cases["host sinks"].observed)
+        self.assertTrue(cases["no command failed and no marker found"].passed)
+        self.assertIn(
+            "failed attempts: {'command lines of loki': [{'attempt': 1, 'unread': ['102'], 'reasons': ['processes unread']}]}, unread processes: {}",
+            cases["host sinks"].observed,
+        )
+
+    def test_a_survived_process_group_fails_the_whole_sweep_even_when_a_later_read_would_succeed(self) -> None:
+        host, _ = self.host(loki=["101"])
+        host.process("101")
+        self.survive(host, lambda args: args[:2] == ["sh", "-c"] and '"$p/environ"' in args[2])
+        cases = self.sweep(host)
+        self.assertFalse(cases["host sinks"].passed)
+        self.assertFalse(cases["no command failed and no marker found"].passed)
+        self.assertIn("ProcessGroupSurvived", cases["host sinks"].observed)
+
     def test_the_record_of_the_sweep_gives_the_attempts_and_names_the_unread_processes(self) -> None:
         host, _ = self.host(loki=["101"])
         host.process("101")
         host.top_reply = lambda service, call: (0, "PID\n101\n102\n")
-        host.configuration = {"AWS_PROFILE": "p", "AWS_REGION": "r", "ENVIRONMENT": "dev"}  # type: ignore[attr-defined]
-        record = Record(feature="x", slug="x", rerun="x")
-        binding = SimpleNamespace(run_id="run", bucket="bucket", state_keys=[], region="r")
-        with (
-            mock.patch.object(self.module, "Remote", lambda: host),
-            mock.patch.object(self.module, "inventory_case"),
-            mock.patch.object(self.module, "HostValues", return_value=SimpleNamespace(secret_files=dict)),
-            mock.patch.object(self.module, "learn_project_key"),
-            mock.patch.object(self.module, "load_run", return_value=binding),
-            mock.patch.object(self.module, "archive_text", return_value=[]),
-            mock.patch.object(self.module, "read_state_objects", return_value=([], [])),
-        ):
-            self.module.run_host_sweep(record, [])
-        sinks = next(item for item in record.observations if item.case == "host sinks")
+        sinks = self.sweep(host)["host sinks"]
         self.assertFalse(sinks.passed)
         self.assertIn("'environment of loki': 3", sinks.observed)
         self.assertIn("unread processes: {'command lines of loki': ['102'], 'environment of loki': ['102']}", sinks.observed)
