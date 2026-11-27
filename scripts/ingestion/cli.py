@@ -5,9 +5,11 @@ check writes a line for each fault, then a line for each kind of fault with its 
 
 ``.venv/bin/python -m scripts.ingestion.cli check --selection S.json --checksum-list SHA256SUMS.txt --pairings pairings.json --result result.json``
 
-``pairings``: read the metadata records that Airbyte wrote for the copied files and write the pairing records the check takes.
+``pairings``: read the metadata records that Airbyte wrote for the copied files and write the pairing records the check takes. Where two syncs recorded one
+file, as after a sync that was stopped and run again, the records of one are taken: of a sync that ``--succeeded-sync`` names (the job number; repeat for
+each) before any other, then of the highest job number. Two records of one file in one sync are both written, and the check refuses them.
 
-``.venv/bin/python -m scripts.ingestion.cli pairings --pairings pairings.json``
+``.venv/bin/python -m scripts.ingestion.cli pairings --pairings pairings.json [--succeeded-sync N ...]``
 
 ``publish``: publish the manifest of a complete passed result and write its reference file.
 
@@ -133,7 +135,8 @@ def command_pairings(store: S3Store, arguments: argparse.Namespace) -> int:
         texts = [store.get_version_bytes(item, METADATA_LIMIT_BYTES).decode() for item in versions]
     except UnicodeDecodeError:
         raise InputError(Notice(Code.METADATA_LINE, position=1)) from None
-    records = sorted(pairings_from_metadata(texts, pinned_release().source_prefix), key=lambda item: (item.source_key, item.landed_key))
+    found = pairings_from_metadata(texts, pinned_release().source_prefix, frozenset(arguments.succeeded_sync or ()))
+    records = sorted(found, key=lambda item: (item.source_key, item.landed_key))
     write_private(arguments.pairings, json.dumps([dataclasses.asdict(item) for item in records], indent=1) + "\n")
     say(Notice(Code.PAIRINGS_WRITTEN, count=len(records)))
     return 0
@@ -176,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--result", type=Path, required=True, help="where to write the result, also when the check fails")
     pairings = commands.add_parser("pairings")
     pairings.add_argument("--pairings", type=Path, required=True, help="where to write the pairing records, each source key with its landed key and size")
+    pairings.add_argument("--succeeded-sync", type=int, action="append", help="the job number of a sync that succeeded; repeat for each")
     publish = commands.add_parser("publish")
     publish.add_argument("--selection", type=Path, required=True)
     publish.add_argument("--result", type=Path, required=True)
