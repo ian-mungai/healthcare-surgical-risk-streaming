@@ -1,12 +1,15 @@
 """Run the ingestion checks from the shell under the project profile in ``.env``.
 
-``check``: stream every selected landed object version and compare it with the pinned checksum list; write the result file and exit 1 on any fault.
+``check``: stream every selected landed object version and compare it with the pinned checksum list; write the result file and exit 1 on any fault. A failed
+check writes a line for each fault, then a line for each kind of fault with its count, which names no file, then its summary.
 
 ``.venv/bin/python -m scripts.ingestion.cli check --selection S.json --checksum-list SHA256SUMS.txt --pairings pairings.json --result result.json``
 
-``pairings``: read the metadata records that Airbyte wrote for the copied files and write the pairing records the check takes.
+``pairings``: read the metadata records that Airbyte wrote for the copied files and write the pairing records the check takes. Where two syncs recorded one
+file, as after a sync that was stopped and run again, the records of one are taken: of a sync that ``--succeeded-sync`` names (the job number; repeat for
+each) before any other, then of the highest job number. Two records of one file in one sync are both written, and the check refuses them.
 
-``.venv/bin/python -m scripts.ingestion.cli pairings --pairings pairings.json``
+``.venv/bin/python -m scripts.ingestion.cli pairings --pairings pairings.json [--succeeded-sync N ...]``
 
 ``publish``: publish the manifest of a complete passed result and write its reference file.
 
@@ -32,6 +35,7 @@ import json
 import posixpath
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from scripts.aws_cli import RAW_ERRORS, Aws, AwsError, AwsTimeout
@@ -40,7 +44,7 @@ from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX, load_pairing_records, pairings_from_metadata
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
-from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.notice import Cause, ClosedError, Code, Notice, Subject, render
 from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.selection import Selection, pinned_release
 from scripts.ingestion.store import S3Store
@@ -106,7 +110,10 @@ def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
     result = run_check(store, selection, read_input_bytes(arguments.checksum_list, Subject.CHECKSUM_LIST), pairings, show_progress)
     write_private(arguments.result, result.to_json())
     if not result.passed:
-        return refuse(*(finding.notice for finding in result.findings), Notice(Code.CHECK_FAILED, count=len(result.findings), total=result.file_count))
+        found = Counter(finding.cause for finding in result.findings)
+        kinds = (Notice(Code.CHECK_FAULT_KIND, cause=cause, count=found[cause]) for cause in Cause if found[cause])
+        failed = Notice(Code.CHECK_FAILED, count=len(result.findings), total=result.file_count)
+        return refuse(*(finding.notice for finding in result.findings), *kinds, failed)
     say(Notice(Code.CHECK_PASSED, count=len(result.files), total=result.file_count, digest=result.result_sha256))
     return 0
 
@@ -128,7 +135,8 @@ def command_pairings(store: S3Store, arguments: argparse.Namespace) -> int:
         texts = [store.get_version_bytes(item, METADATA_LIMIT_BYTES).decode() for item in versions]
     except UnicodeDecodeError:
         raise InputError(Notice(Code.METADATA_LINE, position=1)) from None
-    records = sorted(pairings_from_metadata(texts, pinned_release().source_prefix), key=lambda item: (item.source_key, item.landed_key))
+    found = pairings_from_metadata(texts, pinned_release().source_prefix, frozenset(arguments.succeeded_sync or ()))
+    records = sorted(found, key=lambda item: (item.source_key, item.landed_key))
     write_private(arguments.pairings, json.dumps([dataclasses.asdict(item) for item in records], indent=1) + "\n")
     say(Notice(Code.PAIRINGS_WRITTEN, count=len(records)))
     return 0
@@ -171,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--result", type=Path, required=True, help="where to write the result, also when the check fails")
     pairings = commands.add_parser("pairings")
     pairings.add_argument("--pairings", type=Path, required=True, help="where to write the pairing records, each source key with its landed key and size")
+    pairings.add_argument("--succeeded-sync", type=int, action="append", help="the job number of a sync that succeeded; repeat for each")
     publish = commands.add_parser("publish")
     publish.add_argument("--selection", type=Path, required=True)
     publish.add_argument("--result", type=Path, required=True)

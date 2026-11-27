@@ -104,6 +104,25 @@ class CommandTest(unittest.TestCase):
         self.assertNotIn(MARKER, errors)
         self.assertNotIn("Traceback", errors)
 
+    def test_a_failed_check_says_each_kind_of_fault_and_its_count_in_lines_that_name_no_file(self) -> None:
+        records = [dataclasses.asdict(record) for record in self.work.landed.pairings()]
+        kept = [record for record in records if record["source_key"].endswith("clinical_data.csv")]
+        self.work.write("pairings.json", json.dumps(kept))
+        self.work.landed.land("clinical_data.csv", b"x" * self.work.landed.sizes["clinical_data.csv"])
+        code, output, errors = self.work.check()
+        self.assertEqual((1, ""), (code, output))
+        lines = errors.splitlines()
+        self.assertEqual(
+            ["faults of kind missing: 2", "faults of kind checksum_differs: 1", "check failed: 3 faults in 3 selected files; no manifest may be published"],
+            lines[-3:],
+        )
+        self.assertEqual(3, len([line for line in lines[:-3] if line.startswith("vitaldb/1.0.0/")]))
+
+    def test_a_passed_check_says_no_kind_of_fault(self) -> None:
+        code, output, errors = self.work.check()
+        self.assertEqual(0, code, errors)
+        self.assertNotIn("faults of kind", output + errors)
+
     def test_control_the_three_commands_pass_for_a_complete_landed_set(self) -> None:
         self.assertEqual(0, self.work.check()[0])
         self.assertEqual(0, self.work.publish()[0])

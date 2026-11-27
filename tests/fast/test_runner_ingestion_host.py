@@ -4,8 +4,12 @@ Failure modes covered here, each against a stand-in of the host, of Airbyte, of 
 
 - The runner starts without ``INGESTION_HOST=1``, on an environment other than ``dev``, on a host that is not the run's instance or deployed commit, or goes on
   when the raw connection selects another set of files than the fixed sample or writes another bucket or prefix than the project's landing prefix.
-- A sync that cannot be interrupted (all files land first) passes for the interrupted copy. The staging sampler exits dirty, does not cover a sync, or a disk
-  reading is unreadable, and the measurement still passes.
+- A sync that is not interrupted passes for the interrupted copy: every payload landed before the cancel was asked, or by the time Airbyte confirmed it.
+  A sync that writes after that confirmation passes, whether the write shows between two listings or only in its stamp, or the quiet interval counts from the
+  first listing instead of the confirmation. The cancel waits longer than it must after the first payload. The landed check of the resumed set excuses more
+  than the object versions that the stopped sync left. The pairings are not told which syncs succeeded, or are told of one that did not. A failed check of
+  the complete set leaves no word of why in the record, or a file name with it. The staging sampler exits dirty, does not cover a sync, or a disk reading is
+  unreadable, and the measurement still passes.
 - A third sync that copies bytes, repeats an earlier job or changes a version of landing/ or of the warehouse prefix passes for the idempotent copy.
 - A second load of the same manifest makes a branch of its own or writes to the warehouse, and the idempotence assertion still passes.
 - A planted file, load record, results folder or staging folder that the run did not create is deleted by its cleanup, or one that it did create stays, or an
@@ -47,8 +51,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -159,6 +165,27 @@ class World:
         self.compose_runs: list[list[str]] = []
         self.catalog_writes: list[str] = []
         self.disk_reads = 0
+        self.paired: dict[str, str] = {}
+        self.stopped_payloads: set[tuple[str, str]] = set()
+        self.left_over_seen: list[frozenset[tuple[str, str]]] = []
+        self.write_in_settle = False
+        self.sleeps: list[float] = []
+        self.cancelled = False
+        self.settled = False
+        self.clock_offset = 0.0
+        self.slow_listing = 0.0
+        self.polls_before_a_payload = 0
+        self.sleeps_before_the_cancel: list[float] = []
+        self.settle_sleeps: list[float] = []
+        self.pairings_named: list[list[str]] = []
+        listed = self.store.list_versions
+
+        def list_versions(prefix: str) -> Any:
+            if prefix == LANDING_PREFIX and self.slow_listing:
+                self.clock_offset, self.slow_listing = self.clock_offset + self.slow_listing, 0.0
+            return listed(prefix)
+
+        self.store.list_versions = list_versions  # type: ignore[method-assign]
         self.launch_seen: list[bool] = []
         self.run_tokens: dict[str, str] = {}
         self.finished_ids: list[str] = []
@@ -171,15 +198,21 @@ class World:
         self.instance = INSTANCE
         self.commit = COMMIT
 
-    def land(self, count: int) -> None:
+    def landed_key(self, sync: int, source_key: str) -> str:
+        """Each sync lands its files under a folder of its own, as the pinned destination does."""
+        return f"{LANDING_PREFIX}sync_{sync}/{source_key}"
+
+    def land(self, sync: int, count: int, *, completed: bool) -> None:
+        """Land the first ``count`` payloads of one sync. Only a sync that completes writes the metadata that pairs them."""
         for number, key in enumerate(SAMPLE[:count]):
-            landed = f"{LANDING_PREFIX}{key.removeprefix(SOURCE_PREFIX)}"
+            landed = self.landed_key(sync, key)
             if not any(item.key == landed for item in self.store.list_versions(landed)):
                 data = f"payload {number}".encode()
                 self.store.put_object(landed, data)
                 self.expected[key] = data
-        if count and not self.store.list_versions(f"{LANDING_PREFIX}meta"):
-            self.store.put_object(f"{LANDING_PREFIX}meta_1.jsonl", b"{}")
+        if completed:
+            self.store.put_object(f"{LANDING_PREFIX}sync_{sync}/meta.jsonl", b"{}")
+            self.paired = {key: self.landed_key(sync, key) for key in SAMPLE[:count]}
         if count and "plant_prefix_taken" in self.faults and not self.store.list_versions(f"{PLANT_PREFIX}foreign"):
             self.store.put_object(f"{PLANT_PREFIX}foreign.jsonl", b"not the run's")
 
@@ -412,9 +445,14 @@ def build(module: ModuleType, world: World) -> type:
                     job = 2
                 world.open_jobs.add(job)
                 world.sent[job] = (700 if "resync_copies_bytes" in world.faults else 0) if world.syncs == 3 else 5000
-                world.land(3 if world.syncs == 1 and world.interruptible else 11)
+                if world.syncs == 1 and "first_payload_appears_late" in world.faults:
+                    world.polls_before_a_payload = 2
+                elif world.syncs == 1:
+                    world.land(1, 3 if world.interruptible and "all_landed_when_asked" not in world.faults else 11, completed=False)
+                elif world.syncs == 2:
+                    world.land(2, 11, completed=True)
                 if world.syncs == 3 and "resync_adds_version" in world.faults:
-                    world.store.put_object(f"{LANDING_PREFIX}{SAMPLE[0].removeprefix(SOURCE_PREFIX)}", b"again")
+                    world.store.put_object(world.landed_key(2, SAMPLE[0]), b"again")
                 if world.syncs == 3 and "warehouse_changes_on_resync" in world.faults:
                     world.store.put_object("warehouse/raw_records/clinical_data/data_2.parquet", b"more")
                 if "start_lost_reply" in world.faults and world.syncs == 3:
@@ -432,6 +470,18 @@ def build(module: ModuleType, world: World) -> type:
             job = int(arguments[arguments.index("--job") + 1]) if "--job" in arguments else 0
             if arguments[0] == "cancel":
                 world.open_jobs.discard(job)
+                world.sleeps_before_the_cancel = list(world.sleeps)
+                for fault, count in (("rest_lands_during_the_cancel", 11), ("more_lands_during_the_cancel", 9)):
+                    if fault in world.faults:
+                        world.land(1, count, completed=False)
+                if "stamped_after_the_confirmation" in world.faults:
+                    world.land(1, 4, completed=False)
+                    stored = world.store.history[world.landed_key(1, SAMPLE[3])]
+                    stored[-1].version = replace(stored[-1].version, last_modified="2100-01-01T00:00:00Z")
+                world.write_in_settle = "writes_after_the_confirmed_end" in world.faults
+                world.slow_listing = 20.0 if "slow_first_listing" in world.faults else 0.0
+                world.stopped_payloads = {(item.key, item.version_id) for item in world.store.list_versions(f"{LANDING_PREFIX}sync_1/")}
+                world.cancelled = True
                 return 0, {"job": job, "status": "cancelled" if world.interruptible else "succeeded"}, ""
             if arguments[0] == "wait":
                 if "retry_wait_fails" in world.faults and job == 2:
@@ -591,12 +641,16 @@ def build(module: ModuleType, world: World) -> type:
                 return 0, ""
             command = arguments[0]
             if command == "pairings":
-                landed = [item for item in world.store.list_versions(LANDING_PREFIX) if not item.key.endswith(".jsonl")]
-                if len(landed) < 11:
+                world.pairings_named.append([arguments[position + 1] for position, name in enumerate(arguments) if name == "--succeeded-sync"])
+                if len(world.paired) < 11:
                     return 1, "no metadata"
+                prefix = SOURCE_PREFIX if "pairings_name_no_selected_file" in world.faults else ""
                 Path(options["--pairings"]).write_text(
                     json.dumps(
-                        [{"source_key": SOURCE_PREFIX + item.key.removeprefix(LANDING_PREFIX), "landed_key": item.key, "size": item.size} for item in landed]
+                        [
+                            {"source_key": prefix + source, "landed_key": landed, "size": world.store.list_versions(landed)[-1].size}
+                            for source, landed in world.paired.items()
+                        ]
                     )
                 )
                 return 0, ""
@@ -613,14 +667,20 @@ def build(module: ModuleType, world: World) -> type:
                     elif world.store.find(current[0]).data != world.expected.get(key, world.store.find(current[0]).data):
                         lines.append(f"{key}: checksum_differs")
                 world.checks[options["--result"]] = not lines
-                Path(options["--result"]).write_text("{}")
+                found = [
+                    {"position": position, "cause": line.rsplit(": ", 1)[1], "source_key": line.rsplit(": ", 1)[0]} for position, line in enumerate(lines, 1)
+                ]
+                result_text = "not a result" if "check_result_unreadable" in world.faults else json.dumps({"findings": found})
+                Path(options["--result"]).write_text(result_text)
                 total = len(selection["files"])
                 if not lines:
                     return 0, f"checked {total} of {total} files\ncheck passed: {total} of {total} selected files verified; result x"
                 extra = ["checked 1 of 1 files"] if "check_extra_line" in world.faults else []
                 count = len(lines) + (1 if "check_two_faults" in world.faults else 0)
                 summary = f"check failed: {count} faults in {total} selected files; no manifest may be published"
-                return 1, "\n".join([*extra, f"checked {total} of {total} files", *lines, summary])
+                causes = [line.rsplit(": ", 1)[1] for line in lines]
+                kinds = [f"faults of kind {cause}: {causes.count(cause)}" for cause in sorted(set(causes))]
+                return 1, "\n".join([*extra, f"checked {total} of {total} files", *lines, *kinds, summary])
             if command == "publish":
                 if not world.checks.get(options["--result"]):
                     if "planted_publish_writes" in world.faults:
@@ -657,11 +717,12 @@ class WalkTest(unittest.TestCase):
         self.module = import_runner("ingestion_host")
         self.world = World()
         self.patches: list[Any] = [
-            mock.patch.object(self.module.time, "sleep"),
+            mock.patch.object(self.module.time, "sleep", self.sleep),
+            mock.patch.object(self.module.time, "monotonic", lambda real=time.monotonic: real() + self.world.clock_offset),
             mock.patch.object(self.module.Sampler, "start", lambda sampler: self.sampler_start(sampler)),
             mock.patch.object(self.module.Sampler, "ready", lambda sampler, seconds=0: self.sampler_ready()),
             mock.patch.object(self.module.Sampler, "stop", lambda sampler: self.sampler_stop(sampler)),
-            mock.patch.object(self.module, "verify_landed", lambda store, reference, selection, pins: tuple(range(11))),
+            mock.patch.object(self.module, "verify_landed", self.verify_landed),
             mock.patch.object(self.module, "tracked_pins", lambda: None),
             mock.patch.object(self.module, "read_sample", self.read_sample),
             mock.patch.object(self.module, "GONE_DEADLINE_SECONDS", 0.2),
@@ -669,6 +730,25 @@ class WalkTest(unittest.TestCase):
         for patch in self.patches:
             patch.start()
             self.addCleanup(patch.stop)
+
+    def sleep(self, seconds: float) -> None:
+        """No test waits. The first sleep after the cancel is the quiet interval: it moves the clock by its length, and the planted late write lands in it."""
+        world = self.world
+        world.sleeps.append(seconds)
+        if world.polls_before_a_payload:
+            world.polls_before_a_payload -= 1
+            if not world.polls_before_a_payload:
+                world.land(1, 3, completed=False)
+        if world.cancelled and not world.settled:
+            world.settled = True
+            world.settle_sleeps.append(seconds)
+            world.clock_offset += seconds
+            if world.write_in_settle:
+                world.store.put_object(world.landed_key(1, "a_late_payload"), b"written after the end was confirmed")
+
+    def verify_landed(self, store: Any, reference: Any, selection: Any, pins: Any, left_over: Any = ()) -> tuple[int, ...]:
+        self.world.left_over_seen.append(frozenset(left_over))
+        return tuple(range(11))
 
     def sampler_ready(self) -> bool:
         self.world.sampler_readies += 1
@@ -838,6 +918,88 @@ class WalkTest(unittest.TestCase):
         record, _, _ = self.walk()
         self.assertIn("copy interrupted once (fault)", self.failed(record))
 
+    def observed(self, record: Record, case: str, step: str) -> str:
+        return next(item.observed for item in record.observations if (item.case, item.step) == (case, step))
+
+    def test_a_sync_whose_every_payload_landed_by_the_confirmed_cancellation_is_not_interrupted_and_fails(self) -> None:
+        self.world.faults = {"rest_lands_during_the_cancel"}
+        record, _, _ = self.walk()
+        self.assertEqual(["copy interrupted once (fault)"], self.failed(record))
+        self.assertIn(
+            "status cancelled, not interrupted: payloads landed when asked 3, after the confirmed cancellation 11 of 11",
+            self.observed(record, "copy interrupted once", "fault"),
+        )
+
+    def test_a_sync_that_lands_more_during_the_cancel_but_not_every_payload_is_interrupted(self) -> None:
+        self.world.faults = {"more_lands_during_the_cancel"}
+        record, _, _ = self.walk()
+        self.assertEqual([], self.failed(record))
+        self.assertIn(
+            "status cancelled, interrupted: payloads landed when asked 3, after the confirmed cancellation 9 of 11",
+            self.observed(record, "copy interrupted once", "fault"),
+        )
+
+    def test_the_quiet_interval_counts_from_the_cancels_confirmation_and_not_from_the_first_listing(self) -> None:
+        self.world.faults = {"slow_first_listing"}
+        record, _, _ = self.walk()
+        self.assertEqual([], self.failed(record))
+        (waited,) = self.world.settle_sleeps
+        self.assertTrue(39 <= waited <= 40, waited)
+        self.assertIn(
+            "unchanged from the listing 20 s after the cancel's confirmation to the one 60 s after it: True, versions stamped after the confirmation: 0",
+            self.observed(record, "copy interrupted once", "fault"),
+        )
+
+    def test_a_version_stamped_after_the_confirmation_fails_the_interruption_even_when_both_listings_hold_it(self) -> None:
+        self.world.faults = {"stamped_after_the_confirmation"}
+        record, _, _ = self.walk()
+        self.assertIn("copy interrupted once (fault)", self.failed(record))
+        self.assertIn("True, versions stamped after the confirmation: 1", self.observed(record, "copy interrupted once", "fault"))
+
+    def test_the_landing_is_listed_again_after_half_a_second_while_no_payload_has_landed(self) -> None:
+        self.world.faults = {"first_payload_appears_late"}
+        record, _, _ = self.walk()
+        self.assertEqual([], self.failed(record))
+        self.assertEqual([0.5, 0.5], self.world.sleeps_before_the_cancel)
+
+    def test_the_pairings_are_told_the_syncs_of_the_run_that_succeeded_and_no_other(self) -> None:
+        self.walk()
+        self.assertEqual([["2"], ["2", "3"]], self.world.pairings_named[:2])
+        self.world = World()
+        self.world.faults = {"retry_wait_fails"}
+        self.walk()
+        self.assertEqual([], self.world.pairings_named[0])
+
+    def test_a_sync_that_writes_after_airbyte_confirmed_its_end_fails_the_interruption(self) -> None:
+        self.assertIn("copy interrupted once (fault)", self.with_faults("writes_after_the_confirmed_end"))
+
+    def test_a_cancel_asked_after_every_payload_landed_fails_the_interruption_even_when_the_job_ends_as_cancelled(self) -> None:
+        self.assertIn("copy interrupted once (fault)", self.with_faults("all_landed_when_asked"))
+
+    def test_every_landed_check_is_given_exactly_the_object_versions_that_the_stopped_sync_left(self) -> None:
+        for faults in (set(), {"more_lands_during_the_cancel"}):
+            with self.subTest(faults=sorted(faults)):
+                self.world = World()
+                self.world.faults = faults
+                self.walk()
+                self.assertEqual(9 if faults else 3, len(self.world.stopped_payloads))
+                self.assertGreater(len(self.world.left_over_seen), 1)
+                self.assertEqual({frozenset(self.world.stopped_payloads)}, set(self.world.left_over_seen))
+
+    def test_a_failed_check_of_the_complete_set_records_each_kind_of_fault_with_its_count_and_no_file(self) -> None:
+        self.world.faults = {"pairings_name_no_selected_file"}
+        record, _, _ = self.walk()
+        text = self.observed(record, "complete verified set", "pairings, check, manifest")
+        self.assertIn("'check': 1, 'fault_kinds': {'missing': 11}", text)
+        self.assertNotIn("vital", text)
+        self.assertNotIn("clinical", text)
+
+    def test_a_result_that_cannot_be_read_is_recorded_as_unreadable_kinds_and_the_case_still_fails(self) -> None:
+        self.world.faults = {"pairings_name_no_selected_file", "check_result_unreadable"}
+        record, _, _ = self.walk()
+        self.assertIn("complete verified set (pairings, check, manifest)", self.failed(record))
+        self.assertIn("'fault_kinds': 'unreadable'", self.observed(record, "complete verified set", "pairings, check, manifest"))
+
     def test_a_second_load_that_makes_a_branch_of_its_own_fails_the_load_idempotence(self) -> None:
         self.world.second_load_branches = True
         record, _, _ = self.walk()
@@ -1002,7 +1164,7 @@ class WalkTest(unittest.TestCase):
         self.assertIn("cleanup (airbyte jobs)", self.with_faults("retry_wait_fails", "cancel_owned_still_active"))
 
     def test_a_landing_that_is_not_empty_stops_the_run_in_the_preflight(self) -> None:
-        self.world.land(2)
+        self.world.land(0, 2, completed=False)
         record, _, _ = self.walk()
         self.assertEqual(["preflight (setup)"], self.failed(record))
 
@@ -1534,8 +1696,12 @@ class PureTest(unittest.TestCase):
 
     def test_the_failed_check_refusal_is_exact_only_for_the_one_finding_and_the_fixed_summary(self) -> None:
         key = f"{SOURCE_PREFIX}vital_files/0001.vital"
-        good = f"checked 2 of 2 files\n{key}: checksum_differs\ncheck failed: 1 faults in 2 selected files; no manifest may be published"
+        kind = "faults of kind checksum_differs: 1"
+        good = f"checked 2 of 2 files\n{key}: checksum_differs\n{kind}\ncheck failed: 1 faults in 2 selected files; no manifest may be published"
         self.assertTrue(self.module.exact_refusal(good, [(key, "checksum_differs")], 2))
+        for wrong in (good.replace(kind + "\n", ""), good.replace(kind, "faults of kind missing: 1"), good.replace(kind, kind + "\n" + kind)):
+            with self.subTest(wrong=wrong):
+                self.assertFalse(self.module.exact_refusal(wrong, [(key, "checksum_differs")], 2))
         for text in (
             good.replace("checksum_differs", "missing"),
             good.replace("1 faults", "2 faults"),
