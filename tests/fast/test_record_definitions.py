@@ -77,9 +77,11 @@ class CsvSourceTest(unittest.TestCase):
         self.assertNotIn("input_schema", stream)
         self.assertIs(False, stream["schemaless"])
 
-    def test_the_source_uses_the_pods_own_credentials_and_holds_no_key(self) -> None:
+    def test_the_source_signs_in_with_a_static_key_that_the_client_adds_and_the_document_holds_none(self) -> None:
+        """A pod of Airbyte has no sign-in of its own on the host (the instance metadata answers one network hop only), so the pods' default credentials
+        cannot read the bucket."""
         configuration = self.configuration()
-        self.assertEqual({"auth_type": "default_credentials"}, configuration["credentials"])
+        self.assertEqual({"auth_type": "iam_user"}, configuration["credentials"])
         self.assertNotIn("aws_access_key_id", json.dumps(configuration))
 
     def test_a_run_ID_that_is_not_a_plain_name_is_refused_before_it_reaches_a_key(self) -> None:

@@ -19,7 +19,7 @@ secret files at ``/run/secrets/airbyte_<name>``. The Airbyte role (``record_clie
   ``http://<bridge address>:<airbyte_nessie_route_port>/api/v2``.
 - ``client_id`` and ``client_secret`` (``AIRBYTE_CLIENT_ID_FILE``, ``AIRBYTE_CLIENT_SECRET_FILE``): the instance's client credentials.
 - ``aws_access_key_id`` and ``aws_secret_access_key`` (``AIRBYTE_AWS_ACCESS_KEY_ID_FILE``, ``AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE``): the access key that the S3
-  Data Lake destination needs for the Nessie catalog.
+  Data Lake destination needs for the Nessie catalog and that the two S3 sources of the CSV tables sign in with.
 
 ``.venv/bin/python -m scripts.ingestion.record_run load --run-id RUN --reference reference.json`` runs the load by hand and prints its record.
 """

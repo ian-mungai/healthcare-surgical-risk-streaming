@@ -4,8 +4,13 @@ The stand-in holds only what this reading of the API needs: the token call, the 
 with their lists, creates and updates, and the job calls. It is the test's statement of that reading, which is the one the raw connection's module makes of the
 same API, and the real API is proven on the host: a case here shows that the code does what it means to do, not that Airbyte answers as the stand-in does.
 
+Airbyte reads a source's schema when it creates a connection. An S3 source that holds no static key cannot list the bucket, because a pod has no sign-in of
+its own on the host, and Airbyte then answers the create with status 500 (the live record load of Nov 26 2026); the stand-in does the same. It masks each
+stored key in its answers.
+
 A second call of ``ensure_*`` makes no create and no update, a drifted object is repaired by an update, a field that Airbyte adds to an answer is not drift, a
-secret is sent only in the body of a destination request and never shown in an error, and a failed or late call becomes one error that holds no body.
+secret is sent only in the body of a request for the destination or for an S3 source and never shown in an error, and a failed or late call becomes one error
+that holds no body.
 """
 
 from __future__ import annotations
@@ -37,7 +42,8 @@ ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://ne
 ACCESS_ID = "AKIAEXAMPLEEXAMPLE0"
 ACCESS_VALUE = "wJalrXUtnFEMIexample0000000000000000000000"
 MASK = "**********"
-SECRET_FIELDS = ("access_key_id", "secret_access_key")
+SECRET_FIELDS = ("access_key_id", "secret_access_key", "aws_access_key_id", "aws_secret_access_key")
+S3_SOURCE_DEFINITION = "source_definition1"
 PREFIX = "/api/public/v1"
 ORIGIN = "http://10.42.0.1:8001"
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
@@ -112,6 +118,8 @@ class StandIn:
         if headers.get("Authorization") != f"Bearer token{self.tokens}" or self.expire_next_token:
             self.expire_next_token = False
             return 401, b'{"message":"expired"}'
+        if label == "POST connections" and not self.schema_can_be_read(body["sourceId"]):
+            return 500, b'{"message":"Schema discovery failed for source"}'
         answer = self.route(method, path.strip("/").split("/"), query, body)
         if label in self.mutations and answer is not None:
             self.mutations[label](answer)
@@ -161,9 +169,17 @@ class StandIn:
         return store[rest[0]]
 
     def shown(self, kind: str, entry: dict[str, Any]) -> dict[str, Any]:
-        if kind == "source":
-            return entry
-        return {**entry, "configuration": {name: MASK if name in SECRET_FIELDS else value for name, value in entry["configuration"].items()}}
+        def masked(values: dict[str, Any]) -> dict[str, Any]:
+            return {name: MASK if name in SECRET_FIELDS else masked(value) if isinstance(value, dict) else value for name, value in values.items()}
+
+        return {**entry, "configuration": masked(entry["configuration"])}
+
+    def schema_can_be_read(self, source_id: str) -> bool:
+        """Whether Airbyte's schema discovery of the source can list what it reads: an S3 source needs the static key."""
+        source = self.sources[source_id]
+        credentials = source["configuration"].get("credentials", {})
+        signed_in = credentials.get("aws_access_key_id") == ACCESS_ID and credentials.get("aws_secret_access_key") == ACCESS_VALUE
+        return bool(source["definitionId"] != S3_SOURCE_DEFINITION or (credentials.get("auth_type") == "iam_user" and signed_in))
 
     def connection(self, method: str, rest: list[str], body: dict[str, Any]) -> Any:
         if method == "GET":
@@ -397,23 +413,66 @@ class EnsureTest(unittest.TestCase):
 
 
 class SecretTest(unittest.TestCase):
-    def test_the_destination_gets_the_access_key_in_its_request_and_the_other_requests_get_none(self) -> None:
+    def holds_the_key_where_it_belongs(self, stand_in: StandIn, verb: str) -> None:
+        """Each request body holds the key exactly when it makes or changes the destination or one of the two S3 sources."""
+        keyed = {"destination1", "source1", "source2"}
+        for label, body in stand_in.bodies:
+            if verb == "POST":
+                wanted = label == "POST destinations" or (label == "POST sources" and body["definitionId"] == S3_SOURCE_DEFINITION)
+            else:
+                wanted = label.startswith("PATCH ") and label.rpartition("/")[2] in keyed
+            self.assertEqual(wanted, ACCESS_VALUE in json.dumps(body), label)
+            self.assertEqual(wanted, ACCESS_ID in json.dumps(body), label)
+
+    def test_the_destination_and_the_two_S3_sources_get_the_access_key_in_their_requests_and_no_other_request_does(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
-        for label, body in stand_in.bodies:
-            self.assertEqual(label == "POST destinations", ACCESS_VALUE in json.dumps(body), label)
+        self.holds_the_key_where_it_belongs(stand_in, "POST")
         self.assertEqual(ACCESS_VALUE, stand_in.destinations["destination1"]["configuration"]["secret_access_key"])
+        for name in ("source1", "source2"):
+            self.assertEqual(
+                {"auth_type": "iam_user", "aws_access_key_id": ACCESS_ID, "aws_secret_access_key": ACCESS_VALUE},
+                stand_in.sources[name]["configuration"]["credentials"],
+            )
+        self.assertNotIn(ACCESS_VALUE, json.dumps([stand_in.sources["source3"], stand_in.connections]))
 
-    def test_after_a_new_run_and_a_repair_only_the_destination_requests_hold_the_access_key(self) -> None:
+    def test_after_a_new_run_and_a_repair_only_the_destination_and_the_S3_source_requests_hold_the_access_key(self) -> None:
         api, stand_in = prepared()
         ids = ensure_everything(api)
         stand_in.connections[ids["lab_data"]]["status"] = "inactive"
         stand_in.sources["source1"]["configuration"]["bucket"] = "other"
         stand_in.bodies.clear()
         ensure_everything(api, "run_next")
-        self.assertIn("PATCH destinations/destination1", [label for label, _ in stand_in.bodies])
-        for label, body in stand_in.bodies:
-            self.assertEqual(label.startswith("PATCH destinations"), ACCESS_VALUE in json.dumps(body), label)
+        patched = [label for label, _ in stand_in.bodies if label.startswith("PATCH ")]
+        for name in ("destinations/destination1", "sources/source1", "sources/source2"):
+            self.assertIn(f"PATCH {name}", patched)
+        self.holds_the_key_where_it_belongs(stand_in, "PATCH")
+
+    def test_the_S3_sources_that_an_earlier_load_made_with_the_pods_credentials_are_given_the_key_before_their_connection_is_made(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        for name in ("source1", "source2"):
+            stand_in.sources[name]["configuration"]["credentials"] = {"auth_type": "default_credentials"}
+        stand_in.connections.clear()
+        stand_in.log.clear()
+        ensure_everything(api)
+        self.assertEqual(["PATCH sources/source1", "POST connections", "PATCH sources/source2", "POST connections", "POST connections"], writes(stand_in))
+
+    def test_a_masked_key_in_a_stored_S3_source_is_not_a_difference(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.log.clear()
+        ensure_everything(api)
+        self.assertEqual([], [label for label in writes(stand_in) if "sources" in label])
+
+    def test_no_error_of_a_source_request_holds_a_secret_or_a_response_body(self) -> None:
+        api, stand_in = prepared()
+        stand_in.failures["POST sources"] = (500, json.dumps({"message": f"bad {ACCESS_VALUE}"}).encode())
+        with self.assertRaises(AirbyteError) as raised:
+            ensure_everything(api)
+        for hidden in (ACCESS_VALUE, ACCESS_ID, "bad", "client_value"):
+            self.assertNotIn(hidden, str(raised.exception))
+        self.assertIn("POST sources", str(raised.exception))
 
     def test_a_masked_secret_in_the_stored_destination_is_not_a_difference(self) -> None:
         api, stand_in = prepared()
