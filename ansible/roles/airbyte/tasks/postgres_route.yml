@@ -1,0 +1,16 @@
+# Reads airbyte_postgres_unit and what postgres_route_units.yml reads. The route is up before the release, whose pods connect to PostgreSQL as they start.
+- name: Install the route's units
+  ansible.builtin.include_tasks: postgres_route_units.yml
+
+- name: Start the route's socket now and at boot
+  ansible.builtin.systemd_service:
+    name: "{{ airbyte_postgres_unit }}.socket"
+    state: started
+    enabled: true
+    daemon_reload: "{{ airbyte_postgres_socket_file is changed or airbyte_postgres_service_file is changed }}"
+
+- name: Restart the socket when a unit changed, which also stops the proxy so that its next start reads the new unit
+  ansible.builtin.systemd_service:
+    name: "{{ airbyte_postgres_unit }}.socket"
+    state: restarted
+  when: airbyte_postgres_socket_file is changed or airbyte_postgres_service_file is changed

@@ -1,0 +1,66 @@
+# Reads airbyte_namespace, airbyte_web_port, airbyte_ready_deadline_seconds and airbyte_health_deadline_seconds. Each wait ends at its deadline and names what is not ready.
+- name: Wait until every deployment and the object store are ready
+  block:
+    - name: Wait for every deployment to be available
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - wait
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - --for=condition=Available
+          - deployment
+          - --all
+          - "--timeout={{ airbyte_ready_deadline_seconds }}s"
+      changed_when: false
+      check_mode: false
+      timeout: "{{ airbyte_ready_deadline_seconds | int + 30 }}"
+
+    - name: Wait for the object store's stateful set to be ready
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - rollout
+          - status
+          - statefulset/airbyte-minio
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - "--timeout={{ airbyte_ready_deadline_seconds }}s"
+      changed_when: false
+      check_mode: false
+      timeout: "{{ airbyte_ready_deadline_seconds | int + 30 }}"
+  rescue:
+    - name: Read each pod's phase and why it waits, without logs
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - pods
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - --output
+          - custom-columns=NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,WAITING:.status.containerStatuses[*].state.waiting.reason
+      register: airbyte_ready_diagnosis
+      changed_when: false
+      failed_when: false
+      timeout: 60
+
+    - name: Stop with the pods that are not ready
+      ansible.builtin.fail:
+        msg: >-
+          Airbyte was not ready within {{ airbyte_ready_deadline_seconds }} seconds. Pods in namespace {{ airbyte_namespace }}:
+          {{ airbyte_ready_diagnosis.stdout | default('unreadable') }}
+
+- name: Wait for the health path to answer on the local address
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ airbyte_web_port }}/api/v1/health"
+    status_code: 200
+    timeout: 10
+  register: airbyte_health
+  retries: "{{ (airbyte_health_deadline_seconds | int / 5) | int }}"
+  delay: 5
+  until: airbyte_health.status == 200
+  check_mode: false

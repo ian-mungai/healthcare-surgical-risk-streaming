@@ -1,0 +1,17 @@
+# Reads compose_stack_compose_directory, compose_stack_owner and compose_stack_group. The tracked compose folder is the source of every placed file.
+- name: Create the Compose folder
+  ansible.builtin.file:
+    path: "{{ compose_stack_compose_directory }}"
+    state: directory
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0755"
+
+- name: Place the tracked Compose files
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../compose/"
+    dest: "{{ compose_stack_compose_directory }}/"
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    directory_mode: "0755"
+    mode: "0644"

@@ -1,0 +1,152 @@
+"""The Spark image is built only from pinned inputs that the build checks, and nothing is downloaded when a job starts.
+
+A base image taken by a moving tag or a jar taken without its checksum changes the platform silently, and an image that fetches a package at
+start gives a job a different result on each run. These checks read the tracked Dockerfile and its ignore file.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DOCKERFILE = ROOT / "spark" / "Dockerfile"
+IGNORE_FILE = ROOT / "spark" / "Dockerfile.dockerignore"
+PINNED_IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest@)[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
+
+
+def lines() -> list[str]:
+    """The instructions of the Dockerfile, with each continued line joined and each comment and blank line dropped."""
+    joined = DOCKERFILE.read_text().replace("\\\n", " ")
+    return [line.strip() for line in joined.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def arguments() -> dict[str, str]:
+    return {name: value for name, _, value in (line[4:].partition("=") for line in lines() if line.startswith("ARG ") and "=" in line)}
+
+
+def expanded(text: str) -> str:
+    values = arguments()
+    return re.sub(r"\$\{(\w+)\}", lambda match: values.get(match.group(1), match.group(0)), text)
+
+
+class ImageTest(unittest.TestCase):
+    def test_every_base_image_is_for_x86_64_and_pinned_by_a_tag_and_a_digest(self) -> None:
+        stages: set[str] = set()
+        bases = 0
+        for line in lines():
+            if not line.startswith("FROM "):
+                continue
+            parts = expanded(line).split()
+            self.assertIn("--platform=linux/amd64", parts, line)
+            image = next(part for part in parts[1:] if not part.startswith("--"))
+            if image not in stages:
+                bases += 1
+                self.assertRegex(image, PINNED_IMAGE, line)
+            if "AS" in parts:
+                stages.add(parts[parts.index("AS") + 1])
+        self.assertGreaterEqual(bases, 2)
+
+    def test_python_is_3_14_the_project_target(self) -> None:
+        self.assertTrue(arguments()["PYTHON_IMAGE"].startswith("python:3.14."))
+
+    def test_every_download_is_https_and_checked_against_a_sha256_at_build(self) -> None:
+        downloads = [line for line in lines() if line.startswith("ADD ")]
+        self.assertGreaterEqual(len(downloads), 3, "Spark, the Iceberg runtime and the object store bundle")
+        for line in downloads:
+            with self.subTest(line=line[:90]):
+                self.assertRegex(expanded(line), r"^ADD --checksum=sha256:[0-9a-f]{64} https://\S+ \S+$")
+
+    def test_the_iceberg_runtime_matches_the_spark_and_scala_versions_of_the_image(self) -> None:
+        values = arguments()
+        spark_minor = ".".join(values["SPARK_VERSION"].split(".")[:2])
+        runtime = f"iceberg-spark-runtime-{spark_minor}_{values['SCALA_VERSION']}-{values['ICEBERG_VERSION']}.jar"
+        self.assertTrue(any(runtime in expanded(line) for line in lines() if line.startswith("ADD ")), runtime)
+
+    def test_the_kafka_connector_matches_the_spark_and_scala_versions_and_brings_the_client_and_its_dependencies(self) -> None:
+        values = arguments()
+        downloads = [expanded(line) for line in lines() if line.startswith("ADD ")]
+        suffix = f"_{values['SCALA_VERSION']}-{values['SPARK_VERSION']}.jar"
+        for artifact in ("spark-sql-kafka-0-10", "spark-token-provider-kafka-0-10"):
+            self.assertTrue(any(f"/{artifact}_{values['SCALA_VERSION']}/{values['SPARK_VERSION']}/{artifact}{suffix}" in line for line in downloads), artifact)
+        for artifact, version in (("kafka-clients", values["KAFKA_CLIENTS_VERSION"]), ("commons-pool2", values["COMMONS_POOL_VERSION"])):
+            self.assertTrue(any(f"/{artifact}/{version}/{artifact}-{version}.jar" in line for line in downloads), artifact)
+        held = "the Spark 4.1.4 distribution already holds scala-parallel-collections 1.2.0"
+        self.assertFalse([line for line in downloads if "scala-parallel-collections" in line], held)
+
+    def test_nothing_is_fetched_when_a_job_starts(self) -> None:
+        for line in lines():
+            if line.startswith(("ENTRYPOINT", "CMD")):
+                self.assertNotRegex(line, r"curl|wget|pip|apt|ivy|--packages", line)
+        self.assertNotIn("spark.jars.packages", DOCKERFILE.read_text())
+
+    def test_the_image_runs_as_one_numeric_user_and_never_as_root(self) -> None:
+        users = [line.split()[1] for line in lines() if line.startswith("USER ")]
+        self.assertEqual(1, len(users))
+        self.assertRegex(users[0], r"^[1-9][0-9]*:[1-9][0-9]*$")
+
+    def test_the_build_context_admits_only_what_the_image_copies(self) -> None:
+        rules = [line.strip() for line in IGNORE_FILE.read_text().splitlines() if line.strip() and not line.startswith("#")]
+        self.assertEqual("*", rules[0], "everything is excluded first, so the environment file and the run records never enter the context")
+        copied = {line.split()[1].rstrip("/") for line in lines() if line.startswith("COPY ") and "--from=" not in line}
+        allowed = {rule[1:].rstrip("/") for rule in rules[1:] if rule.startswith("!")}
+        self.assertLessEqual(copied, allowed)
+        self.assertLessEqual(allowed, copied)
+
+    def test_the_image_holds_every_project_module_that_a_job_imports_at_the_path_that_the_job_imports_from(self) -> None:
+        copies = {parts[1]: parts[2] for parts in (line.split() for line in lines() if line.startswith("COPY ") and "--from=" not in line)}
+        roots = [value for line in lines() if line.startswith("ENV ") for value in re.findall(r"PYTHONPATH=(\S+)", line)]
+        self.assertEqual(1, len(roots))
+        root = roots[0].split(":")[0]
+        self.assertEqual(f"{root}/spark", copies.get("spark"), "the Spark package is copied to the import root")
+        needed: dict[str, set[str]] = {}
+        for job in sorted((ROOT / "spark").rglob("*.py")):
+            for node in ast.walk(ast.parse(job.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] == "scripts":
+                    parts = (node.module or "").split(".")
+                    module = (ROOT / Path(*parts)).with_suffix(".py")
+                    for file in (module, *(ROOT / Path(*parts[:depth]) / "__init__.py" for depth in range(1, len(parts)))):
+                        needed.setdefault(str(file.relative_to(ROOT)), set()).add(job.name)
+        self.assertTrue(needed)
+        for path, importers in sorted(needed.items()):
+            with self.subTest(path=path):
+                # A module is copied either by its own line or by the line that copies a folder holding it.
+                source = next((name for name in (path, *(str(parent) for parent in Path(path).parents if str(parent) != ".")) if name in copies), None)
+                self.assertIsNotNone(source, f"{sorted(importers)} import it and the image does not copy it")
+                self.assertEqual(f"{root}/{source}", copies[str(source)], f"{sorted(importers)} import it from {root} and the image copies it elsewhere")
+
+    def test_every_name_a_spark_job_imports_from_the_project_exists_in_its_module(self) -> None:
+        """A join can move a function to another module; the jobs run only in the image, so a stale import shows only there unless this catches it."""
+        for job in sorted((ROOT / "spark").rglob("*.py")):
+            for node in ast.walk(ast.parse(job.read_text())):
+                if not (isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] in ("spark", "scripts", "replay")):
+                    continue
+                folder = ROOT / Path(*(node.module or "").split("."))
+                source = folder.with_suffix(".py") if folder.with_suffix(".py").is_file() else folder / "__init__.py"
+                with self.subTest(job=str(job.relative_to(ROOT)), module=node.module):
+                    self.assertTrue(source.is_file(), f"{node.module} does not exist")
+                    defined = module_names(ast.parse(source.read_text()))
+                    for alias in node.names:
+                        self.assertTrue(alias.name in defined or (folder / f"{alias.name}.py").is_file(), f"{node.module} defines no {alias.name}")
+
+
+def module_names(tree: ast.Module) -> set[str]:
+    """The names a module defines or imports at its top level, the ones another module can import from it."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        names.add(name.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+    return names
+
+
+if __name__ == "__main__":
+    unittest.main()

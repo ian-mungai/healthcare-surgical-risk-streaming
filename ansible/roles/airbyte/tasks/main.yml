@@ -1,0 +1,48 @@
+# Deploys Airbyte on k3s from its Helm chart: installs Helm from a pinned release, checks the pinned chart against the tracked values and the limits file,
+# creates the namespace, reads the k3s bridge address, forwards the pods' connections on it to PostgreSQL, limits who may use that route, makes the secrets
+# from files on the host, gives the group commands of Dagster their narrow access, installs or upgrades the release only when its inputs changed and forwards
+# the web service to the host's local address. A second run changes nothing. Every wait ends at its deadline and a failure names what did not become ready.
+- name: Install Helm
+  ansible.builtin.include_tasks: helm.yml
+
+- name: Download the chart and check it
+  ansible.builtin.include_tasks: chart.yml
+
+- name: Create the namespace and its default container memory limit
+  ansible.builtin.include_tasks: cluster.yml
+
+- name: Read the address that k3s gave its bridge on the host
+  ansible.builtin.include_tasks: bridge_address.yml
+
+- name: Forward the pods' connections on that address to PostgreSQL
+  ansible.builtin.include_tasks: postgres_route.yml
+
+- name: Limit which pods may use the route
+  ansible.builtin.include_tasks: network_policy.yml
+
+- name: Create the generated secret files
+  ansible.builtin.include_tasks: secret_files.yml
+
+- name: Make the Kubernetes secrets match the files
+  ansible.builtin.include_tasks: secrets.yml
+
+- name: Give the group commands their access to Airbyte's workloads
+  ansible.builtin.include_tasks: group_access.yml
+
+- name: Place the values files
+  ansible.builtin.include_tasks: place_files.yml
+
+- name: Install or upgrade the release
+  ansible.builtin.include_tasks: release.yml
+
+- name: Forward the web service to the local address
+  ansible.builtin.include_tasks: web_forward.yml
+
+- name: Make the record load's routes and credential files
+  ansible.builtin.include_tasks: record_routes.yml
+
+- name: Confirm that Airbyte is ready and answers on the local address
+  ansible.builtin.include_tasks: verify.yml
+
+- name: Install the script that places the project profile's access key
+  ansible.builtin.include_tasks: key_script.yml

@@ -15,7 +15,6 @@ import os
 import re
 import stat
 import tempfile
-import traceback
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
@@ -30,6 +29,7 @@ from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, load_documents
 from scripts import aws_cli
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError, AwsTimeout
 from scripts.process import CompletedProcess, TimeoutExpired
+from tests.fast.traceback_support import raised_text
 
 ACCOUNT = "1" * 12
 CONFIGURATION = {
@@ -264,7 +264,8 @@ class KeyTest(unittest.TestCase):
         code, output, backup = self.run_key(account)
         self.assertEqual(1, code)
         self.assertIn("cli_history", output)
-        self.assertIn("aws configure set cli_history disabled --profile admin_profile", output)
+        self.assertIn("aws configure set cli_history disabled --profile <ADMIN_PROFILE>", output)
+        self.assertNotIn("admin_profile", output, "the advice is constant and holds no value of --admin-profile")
         self.assertEqual(0, self.creations(account))
         self.assertFalse(backup.exists())
         self.assertNotIn(SECRET, output)
@@ -289,6 +290,8 @@ class KeyTest(unittest.TestCase):
         code, output, backup = self.run_key(account)
         self.assertEqual(1, code)
         self.assertIn("cli_history", output)
+        self.assertIn("--profile <ADMIN_PROFILE>", output)
+        self.assertNotIn("admin_profile", output, "no message of the key command holds a value of --admin-profile")
         self.assertEqual(0, self.creations(account))
         self.assertFalse(backup.exists())
 
@@ -327,7 +330,7 @@ class KeyTest(unittest.TestCase):
         (folder / "other_accessKeys.csv").write_text("kept")
         code, output, backup = self.rerun_key(account)
         self.assertEqual(1, code)
-        self.assertIn("LimitExceeded", output)
+        self.assertIn("AwsError", output)
         self.assertFalse(backup.exists())
         self.assertEqual("kept", (folder / "other_accessKeys.csv").read_text())
         account.create_error = None
@@ -350,7 +353,7 @@ class KeyTest(unittest.TestCase):
         with mock.patch.object(aws_cli, "keep_raw_error", side_effect=OSError("disk full")):
             code, output, backup = self.run_key(account)
         self.assertEqual(1, code)
-        self.assertIn("LimitExceeded", output)
+        self.assertIn("AwsError", output)
         self.assertFalse(backup.exists())
         account.create_refusal = None
         code, output, _ = self.rerun_key(account)
@@ -388,8 +391,8 @@ class KeyTest(unittest.TestCase):
                 self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
                 self.assertTrue(backup.exists())
                 self.assertNotIn(SECRET, output)
-                error = self.raised_by_write_new_key(account)
-                self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
+                error, text = self.raised_by_write_new_key(account)
+                self.assertNotIn(SECRET, text)
                 self.assertIsNone(error.__context__)
 
     def test_a_failed_write_or_flush_of_the_backup_after_the_key_exists_keeps_the_reservation_gives_the_advice_and_shows_no_secret(self) -> None:
@@ -424,8 +427,8 @@ class KeyTest(unittest.TestCase):
                 self.assertTrue(backup.exists())
                 self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
                 self.assertNotIn(SECRET, output)
-                error = self.raised_by_write_new_key(Account.matching_templates())
-                self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
+                error, text = self.raised_by_write_new_key(Account.matching_templates())
+                self.assertNotIn(SECRET, text)
                 self.assertIsNone(error.__context__)
 
     def test_a_backup_file_that_cannot_be_opened_creates_no_key_says_so_and_leaves_no_reservation(self) -> None:
@@ -441,14 +444,14 @@ class KeyTest(unittest.TestCase):
         code, output, _ = self.rerun_key(account)
         self.assertEqual((0, 1), (code, account.keys), output)
 
-    def raised_by_write_new_key(self, account: Account) -> BaseException:
+    def raised_by_write_new_key(self, account: Account) -> tuple[ValueError, str]:
         backup = self.folder / "direct_accessKeys.csv"
         with mock.patch.object(aws_cli, "run_command", return_value=account.create_refusal) if account.create_refusal else contextlib.nullcontext():
-            try:
-                manage_policies.write_new_key(FakeAws("admin_profile", "us-west-2", account), "example_project_dev", backup)
-            except ValueError as error:
-                return error
-        raise AssertionError("write_new_key raised nothing")
+            return raised_text(
+                lambda: manage_policies.write_new_key(FakeAws("admin_profile", "us-west-2", account), "example_project_dev", backup),
+                ValueError,
+                "write_new_key",
+            )
 
     def test_every_ready_wait_call_gets_the_time_that_is_left_and_no_sleep_passes_the_deadline(self) -> None:
         clock = FakeClock()

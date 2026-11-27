@@ -1,0 +1,2 @@
+# The most disk, in GiB, that the topics in topics.txt may use together. It is a share of the host's disk budget, set from the measured event rate and checked by a fast test.
+30

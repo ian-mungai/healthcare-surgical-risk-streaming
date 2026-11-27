@@ -1,0 +1,16 @@
+# Reads airbyte_chart_defaults, which the role registers from `helm show values`. The check runs on the computer that runs Ansible, where the repository is.
+# It refuses a chart that starts a workload the tracked values do not mention, a workload without a limits entry and an entry without a workload.
+- name: Check the chart's workloads and settings against the tracked values and the limits file
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - scripts.stack.k3s_limits
+      - check-chart
+    chdir: "{{ role_path }}/../../.."
+    stdin: "{{ airbyte_chart_defaults.stdout }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  timeout: 60

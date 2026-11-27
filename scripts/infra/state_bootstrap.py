@@ -17,8 +17,8 @@ object to the bucket.
 
 from __future__ import annotations
 
-import argparse
 import json
+import os
 import secrets
 import sys
 from dataclasses import asdict, dataclass
@@ -27,16 +27,21 @@ from pathlib import Path
 from typing import Any
 
 from scripts.aws_cli import Aws, AwsError
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
-DEFAULT_BINDING = ROOT / "runs" / "run_binding.json"
+RUNS = ROOT / "runs"
+DEFAULT_BINDING = RUNS / "run_binding.json"
 STATE_PREFIX = "state"
 BUCKET_NAME_LIMIT = 63
 WORKSPACE = "default"
 BLOCK_NAMES = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
 MISSING_BUCKET = ("(404)", "NoSuchBucket")
 GIT_TIMEOUT_SECONDS = 60
+BINDING_REFUSED = "the run binding file must lie directly inside the runs folder of the repository; nothing was written"
 
 
 @dataclass
@@ -53,9 +58,11 @@ class RunBinding:
     bucket_creation: str = "none"
     bucket_mode: str = "permanent"
 
-    def write(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2) + "\n")
+    def write(self, path: Path, *, state_root: Path = RUNS) -> None:
+        """Replace the binding file, which must lie directly inside ``state_root`` (the runs folder unless a caller names its own state folder)."""
+        if path.parent == state_root:
+            state_root.mkdir(parents=True, exist_ok=True)
+        replace_owned_file(path, json.dumps(asdict(self), indent=2) + "\n", state_root=state_root, mode=0o644)
 
 
 def state_keys(environment: str) -> list[str]:
@@ -64,9 +71,14 @@ def state_keys(environment: str) -> list[str]:
     return [key, f"{key}.tflock"]
 
 
+def run_suffix(run_id: str) -> str:
+    """The run ID without its year and separators: the part that names a test run's own bucket and deploy role."""
+    return run_id[4:].replace("t", "").replace("-", "")
+
+
 def short_lived_bucket_name(project_bucket: str, run_id: str) -> str:
     """A test's own bucket: the project's bucket name, the test suffix and the run ID without its year and separators, to fit an S3 name."""
-    name = f"{project_bucket}-test-{run_id[4:].replace('t', '').replace('-', '')}"
+    name = f"{project_bucket}-test-{run_suffix(run_id)}"
     if len(name) > BUCKET_NAME_LIMIT:
         raise ConfigurationError(f"the test bucket name would be longer than {BUCKET_NAME_LIMIT} characters; shorten S3_BUCKET")
     return name
@@ -169,7 +181,19 @@ def repair(aws: Aws, bucket: str, name: str, tags: dict[str, str]) -> None:
         aws.call("s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging", tag_set)
 
 
+def binding_path(path: Path) -> Path | None:
+    """The binding file that ``path`` names: a relative path is read from the repository root, never from the working folder, and ``..`` parts are folded
+    out. None when the file does not lie directly inside the runs folder, the only place a binding is written."""
+    resolved = Path(os.path.normpath(ROOT / path))
+    return resolved if resolved.parent == RUNS else None
+
+
 def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3", provision_host: bool = True, short_lived: bool = False) -> int:
+    named = binding_path(path)
+    if named is None:
+        sys.stderr.write(f"{BINDING_REFUSED}\n")
+        return 1
+    path = named
     binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend, provision_host, short_lived)
     if binding.backend != backend:
         sys.stderr.write(f"the run is bound to the {binding.backend} backend, not {backend}\n")
@@ -235,7 +259,7 @@ def verify(aws: Aws, configuration: dict[str, str], path: Path) -> int:
 
 def main() -> int:
     """Run create or verify and return a non-zero code on a difference or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["create", "verify"])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     parser.add_argument(
@@ -251,7 +275,7 @@ def main() -> int:
             return create(aws, configuration, arguments.binding, arguments.backend, not arguments.given_host, arguments.short_lived_bucket)
         return verify(aws, configuration, arguments.binding)
     except (ConfigurationError, AwsError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

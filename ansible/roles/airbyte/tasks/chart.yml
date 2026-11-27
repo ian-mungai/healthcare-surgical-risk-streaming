@@ -1,0 +1,30 @@
+# Reads airbyte_directory, airbyte_owner, airbyte_group, airbyte_chart_version and airbyte_chart_sha256. The chart is installed from this archive
+# and never from a repository index, so the pinned hash is what runs.
+- name: Create Airbyte's folder
+  ansible.builtin.file:
+    path: "{{ airbyte_directory }}"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0755"
+
+- name: Download the chart archive of the pinned version, checked against its pinned hash
+  ansible.builtin.get_url:
+    url: "https://airbytehq.github.io/charts/airbyte-{{ airbyte_chart_version }}.tgz"
+    dest: "{{ airbyte_directory }}/airbyte-{{ airbyte_chart_version }}.tgz"
+    checksum: "sha256:{{ airbyte_chart_sha256 }}"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+    timeout: 60
+
+- name: Read the chart's default values
+  ansible.builtin.command:
+    argv: [helm, show, values, "{{ airbyte_directory }}/airbyte-{{ airbyte_chart_version }}.tgz"]
+  register: airbyte_chart_defaults
+  changed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Check the chart's workloads and settings against the tracked values and the limits file
+  ansible.builtin.include_tasks: verify_chart.yml

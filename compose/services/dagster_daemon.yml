@@ -1,0 +1,33 @@
+services:
+  dagster_daemon:
+    image: ${IMAGE_DAGSTER:?render the image pins first}
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_DAGSTER_DAEMON:?render the limits first}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    command: [dagster-daemon, run, --workspace, /opt/dagster/instance/workspace.yaml]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dagster_code_location:
+        condition: service_healthy
+    secrets:
+      - dagster_postgres_password
+    tmpfs:
+      - /run/dagster:uid=10001,gid=10001,mode=0700
+    volumes:
+      - dagster_storage:/opt/dagster/instance/storage
+    healthcheck:
+      test: [CMD, dagster-daemon, liveness-check]
+      interval: 15s
+      timeout: 45s
+      retries: 8
+      start_period: 90s
+
+secrets:
+  dagster_postgres_password:
+    file: ${SECRETS_DIR:?render the host settings first}/postgres/dagster.password
+
+volumes:
+  dagster_storage:

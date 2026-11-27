@@ -1,0 +1,108 @@
+# Airbyte chart 2.5.0 on k3s. This file is the first of three values files. The limits file gives every memory figure (rendered by
+# scripts.stack.k3s_limits) and the role's settings give the database address and the staging size, so no memory figure or host value is typed here.
+# The credentials live in Kubernetes secrets that the role creates from files on the host: this file names them and holds no value.
+global:
+  edition: community
+  auth:
+    enabled: true
+  database:
+    # The chart's default type, not "external": chart 2.5.0 turns Temporal's database TLS on for an external database, and the shared PostgreSQL
+    # server on the k3s bridge has no TLS. The host values give the bridge address, and postgresql.enabled: false keeps the chart's own database out.
+    secretName: airbyte-database
+    userSecretKey: database-user
+    passwordSecretKey: database-password
+    # The chart's replica is the same database read with the same account. Unset, these keys default to CONFIG_DATABASE_REPLICA_USER and
+    # CONFIG_DATABASE_REPLICA_PASSWORD, which the secret does not hold, and the bootloader cannot start.
+    replica:
+      userSecretKey: database-user
+      passwordSecretKey: database-password
+  storage:
+    type: minio
+    secretName: airbyte-storage
+  tracking:
+    enabled: false
+    strategy: logging
+  workloads:
+    resources:
+      useConnectorResourceDefaults: false
+
+# Airbyte serves its interface from the server. The chart's separate web application is off.
+webapp:
+  enabled: false
+# Every named database pool of Airbyte's pods has a cap here (compose/postgres_connections.yml). A pool is named in the application.yml of the pod's module
+# (airbytehq/airbyte-platform at d5a0048). The chart's env_vars of a component become environment values of its container, and a Java option in
+# JAVA_TOOL_OPTIONS (the chart sets none) is read by the JVM itself. A pool named local-secrets or config-replica has a hyphen in its name, and the environment
+# form DATASOURCES_LOCAL_SECRETS_MAXIMUM_POOL_SIZE would also give Micronaut an entry named "local" (the first form of the name that it normalizes to is
+# datasources.local.secrets.maximum.pool.size), so a hyphenated pool and a pool that has a fixed size are capped with the property itself,
+# -Ddatasources.<name>.maximum-pool-size=<n>, which names the pool exactly.
+server:
+  enabled: true
+  service:
+    type: ClusterIP
+  # The pool size of each of the server's pools config and jobs: the chart renders CONFIG_DB_MAX_POOL_SIZE into the server's container only. The default is 20.
+  configDbMaxPoolSize: "4"
+  env_vars:
+    # The server's read-only copy of the config pool, which application.yml sizes with this variable (default 20).
+    CONFIG_DB_REPLICA_MAX_POOL_SIZE: "1"
+    # The pool local-secrets is fixed at 20 in application.yml.
+    JAVA_TOOL_OPTIONS: "-Ddatasources.local-secrets.maximum-pool-size=1"
+worker:
+  enabled: true
+  env_vars:
+    JAVA_TOOL_OPTIONS: "-Ddatasources.local-secrets.maximum-pool-size=1"
+workloadLauncher:
+  enabled: true
+  env_vars:
+    JAVA_TOOL_OPTIONS: "-Ddatasources.local-secrets.maximum-pool-size=1"
+workloadApiServer:
+  enabled: true
+  # The chart renders CONFIG_DB_MAX_POOL_SIZE only into the server, and this pod reads the same variable for its one pool config (default 20).
+  env_vars:
+    CONFIG_DB_MAX_POOL_SIZE: "4"
+manifestServer:
+  enabled: true
+cron:
+  enabled: true
+  # The pools config and jobs are fixed at 5 and local-secrets at 20 in application.yml.
+  env_vars:
+    JAVA_TOOL_OPTIONS: "-Ddatasources.config.maximum-pool-size=2 -Ddatasources.jobs.maximum-pool-size=2 -Ddatasources.local-secrets.maximum-pool-size=1"
+airbyteBootloader:
+  enabled: true
+  # The pools config and jobs are fixed at 5 each in application.yml. The migration runs on both, and Flyway may hold a second connection of a pool.
+  env_vars:
+    JAVA_TOOL_OPTIONS: "-Ddatasources.config.maximum-pool-size=3 -Ddatasources.jobs.maximum-pool-size=3"
+temporal:
+  enabled: true
+  # Temporal's four services each keep a pool for the default store and one for the visibility store (compose/postgres_connections.yml). The defaults are 20 and 10,
+  # so the live host held 65 connections for Temporal alone. The values are strings because they become environment values.
+  env_vars:
+    SQL_MAX_CONNS: "4"
+    SQL_MAX_IDLE_CONNS: "4"
+    SQL_VIS_MAX_CONNS: "2"
+    SQL_VIS_MAX_IDLE_CONNS: "2"
+minio:
+  enabled: true
+  storage:
+    volumeClaimValue: 2Gi
+
+# The shared PostgreSQL server replaces the chart's own database.
+postgresql:
+  enabled: false
+
+connectorRolloutWorker:
+  enabled: false
+metrics:
+  enabled: false
+temporalUi:
+  enabled: false
+keycloak:
+  enabled: false
+directJobRunner:
+  enabled: false
+featureflagServer:
+  enabled: false
+stiggSidecar:
+  enabled: false
+
+ingress:
+  enabled: false

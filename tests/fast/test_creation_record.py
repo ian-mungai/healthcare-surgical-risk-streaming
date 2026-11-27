@@ -7,10 +7,16 @@ a new binding, a retry after an interrupted creation and the name of a test's ow
 
 from __future__ import annotations
 
+import inspect
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from scripts.infra import state_bootstrap
 from scripts.infra.created import created_entries, device_entries, merge_created, run_inventory
 from scripts.infra.state_bootstrap import RunBinding, adoption_problem, bucket_problem, short_lived_bucket_name, state_keys
+from scripts.ingestion.closed import ClosedInputError
 from scripts.project_config import ConfigurationError
 
 KEYS = ["state/dev/terraform.tfstate", "state/dev/terraform.tfstate.tflock"]
@@ -41,6 +47,34 @@ HOST_ENTRIES = [
     {"address": "module.host[0].aws_instance.host root volume", "type": "aws_ebs_volume", "service_id": "vol-0aaa"},
 ]
 LANDING_ENTRY = {"address": 'module.storage.aws_s3_bucket.this["landing"]', "type": "aws_s3_bucket", "service_id": "example-landing"}
+
+
+class BindingWriteTest(unittest.TestCase):
+    """The run binding is replaced only as a regular file directly inside the runs folder, or inside the state folder that a caller names itself."""
+
+    def test_a_binding_path_outside_the_runs_folder_is_refused_and_nothing_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "run_binding.json"
+            other = Path(scratch) / "other.json"
+            other.write_text("kept\n")
+            for target in (path, other):
+                with self.subTest(target=target.name), self.assertRaises(ClosedInputError):
+                    RUN.write(target)
+            self.assertFalse(path.exists())
+            self.assertEqual("kept\n", other.read_text())
+            self.assertEqual(["other.json"], [entry.name for entry in Path(scratch).iterdir()])
+
+    def test_a_binding_is_replaced_in_the_folder_that_is_named_as_its_state_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "run_binding.json"
+            RUN.write(path, state_root=Path(scratch))
+            RUN.write(path, state_root=Path(scratch))
+            self.assertEqual(RUN.run_id, json.loads(path.read_text())["run_id"])
+            self.assertEqual(["run_binding.json"], [entry.name for entry in Path(scratch).iterdir()])
+
+    def test_the_default_state_folder_is_the_runs_folder_of_the_default_binding(self) -> None:
+        self.assertEqual(state_bootstrap.RUNS, state_bootstrap.DEFAULT_BINDING.parent)
+        self.assertEqual(state_bootstrap.RUNS, inspect.signature(RunBinding.write).parameters["state_root"].default)
 
 
 class CreatedRecordTest(unittest.TestCase):

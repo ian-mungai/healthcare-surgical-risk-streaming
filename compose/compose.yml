@@ -1,0 +1,23 @@
+# The root file only names the project and lists one file for each service. A service is added by a new file in services/ and one line here.
+name: surgical_risk
+include:
+  - services/nessie.yml
+  - services/openbao.yml
+  - services/postgres.yml
+  - services/caddy.yml
+  - services/dagster_code_location.yml
+  - services/dagster_daemon.yml
+  - services/dagster_webserver.yml
+  - services/prometheus.yml
+  - services/grafana.yml
+  - services/loki.yml
+  - services/alloy.yml
+  - services/spark_bronze.yml
+  - services/spark_silver.yml
+  - services/spark_gold.yml
+  - services/spark_maintenance.yml
+  - services/trino.yml
+  - services/kafka.yml
+  - services/apicurio.yml
+  - services/aistor.yml
+  - services/replay.yml

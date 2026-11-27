@@ -1,0 +1,43 @@
+services:
+  spark_bronze:
+    image: ${IMAGE_SPARK:?render the image pins first}
+    platform: linux/amd64
+    profiles: [batch_bronze]
+    mem_limit: ${MEM_LIMIT_SPARK_BRONZE:?render the limits first}
+    restart: "no"
+    user: "10100:10100"
+    group_add: ["20106"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      nessie:
+        condition: service_healthy
+    entrypoint: [python, -m, spark.launcher]
+    environment:
+      SPARK_WORKLOAD: bronze
+      NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      WAREHOUSE_LOCATION: ${WAREHOUSE_LOCATION:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
+    configs:
+      - source: bronze_aws_client_config
+        target: /etc/workload_access/client_config
+    volumes:
+      - spark_bronze_scratch:/scratch
+      - lake_warehouse:/warehouse
+      - workload_access_bronze:/run/workload_access:ro
+
+configs:
+  bronze_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
+
+volumes:
+  spark_bronze_scratch:
+  lake_warehouse:
+  workload_access_bronze:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${BRONZE_ACCESS_DIR:-/run/workload_access/bronze}

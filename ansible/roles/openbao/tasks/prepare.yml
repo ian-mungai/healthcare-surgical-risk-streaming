@@ -1,0 +1,16 @@
+# Run before the stack starts. Reads openbao_secrets_directory, openbao_unlock_key_file and openbao_user. Creates only the missing admin secret ID file, gives it
+# the user of the OpenBao container with mode 0400 and prints no secret.
+- name: Create the admin secret ID file that OpenBao reads at its first start
+  openbao_bootstrap:
+    step: prepare
+    secrets_directory: "{{ openbao_secrets_directory }}"
+    unlock_key_file: "{{ openbao_unlock_key_file }}"
+    file_owner: "{{ openbao_user }}"
+  register: openbao_prepared
+
+- name: Remember the secret files and their owners
+  ansible.builtin.set_fact:
+    openbao_secret_files: "{{ openbao_prepared.secret_files }}"
+
+- name: Check the secret files
+  ansible.builtin.include_tasks: verify_secrets.yml

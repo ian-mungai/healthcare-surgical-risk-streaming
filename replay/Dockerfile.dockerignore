@@ -1,0 +1,16 @@
+*
+!features/__init__.py
+!features/sampling.py
+!casefile
+!replay
+!scripts/__init__.py
+!scripts/process.py
+!scripts/project_config.py
+!scripts/sample
+!tests/fixtures/vitaldb/release.json
+!scripts/ingestion
+scripts/ingestion/cli.py
+**/__pycache__
+replay/Dockerfile
+replay/Dockerfile.dockerignore
+replay/requirements.in

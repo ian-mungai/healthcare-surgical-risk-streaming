@@ -1,0 +1,100 @@
+"""The shape of the one diagnostic line that a sealed job writes to standard error on ``internal_error``, and the checks that tests share."""
+
+from __future__ import annotations
+
+import os
+import sys
+import types
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+from spark import internal_diagnostic
+from spark.internal_diagnostic import is_diagnostic
+from spark.internal_inventory import INVENTORY
+
+ROOT = Path(internal_diagnostic.__file__).resolve().parent.parent
+TRACKED = "spark/result_file.py"  # a tracked file of the project, standing in for a module of a job
+OWN_FILE = str(ROOT / TRACKED)
+ENTRY = sorted(INVENTORY[TRACKED])[0]  # a name that the inventory holds for that file
+LINE_MARKER = "7316254"  # a number that a message can carry (PySpark 4 sets the line of a rebuilt frame from one); no line, file or standard error holds it
+ENTRY_FRAME = f"{TRACKED}:{ENTRY}"  # the frame of ``def ENTRY(): raise KeyError``: the path and the function, no line number
+
+
+def stand_in(case: unittest.TestCase, filename: str, scope: dict[str, Any]) -> None:
+    """Make the functions in ``scope`` (compiled under the project file ``filename``) code that the loaded module of that file holds, as if the file had defined
+    them: a frame is named only when its code object is held by a loaded project module. The module (the real one, or an empty one when none is loaded) is
+    restored when ``case`` ends."""
+    path = Path(os.path.normpath(filename))
+    if not path.is_relative_to(ROOT):
+        return
+    relative = path.relative_to(ROOT).as_posix()
+    if relative not in INVENTORY:
+        return
+    name = relative.removesuffix(".py").removesuffix("/__init__").replace("/", ".")
+    module = sys.modules.get(name)
+    if module is None:
+        module = types.ModuleType(name)
+        patcher = mock.patch.dict(sys.modules, {name: module})
+        patcher.start()
+        case.addCleanup(patcher.stop)
+    held = {f"_stand_in_for_{key}": value for key, value in scope.items() if not key.startswith("__")}
+    patcher = mock.patch.dict(module.__dict__, held)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
+def split_lines(err: str, job: str) -> tuple[list[str], list[str]]:
+    """The lines of standard error that are not the diagnostic line, and the bodies of the diagnostic lines (without the job prefix)."""
+    prefix = f"{job}: internal_error class="
+    rest = [line for line in err.splitlines() if not line.startswith(prefix)]
+    found = [line[len(job) + 2 :] for line in err.splitlines() if line.startswith(prefix)]
+    return rest, found
+
+
+def assert_internal(case: unittest.TestCase, err: str, job: str, code_line: str | None, classes: tuple[str, ...], marker: str) -> list[str]:
+    """Standard error is the code line (when given) and exactly one diagnostic line of the one shape of the producer (``is_diagnostic``) that names ``classes``
+    first, with no ``marker``. Gives the frames."""
+    rest, found = split_lines(err, job)
+    case.assertEqual([] if code_line is None else [code_line], rest)
+    case.assertEqual(1, len(found), err)
+    case.assertTrue(is_diagnostic(found[0]), found[0])
+    head, _, tail = found[0].partition(" frames=")
+    case.assertEqual(list(classes), head.partition("class=")[2].split(" <- ")[: len(classes)])
+    case.assertNotIn(marker, err)
+    return [frame for frame in tail.split(" | ") if frame]
+
+
+class RaisingLoader:
+    """A source loader that raises when the source of a file is asked for (``linecache`` asks it for every frame that ``traceback`` prints)."""
+
+    def get_source(self, name: str) -> str:
+        raise RuntimeError("the loader failed")
+
+
+def error_with_raising_loader(case: unittest.TestCase) -> KeyError:
+    """An error that was raised in a frame of a project file whose module has a source loader that raises."""
+    scope: dict[str, Any] = {"__name__": "fake_job", "__loader__": RaisingLoader()}
+    exec(compile(f"def {ENTRY}():\n    raise KeyError\n", OWN_FILE, "exec"), scope)  # noqa: S102 (a stand-in for a module of the project)
+    stand_in(case, OWN_FILE, scope)
+    try:
+        scope[ENTRY]()
+    except KeyError as error:
+        return error
+    raise AssertionError("no error")
+
+
+def error_with_marked_line(case: unittest.TestCase, number: str = LINE_MARKER) -> KeyError:
+    """An error raised in a frame of a tracked file and function (held by the loaded module of the file) whose line number (``tb_lineno``) is ``number``, as
+    PySpark 4 builds from a message."""
+    count = int(number)
+    source = f"def {ENTRY}(): raise KeyError\n" if count == 1 else f"def {ENTRY}():" + "\n" * (count - 1) + "    raise KeyError\n"
+    scope: dict[str, Any] = {}
+    exec(compile(source, OWN_FILE, "exec"), scope)  # noqa: S102 (a stand-in for a frame of the project)
+    stand_in(case, OWN_FILE, scope)
+    try:
+        scope[ENTRY]()
+    except KeyError as error:
+        return error
+    raise AssertionError("no error")

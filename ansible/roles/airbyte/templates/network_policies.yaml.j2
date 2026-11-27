@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-bridge
+  namespace: {{ airbyte_namespace }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: {{ airbyte_bridge_address }}/32
+      ports:
+        - protocol: TCP
+          port: {{ airbyte_database_port | int }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - {{ airbyte_bridge_address }}/32
+{% for namespace in airbyte_other_namespaces | difference([airbyte_namespace]) | unique | sort %}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-postgres-bridge
+  namespace: {{ namespace }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - {{ airbyte_bridge_address }}/32
+{% endfor %}

@@ -1,0 +1,92 @@
+{
+  "type": "record",
+  "name": "WaveformSecond",
+  "namespace": "surgical.stream",
+  "doc": "The samples of one waveform track for one second of a case recording. A second with no sample has no message.",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": "string",
+      "doc": "The stable ID of the event: run, room, case occurrence, track, case time in microseconds and discriminator, joined by vertical bars."
+    },
+    {
+      "name": "run_id",
+      "type": "string",
+      "doc": "The run: a name and 8 hex digits, with an attempt number from 2 for a later attempt."
+    },
+    {
+      "name": "room",
+      "type": "int",
+      "doc": "The operating room, counted from 0. Events are keyed by room."
+    },
+    {
+      "name": "occurrence_id",
+      "type": "string",
+      "doc": "The case occurrence: the publisher's case number, a dot and the number of earlier plays of the case in the run."
+    },
+    {
+      "name": "case_id",
+      "type": "int",
+      "doc": "The publisher's case number."
+    },
+    {
+      "name": "track",
+      "type": "string",
+      "doc": "The source track name, a device and a parameter."
+    },
+    {
+      "name": "case_time_us",
+      "type": "long",
+      "doc": "The time within the case, in whole microseconds from the case start. For a waveform it is the start of the second."
+    },
+    {
+      "name": "discriminator",
+      "type": "int",
+      "doc": "The position of this reading among the readings of its track that share its case time, in file order. It is 0 for a reading that shares its time with none before it."
+    },
+    {
+      "name": "replay_time_us",
+      "type": "long",
+      "doc": "The replay time at which the event is due, in whole microseconds since the replay origin that all rooms share. It only moves forward."
+    },
+    {
+      "name": "unit",
+      "type": "string",
+      "doc": "The unit of the physical value."
+    },
+    {
+      "name": "sample_rate",
+      "type": "double",
+      "doc": "Samples each second."
+    },
+    {
+      "name": "gain",
+      "type": "double",
+      "doc": "For a track of an integer sample format (3 to 8) the physical value of a sample is its raw value times the gain plus the offset, so the calibration applies to integer formats only. A float format (1 and 2) holds physical values already, and the gain and the offset do not apply to it."
+    },
+    {
+      "name": "offset",
+      "type": "double",
+      "doc": "See the gain."
+    },
+    {
+      "name": "sample_format",
+      "type": "int",
+      "default": 0,
+      "doc": "The track's sample format code in the file: 1 and 2 are floats, which are already physical values, and 3 to 8 are integers (int8, uint8, int16, uint16, int32, uint32), whose physical value is the raw value times the gain plus the offset and whose gap marker is a missing sample. 0 means that the sender did not state it, and the stream refuses such a message."
+    },
+    {
+      "name": "start_offset_us",
+      "type": "long",
+      "doc": "The time of the first sample after the start of the second, in microseconds."
+    },
+    {
+      "name": "samples",
+      "type": {
+        "type": "array",
+        "items": "double"
+      },
+      "doc": "The raw samples of the second, in the order of the file."
+    }
+  ]
+}

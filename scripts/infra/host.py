@@ -5,10 +5,12 @@ Run from the repository root under the project profile in ``.env``, through ``ma
 ``make host-up`` creates the project's bucket when it is absent and saves a Terraform plan. When the plan changes
 anything, it prints the changes and a confirmation code and stops for the owner's review.
 ``make host-up CONFIRM=<CODE>`` applies exactly the reviewed plan, waits for the instance, for its Tailscale peer and
-for SSH, runs the Ansible host setup and writes the inventory. A run with nothing to change goes straight to those
-checks, so a second run changes nothing.
+for SSH, runs the Ansible host setup (up to the host's OpenBao), gives that OpenBao the external secrets that it still lacks (the intake), runs the stack
+deployment, places AIStor's licence and runs the AIStor step, places the project profile's key, runs the connection step and writes the inventory. A run with
+nothing to change goes straight to those checks, so a second run changes nothing.
 ``make host-stop`` stops the instance, keeps its disk and prints what still bills.
 ``make host-start`` starts it and waits until it answers over Tailscale.
+``make host-runners-place RUNNERS="..."`` (``scripts/infra/runner_place.py``) places named Git-ignored runner files in the runner folder that the deploy made.
 ``host check --host-name <NAME> --instance-id <ID>`` is the deploy workflow's check: the peer with that name and tag must answer over
 SSH as the instance with that ID.
 
@@ -17,7 +19,7 @@ Every wait has a deadline and fails with a message that names what did not happe
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,35 +31,168 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from scripts.aws_cli import Aws, AwsError
-from scripts.infra import state_bootstrap
+from scripts.infra import aistor_licence, external_intake, state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
-from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, state_json
+from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import FixedTextError, describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
-from scripts.project_config import ROOT, ConfigurationError, load_configuration
+from scripts.project_config import ENVIRONMENTS, OPTIONAL_PATTERNS, PATTERNS, ROOT, ConfigurationError, load_configuration
+from scripts.stack.warehouse import WarehouseError, warehouse_location
 
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 HOST_TAG = "tag:surgical-host"
 HOST_USER = "ubuntu"
 INSTANCE_ID_COMMAND = "cat /var/lib/cloud/data/instance-id"
 INSTANCE_ID_FORM = re.compile(r"i-[0-9a-f]{8,17}")
+HOST_NAME_FORM = re.compile("platform-(?:" + "|".join(ENVIRONMENTS) + ")")
 RECAP_LINE = re.compile(r"platform +: ok=\d+( +\w+=\d+)+ *")
 INSTANCE_DEADLINE_SECONDS = 600
 PEER_DEADLINE_SECONDS = 600
 SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
-ANSIBLE_TIMEOUT_SECONDS = 2400
+# The host setup may take the sum of the deadlines of every task on the path of ansible/host.yml (each include counted once per call, each retried task once
+# per attempt, each loop once per item) plus a tenth, in whole five minutes. tests/fast/test_host_budget.py walks the playbook, works the sum out from the task
+# files and fails when this figure is lower. The stack deployment (ansible/stack.yml, after the launcher's intake of the external secrets), the AIStor step
+# (ansible/storage.yml: the licence check, the start of AIStor and its project user) and the connection step (ansible/connection.yml: the Airbyte connection
+# step and the start of the orchestration services) each have their own budget from the same sum.
+HOST_SETUP_TIMEOUT_SECONDS = 10800
+STACK_TIMEOUT_SECONDS = 19200
+CONNECTION_TIMEOUT_SECONDS = 5100
+STORAGE_TIMEOUT_SECONDS = 3300
+PLAYBOOKS = {
+    "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),
+    "stack.yml": ("stack deployment", "ansible_stack_output.txt", STACK_TIMEOUT_SECONDS),
+    "storage.yml": ("AIStor step", "ansible_storage_output.txt", STORAGE_TIMEOUT_SECONDS),
+    "connection.yml": ("connection step", "ansible_connection_output.txt", CONNECTION_TIMEOUT_SECONDS),
+}
+# What the raw connection selects on each host, by the project's environment (``airbyte_connection_scope`` of ansible/group_vars/all.yml).
+CONNECTION_SCOPES = {"dev": "fixed_sample", "prod": "full_release"}
+KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
+# The remote command: the host's interpreter in isolated mode and the installed script. This command line is the one that sudo matches, and the sudoers drop-in
+# (the file named below, which the role installs and this program compares by its SHA-256) turns input recording off for it.
+KEY_COMMAND = ["/usr/bin/python3", "-I", KEY_SCRIPT]
+SUDOERS_FILE = "/etc/sudoers.d/airbyte_key_install"
+KEY_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "airbyte" / "files" / "airbyte_key_install.sudoers"
+# The intake of external secrets runs the same way: the host's interpreter in isolated mode and the installed script, with a sudoers drop-in that turns
+# input recording off for exactly that command line (compared by SHA-256 before any value is read).
+INTAKE_SCRIPT = "/opt/platform/bin/external_secret_intake"
+INTAKE_COMMAND = ["/usr/bin/python3", "-I", INTAKE_SCRIPT]
+INTAKE_SUDOERS = "/etc/sudoers.d/external_secret_intake"
+INTAKE_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "openbao" / "files" / "external_secret_intake.sudoers"
+INTAKE_SEND_SECONDS = 60
+INTAKE_POLICY_MESSAGES = {
+    "ssh_failed": "the intake of external secrets could not reach the host (exit status {status})",
+    "ssh_timeout": "the intake of external secrets did not finish within {seconds} seconds",
+    "policy_missing": "the sudo policy file for the intake script is missing or cannot be read on the host; the host playbook installs it, so run it first",
+    "policy_differs": "the sudo policy file for the intake script on the host is not the repository's; the host playbook installs the right one, run it first",
+}
+KEY_EXPORT_SECONDS = 60
+KEY_SEND_SECONDS = 60
+KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
+KEY_VALUE_FORM = re.compile(r"[A-Za-z0-9/+=]{20,128}")
+SCRIPT_REFUSALS = ("oversized", "not_json", "bad_keys", "session_token", "empty", "bad_form", "bad_owner", "cannot_write")
+KEY_MESSAGES = {
+    "export_failed": "the AWS command line could not export the credentials of the project profile (exit status {status}); run it by hand to see why",
+    "export_timeout": "the AWS command line did not finish within {seconds} seconds",
+    "no_aws": "the AWS command line is not installed or not on PATH",
+    "not_a_static_key": "the AWS command line answered for the project profile with something that is not the ID and the secret of an AWS access key",
+    "session_token": "the project profile yields a session token; Airbyte's connectors need the own access key of an IAM user, not a temporary credential",
+    "empty": "the AWS command line answered for the project profile with no access key ID or no secret",
+    "policy_missing": "the sudo policy file for the key script is missing or cannot be read on the host; the host playbook installs it, so run it first",
+    "policy_differs": "the sudo policy file for the key script on the host is not the repository's; the host playbook installs the right one, so run it first",
+    "ssh_failed": "the key could not be sent to the host (exit status {status})",
+    "ssh_timeout": "sending the key to the host did not finish within {seconds} seconds",
+    "script_oversized": "the key script on the host refused the document: it is larger than the script accepts",
+    "script_not_json": "the key script on the host refused the document: it is not a JSON object",
+    "script_bad_keys": "the key script on the host refused the document: it does not hold exactly the two key values",
+    "script_session_token": "the key script on the host refused the document: it holds a session token",
+    "script_empty": "the key script on the host refused the document: a value is empty",
+    "script_bad_form": "the key script on the host refused the document: a value is not in the form of an AWS access key",
+    "script_bad_owner": "the key script on the host refused its owner options: an owner is not a numeric uid:gid that the system takes",
+    "script_cannot_write": "the key script on the host could not write the key files under the secrets folder; check the folder's owner and free space",
+    "script_unknown": "the key script on the host answered with something that this program does not know",
+}
+# AIStor's licence is placed the same way: the launcher reads it from this computer's OpenBao (scripts/infra/aistor_licence.py) and sends it on standard input
+# of one SSH command to a root-owned script that the host playbook installs, with its own sudoers drop-in that turns off sudo's recording for that command line.
+LICENCE_SCRIPT = "/opt/platform/bin/aistor_licence_install"
+LICENCE_COMMAND = ["/usr/bin/python3", "-I", LICENCE_SCRIPT]
+LICENCE_SUDOERS_FILE = "/etc/sudoers.d/aistor_licence_install"
+LICENCE_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "compose_stack" / "files" / "aistor_licence_install.sudoers"
+LICENCE_SEND_SECONDS = 60
+LICENCE_REFUSALS = ("oversized", "empty", "bad_form", "bad_owner", "cannot_write")
+LICENCE_MESSAGES = {
+    "policy_missing": "the sudo policy file for the licence script is missing or cannot be read on the host; the host playbook installs it, so run it first",
+    "policy_differs": "the sudo policy file for the licence script on the host is not the repository's; the host playbook installs the right one, run it first",
+    "ssh_failed": "the licence could not be sent to the host (exit status {status})",
+    "ssh_timeout": "sending the licence to the host did not finish within {seconds} seconds",
+    "script_oversized": "the licence script on the host refused the licence: it is larger than the script accepts",
+    "script_empty": "the licence script on the host refused the licence: it is empty",
+    "script_bad_form": "the licence script on the host refused the licence: it is not ASCII text without control characters",
+    "script_bad_owner": "the licence script on the host refused its owner option: it is not a numeric uid:gid that the system takes",
+    "script_cannot_write": "the licence script on the host could not write the licence file under the secrets folder; check the folder's owner and free space",
+    "script_unknown": "the licence script on the host answered with something that this program does not know",
+}
+LICENCE_ABSENT_NOTICE = (
+    "AIStor is skipped: this computer's OpenBao holds no AIStor licence at secret/aistor_licence (field value), so the host has none to start the server with. "
+    "The deploy goes on with everything else (Airbyte, the connection step and the rest). Store the licence at that path (references/local_machine.md, "
+    "Local secrets) and run make host-up again: AIStor then starts."
+)
+LICENCE_NO_SOURCE_NOTICE = (
+    f"AIStor is skipped: {aistor_licence.SETUP_MESSAGE}. The deploy goes on with everything else (Airbyte, the connection step and the rest). "
+    "After the owner's step is done and the licence is stored, run make host-up again: AIStor then starts."
+)
+LICENCE_KEPT_NOTICE = (
+    "AIStor started with the licence file that was already on the host: this computer sent no licence this time "
+    "(it has no licence source, or its OpenBao holds none)."
+)
+LICENCE_UNCONFIRMED_NOTICE = (
+    "AIStor: could not confirm from the host whether the server started or was skipped for want of a licence; "
+    "make storage-up reads the host's record and says which."
+)
+AISTOR_STATE_FILE = "/opt/platform/compose/aistor.state"
+# What the launcher tells the AIStor playbook about the licence: ``placed`` (the licence is on the host, new or unchanged) or ``absent`` (none was sent).
+PLACEMENT_FACTS = {"placed": "placed", "unchanged": "placed", "absent": "absent", "no_source": "absent"}
+GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
+PROJECT_WORKLOAD_GIDS = {
+    "airbyte": 20100,
+    "ingestion_check": 20101,
+    "trino": 20103,
+    "replay": 20104,
+    "orchestrator": 20105,
+    "bronze": 20106,
+    "silver": 20107,
+    "gold": 20108,
+    "stream": 20109,
+    "maintenance": 20110,
+}
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
 
 class HostError(RuntimeError):
-    """A host command refused to continue, a wait passed its deadline or a call failed."""
+    """A host command refused to continue, a wait passed its deadline or a call failed. Its text can hold a value of the state, a plan or a reply, so a
+    command shows its type name."""
 
 
-class NoPeerError(HostError):
+class FixedHostError(HostError, FixedTextError):
+    """A host refusal whose whole text is fixed advice: constants, the host's name and counts, and never the run's ID or a value of the state, a plan, a
+    file or a reply. A command shows it."""
+
+
+class IntakeRefusal(FixedHostError):
+    """The intake of an external secret refused. Its text is the intake's own fixed message: it names the secret and its status and never a value."""
+
+
+class LicenceRefusal(FixedHostError):
+    """The read of AIStor's licence refused. Its text is the reader's own fixed message: it names the failed step and a status and never a value."""
+
+
+class NoPeerError(FixedHostError):
     """The Tailscale network shows no online peer with the host's name and tag yet."""
 
 
@@ -85,13 +220,13 @@ def wait_for[T](
     while True:
         remaining = deadline - clock()
         if remaining <= 0:
-            raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
+            raise FixedHostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
         try:
             found = probe(remaining)
         except TimeoutExpired, PermissionError:
             found = None
         if clock() > deadline:
-            raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
+            raise FixedHostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
         if found is not None:
             sys.stdout.write(f"ready: {what}\n")
             return found
@@ -106,7 +241,7 @@ def select_peer(status: dict[str, Any], host_name: str, tag: str) -> Peer:
     if not peers:
         raise NoPeerError(f"no online peer named {host_name} with {tag} in the Tailscale network")
     if len(peers) > 1:
-        raise HostError(
+        raise FixedHostError(
             f"{len(peers)} online peers are named {host_name} with {tag}: remove the extra devices in the Tailscale console, then run the command again"
         )
     return Peer(str(peers[0]["DNSName"]).rstrip("."), str(peers[0]["ID"]))
@@ -116,12 +251,12 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
-    except FileNotFoundError as error:
-        raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
+    except FileNotFoundError:
+        raise FixedHostError("the Tailscale client is not installed on this computer") from None
     except TimeoutExpired:
         raise NoPeerError(timeout_text("tailscale status", min(timeout, SSH_ATTEMPT_SECONDS))) from None
     if result.returncode != 0:
-        raise HostError(f"tailscale status failed: exit status {result.returncode}")
+        raise FixedHostError(f"tailscale status failed: exit status {result.returncode}")
     status: dict[str, Any] = json.loads(result.stdout)
     return status
 
@@ -137,16 +272,17 @@ def tailscale_device_id(host_name: str) -> str:
 
 def record_tailscale_device(run_id: str, host_name: str, device_id: str) -> Path:
     """Write the host's current Tailscale device to the run folder, over any earlier record: a host that left the network and rejoined has a new device."""
-    target = ROOT / "runs" / run_id / DEVICE_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n")
+    folder = ROOT / "runs" / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / DEVICE_FILE
+    replace_owned_file(target, json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n", state_root=folder, mode=0o644)
     return target
 
 
 def require_connected(status: dict[str, Any]) -> None:
     """Refuse a status from a client that is not running and connected: its peer list says nothing about the host's device."""
     if status.get("BackendState") != "Running":
-        raise HostError("the Tailscale client on this computer is not running and connected, so the host's device cannot be checked")
+        raise FixedHostError("the Tailscale client on this computer is not running and connected, so the host's device cannot be checked")
 
 
 def device_gone(status: dict[str, Any], host_name: str, device_id: str) -> bool:
@@ -176,7 +312,7 @@ def release_tailscale_device(run_id: str, host_name: str, device_id: str, instan
         keep_host_keys_of(run_id, instance_id)
         found = ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, SSH_ATTEMPT_SECONDS)
         if found is None:
-            raise HostError(f"the Tailscale peer {host_name} did not tell its instance over SSH: no logout was sent")
+            raise FixedHostError(f"the Tailscale peer {host_name} did not tell its instance over SSH: no logout was sent")
         require_instance(found, instance_id, host_name)
         ssh_output(run_id, peer.address, "sudo -n tailscale logout", SSH_ATTEMPT_SECONDS)
 
@@ -211,7 +347,7 @@ def keep_host_keys_of(run_id: str, instance: str) -> None:
         return
     (folder / "known_hosts").unlink(missing_ok=True)
     folder.mkdir(parents=True, exist_ok=True)
-    owner.write_text(f"{instance}\n")
+    replace_owned_file(owner, f"{instance}\n", state_root=folder, mode=0o644)
 
 
 def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str | None:
@@ -230,7 +366,7 @@ def instance_id(state: dict[str, Any]) -> str:
         if item["mode"] == "managed" and item["type"] == "aws_instance"
     ]
     if len(found) != 1:
-        raise HostError("the run's state does not hold exactly one host instance: run make host-up first")
+        raise FixedHostError("the run's state does not hold exactly one host instance: run make host-up first")
     return str(found[0])
 
 
@@ -252,14 +388,101 @@ def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -
 def require_instance(found: str, expected: str, host_name: str) -> None:
     """Refuse a peer that answered with another instance ID. The message names no ID."""
     if found.strip() != expected:
-        raise HostError(f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again")
+        raise FixedHostError(
+            f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again"
+        )
 
 
 def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
-    """The Ansible variables for workload access: the region and each workload role, with a group ID fixed by name order."""
+    """The Ansible variables for workload access: the region and each workload role.
+
+    A project workload keeps its own fixed group ID, so a pod's group setting never depends on which other workloads exist.
+    Any other workload gets one by name order.
+    """
     roles = state.get("values", {}).get("outputs", {}).get("workload_role_arns", {}).get("value", {})
-    workloads = [{"name": name, "role_arn": roles[name], "gid": WORKLOAD_GID_BASE + index} for index, name in enumerate(sorted(roles))]
+    others = sorted(name for name in roles if name not in PROJECT_WORKLOAD_GIDS)
+    group_ids = PROJECT_WORKLOAD_GIDS | {name: WORKLOAD_GID_BASE + index for index, name in enumerate(others)}
+    workloads = [{"name": name, "role_arn": roles[name], "gid": group_ids[name]} for name in sorted(roles)]
     return {"workload_access_region": region, "workload_access_workloads": workloads}
+
+
+def saved_plan(run_id: str, *, applied: bool) -> dict[str, Any]:
+    """The JSON of the saved plan that the deploy follows.
+
+    After an apply of the reviewed plan, that plan is ``apply.json``. After a run with no change, it is the newest plan the run saved: ``apply.json`` for a
+    first plan and ``apply_check.json`` for a later one.
+    """
+    folder = ROOT / "runs" / run_id / "plans"
+    found = [folder / name for name in (("apply.json",) if applied else ("apply.json", "apply_check.json")) if (folder / name).is_file()]
+    if not found:
+        raise FixedHostError("no saved plan JSON of the run gives the planned heavy_memory_mib: run make host-up again to plan first")
+    document: dict[str, Any] = json.loads(max(found, key=lambda path: path.stat().st_mtime_ns).read_text())
+    return document
+
+
+def planned_heavy_figure(plan: dict[str, Any]) -> object:
+    """The heavy-job figure that the saved plan gave to the output."""
+    entry = plan.get("planned_values", {}).get("outputs", {}).get("heavy_memory_mib")
+    return entry.get("value") if isinstance(entry, dict) else None
+
+
+def require_current_inputs(plan: dict[str, Any]) -> None:
+    """Refuse a deploy when the limits file now gives other heavy inputs than the plan was made with: the deploy places the current checkout."""
+    try:
+        problem = stale_inputs_problem(plan)
+    except WrapperError as error:
+        raise HostError(str(error)) from error
+    if problem:
+        raise HostError(problem)
+
+
+def heavy_memory_variables(state: dict[str, Any], planned: object) -> dict[str, Any]:
+    """The Ansible variable for the heavy-job figure that Terraform calculated, in MiB, once the state holds the planned figure.
+
+    The orchestrator has no default, so a missing or bad figure is refused. A state figure that is not the planned one is stale: the plan was not applied,
+    so the deploy would give the host an old figure.
+    """
+    outputs = state.get("values", {}).get("outputs", {})
+    if "heavy_memory_mib" not in outputs:
+        raise FixedHostError("the run's state has no heavy_memory_mib output: it is missing, so run make host-up to plan and apply the current Terraform first")
+    figure = outputs["heavy_memory_mib"].get("value")
+    if not isinstance(figure, int) or isinstance(figure, bool) or figure <= 0:
+        raise HostError(f"the heavy_memory_mib output of the run's state is {figure!r}, not a positive whole number of MiB")
+    if figure != planned or type(planned) is not int:
+        raise HostError(f"the heavy_memory_mib of the run's state is {figure!r} and the plan gave {planned!r}: the state is stale, so the plan was not applied")
+    return {"compose_stack_heavy_memory_mib": figure}
+
+
+def platform_commit() -> str:
+    """The commit of the checkout that the deploy places on the host."""
+    return run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
+
+
+def registry_user(configuration: dict[str, str]) -> str:
+    """The Docker Hub account of IMAGE_REPOSITORY (``<account>/<repository>``), which the host pulls as. A bad value is refused by the key's name."""
+    repository = configuration.get("IMAGE_REPOSITORY", "")
+    if not repository:
+        raise FixedHostError("IMAGE_REPOSITORY is missing in .env: copy the line from .env.example and fill it in")
+    if OPTIONAL_PATTERNS["IMAGE_REPOSITORY"].fullmatch(repository) is None:
+        raise FixedHostError("IMAGE_REPOSITORY in .env is malformed: it must be <account>/<repository>, lowercase, with no registry host, tag or digest")
+    return repository.partition("/")[0]
+
+
+def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
+    """The Ansible variables of the stack's host settings: the deployed commit (the stack's and the name of the runner folder), the warehouse location of the
+    configured bucket, the bucket that Airbyte's connection copies into and what that connection selects, the bucket that the AIStor project user's policy
+    reaches and the Docker Hub account that the host pulls the project's images as. The dev host copies the fixed sample and only the prod host copies the full
+    release (owner, Nov 25 2026: "the full 84 day run will be production only. for development a sample should be enough"). No variable holds the AWS profile or
+    the key: the launcher reads the key itself and sends it to the host without Ansible."""
+    return {
+        "compose_stack_platform_commit": commit,
+        "runner_checkout_commit": commit,
+        "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
+        "airbyte_landing_bucket": configuration["S3_BUCKET"],
+        "airbyte_connection_scope": CONNECTION_SCOPES[configuration["ENVIRONMENT"]],
+        "aistor_bucket": configuration["S3_BUCKET"],
+        "compose_stack_registry_user": registry_user(configuration),
+    }
 
 
 def ansible_recap(stdout: str) -> str:
@@ -268,34 +491,215 @@ def ansible_recap(stdout: str) -> str:
     return "".join(f"{line.strip()}\n" for line in recap if RECAP_LINE.fullmatch(line.strip()))
 
 
-def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
+def run_ansible(run_id: str, address: str, variables: dict[str, Any], playbook: str = "host.yml") -> None:
+    """Run one playbook on the host and keep its whole output privately. Only the recap counts are printed, because task output can hold variable values."""
+    label, output_name, budget = PLAYBOOKS[playbook]
     home = ROOT / ".tools" / "ansible"
     settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
     environment = os.environ | settings | {"PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
     try:
         result = run_command(
             str(ROOT / ".venv" / "bin" / "ansible-playbook"),
-            ["host.yml", "--extra-vars", json.dumps(variables)],
+            [playbook, "--extra-vars", json.dumps(variables)],
             cwd=ROOT / "ansible",
             env=environment,
-            timeout=ANSIBLE_TIMEOUT_SECONDS,
+            timeout=budget,
         )
     except TimeoutExpired as error:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
-        note = f"; {kept_note(run_id, 'ansible_output.txt', partial, 'partial output')}" if partial else ""
-        raise HostError(timeout_text("ansible-playbook host.yml", ANSIBLE_TIMEOUT_SECONDS) + note) from None
-    kept = kept_note(run_id, "ansible_output.txt", result.stdout + result.stderr, "full output")
+        note = f"; {kept_note(run_id, output_name, partial, 'partial output')}" if partial else ""
+        raise FixedHostError(timeout_text(f"ansible-playbook {playbook}", budget) + note) from None
+    kept = kept_note(run_id, output_name, result.stdout + result.stderr, "full output")
     sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:
-        raise HostError(f"the Ansible host setup failed; {kept}")
-    sys.stdout.write(f"the Ansible host setup passed; {kept}\n")
+        raise FixedHostError(f"the Ansible {label} failed; {kept}")
+    sys.stdout.write(f"the Ansible {label} passed; {kept}\n")
 
 
-def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
+def exported_key(profile: str) -> dict[str, str]:
+    """The project profile's static access key from the AWS command line, checked in memory. A refusal is a fixed message with no output of the command."""
+    try:
+        result = run_command("aws", ["configure", "export-credentials", "--profile", profile, "--format", "process"], timeout=KEY_EXPORT_SECONDS)
+    except TimeoutExpired:
+        raise FixedHostError(KEY_MESSAGES["export_timeout"].format(seconds=KEY_EXPORT_SECONDS)) from None
+    except FileNotFoundError:
+        raise FixedHostError(KEY_MESSAGES["no_aws"]) from None
+    if result.returncode != 0:
+        raise FixedHostError(KEY_MESSAGES["export_failed"].format(status=result.returncode))
+    if not result.stdout.strip():
+        raise FixedHostError(KEY_MESSAGES["empty"])
+    try:
+        document = json.loads(result.stdout)
+    except ValueError:
+        document = None
+    if not isinstance(document, dict):
+        raise FixedHostError(KEY_MESSAGES["not_a_static_key"])
+    if any("token" in str(name).lower() for name in document):
+        raise FixedHostError(KEY_MESSAGES["session_token"])
+    key_id, value = document.get("AccessKeyId"), document.get("SecretAccessKey")
+    if not isinstance(key_id, str) or not isinstance(value, str):
+        raise FixedHostError(KEY_MESSAGES["not_a_static_key"])
+    if not key_id or not value:
+        raise FixedHostError(KEY_MESSAGES["empty"])
+    if KEY_ID_FORM.fullmatch(key_id) is None or KEY_VALUE_FORM.fullmatch(value) is None:
+        raise FixedHostError(KEY_MESSAGES["not_a_static_key"])
+    return {"aws_access_key_id": key_id, "aws_secret_access_key": value}
+
+
+def sudo_policy_problem(run_id: str, address: str, source: Path, target: str, seconds: float) -> str | None:
+    """The code of a problem with a sudo drop-in on the host, or None when the host's file is the repository's file.
+
+    The check reads the file's SHA-256 with one remote call (``sudo -n sha256sum <file>``). The codes are ``ssh_timeout``, ``ssh_failed``,
+    ``policy_missing`` and ``policy_differs``."""
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    try:
+        result = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", target], timeout=seconds)
+    except TimeoutExpired:
+        return "ssh_timeout"
+    if result.returncode == 255:
+        return "ssh_failed"
+    if result.returncode != 0:
+        return "policy_missing"
+    words = result.stdout.split()
+    return None if words and words[0] == expected else "policy_differs"
+
+
+def check_sudo_policy(run_id: str, address: str) -> None:
+    """Refuse, before the key is read, a host whose sudo policy file for the key script is missing or is not the repository's file.
+
+    The file turns sudo's recording of input and output off for the key script's command line, and the key arrives on standard input. The check shows that the
+    repository's file is in place unchanged. It does not read sudo's effective settings, whose output format the sudoers manual does not define, so the first
+    host run also proves the effect with a marker test."""
+    problem = sudo_policy_problem(run_id, address, KEY_POLICY_SOURCE, SUDOERS_FILE, KEY_SEND_SECONDS)
+    if problem is not None:
+        raise FixedHostError(KEY_MESSAGES[problem].format(status=255, seconds=KEY_SEND_SECONDS))
+
+
+def licence_fact(code: str) -> str:
+    """The non-secret fact for the AIStor playbook that a placement code stands for: ``placed`` or ``absent``."""
+    if not isinstance(code, str) or code not in PLACEMENT_FACTS:
+        raise ValueError("the licence placement is not one of placed, unchanged, absent and no_source")
+    return PLACEMENT_FACTS[code]
+
+
+def place_aistor_licence(run_id: str, address: str) -> str:
+    """Read AIStor's licence from this computer's OpenBao and place it on the host through one SSH command.
+
+    Return ``placed``, ``unchanged``, ``absent`` or ``no_source``.
+
+    The licence is read in memory (``scripts/infra/aistor_licence.py``) and written to the standard input of ``ssh <host> sudo /usr/bin/python3 -I <the licence
+    script>``, which writes the one root-only file. It is never in an argument list, an environment variable, a file on this computer, an output or an error
+    text; every failure is a fixed message. A licence that this computer's OpenBao does not hold (its 404) is ``absent``, and a computer with no Keychain
+    item for the licence token or no ``security`` command is ``no_source``: neither is a failure, nothing is sent and no notice is printed here, because
+    only the host can confirm that it has no licence (``report_aistor_state``)."""
+    try:
+        licence = aistor_licence.read_licence()
+    except aistor_licence.NoLicenceSource:
+        return "no_source"
+    except aistor_licence.LicenceError as error:
+        raise LicenceRefusal(str(error)) from None
+    if licence is None:
+        return "absent"
+    problem = sudo_policy_problem(run_id, address, LICENCE_POLICY_SOURCE, LICENCE_SUDOERS_FILE, KEY_SEND_SECONDS)
+    if problem is not None:
+        raise FixedHostError(LICENCE_MESSAGES[problem].format(status=255, seconds=KEY_SEND_SECONDS))
+    try:
+        sent = run_command(
+            "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *LICENCE_COMMAND], input_text=licence, timeout=LICENCE_SEND_SECONDS
+        )
+    except TimeoutExpired:
+        raise FixedHostError(LICENCE_MESSAGES["ssh_timeout"].format(seconds=LICENCE_SEND_SECONDS)) from None
+    code = sent.stdout.strip()
+    if sent.returncode == 0 and code in ("placed", "unchanged"):
+        sys.stdout.write("the AIStor licence is placed on the host\n" if code == "placed" else "the AIStor licence is in place on the host and unchanged\n")
+        return code
+    if sent.returncode == 3 and code in LICENCE_REFUSALS:
+        raise FixedHostError(LICENCE_MESSAGES[f"script_{code}"])
+    if sent.returncode not in (0, 3):
+        raise FixedHostError(LICENCE_MESSAGES["ssh_failed"].format(status=sent.returncode))
+    raise FixedHostError(LICENCE_MESSAGES["script_unknown"])
+
+
+def report_aistor_state(run_id: str, address: str, placement: str) -> None:
+    """After the AIStor playbook: say whether AIStor was skipped, only when this computer sent no licence and the host's own record confirms the skip.
+
+    The record is the file that the playbook writes (``skipped: ...`` or ``started``), read with one fixed read-only command. When it cannot be read or is not a
+    known record, the notice says that the state is unconfirmed and claims no skip."""
+    if licence_fact(placement) == "placed":
+        return
+    state = ssh_output(run_id, address, f"cat {AISTOR_STATE_FILE}", SSH_ATTEMPT_SECONDS)
+    record = state.strip() if state else ""
+    if record.startswith("skipped:"):
+        sys.stdout.write(f"{LICENCE_NO_SOURCE_NOTICE if placement == 'no_source' else LICENCE_ABSENT_NOTICE}\n")
+    elif record == "started":
+        sys.stdout.write(f"{LICENCE_KEPT_NOTICE}\n")
+    else:
+        sys.stdout.write(f"{LICENCE_UNCONFIRMED_NOTICE}\n")
+
+
+def place_project_key(run_id: str, address: str, profile: str) -> None:
+    """Read the project profile's access key on this computer and place it on the host through one SSH command.
+
+    The key is exported with the AWS command line (deadline, captured output), checked in memory and written to the standard input of ``ssh <host>
+    sudo /usr/bin/python3 -I <the key script>``, which writes the two root-only files. It is never in an argument list, an environment variable, a
+    file on this computer, an output or an error text. Every failure is a fixed message from ``KEY_MESSAGES``. The script's one-line answer is the
+    only output read."""
+    if PATTERNS["AWS_PROFILE"].fullmatch(profile) is None:
+        raise FixedHostError("AWS_PROFILE is not a profile name")
+    check_sudo_policy(run_id, address)
+    document = json.dumps(exported_key(profile))
+    try:
+        sent = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *KEY_COMMAND], input_text=document, timeout=KEY_SEND_SECONDS)
+    except TimeoutExpired:
+        raise FixedHostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
+    code = sent.stdout.strip()
+    if sent.returncode == 0 and code in ("placed", "unchanged"):
+        sys.stdout.write(
+            "the project profile's access key is placed on the host\n"
+            if code == "placed"
+            else "the project profile's access key is in place on the host and unchanged\n"
+        )
+        return
+    if sent.returncode == 3 and code in SCRIPT_REFUSALS:
+        raise FixedHostError(KEY_MESSAGES[f"script_{code}"])
+    if sent.returncode not in (0, 3):
+        raise FixedHostError(KEY_MESSAGES["ssh_failed"].format(status=sent.returncode))
+    raise FixedHostError(KEY_MESSAGES["script_unknown"])
+
+
+def place_external_secrets(run_id: str, address: str, configuration: dict[str, str]) -> None:
+    """Give the host's OpenBao each external secret that is still empty there (``scripts/infra/external_intake.py``), through one SSH command for each call.
+
+    The values travel on standard input of ``ssh <host> sudo /usr/bin/python3 -I <the intake script>`` and nowhere else. The source on this computer is the
+    kind that ``EXTERNAL_SECRETS_SOURCE`` names in ``.env`` (``openbao``, or the default ``prompt``). Every failure is a fixed message that names the secret
+    and never a value."""
+    problem = sudo_policy_problem(run_id, address, INTAKE_POLICY_SOURCE, INTAKE_SUDOERS, INTAKE_SEND_SECONDS)
+    if problem is not None:
+        raise FixedHostError(INTAKE_POLICY_MESSAGES[problem].format(status=255, seconds=INTAKE_SEND_SECONDS))
+
+    def ask_host(document: str) -> tuple[int, str]:
+        try:
+            sent = run_command(
+                "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *INTAKE_COMMAND], input_text=document, timeout=INTAKE_SEND_SECONDS
+            )
+        except TimeoutExpired:
+            return external_intake.TIMED_OUT, ""
+        return sent.returncode, sent.stdout
+
+    source = external_intake.openbao_source() if configuration.get("EXTERNAL_SECRETS_SOURCE") == "openbao" else external_intake.prompt_source()
+    try:
+        external_intake.run_intake(external_intake.declared_secrets(), ask_host, source, external_intake.write_line)
+    except external_intake.IntakeError as error:
+        raise IntakeRefusal(str(error)) from None
+
+
+def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str, *, aistor_repair: bool = False) -> int:
     existing = load_run(binding) if binding.is_file() else None
     backend, provision_host = (existing.backend, existing.provision_host) if existing else ("s3", True)
+    if backend != "local" and provision_host:
+        registry_user(configuration)
     if state_bootstrap.create(aws, configuration, binding, backend, provision_host) != 0:
-        raise HostError("the state bootstrap step failed")
+        raise FixedHostError("the state bootstrap step failed")
     run = load_run(binding)
     if confirm:
         apply_plan(run, confirm)
@@ -308,10 +712,24 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         write_inventory(binding)
         return 0
     state = state_json(run, configuration)
+    plan = saved_plan(run.run_id, applied=bool(confirm))
+    require_current_inputs(plan)
+    heavy_memory = heavy_memory_variables(state, planned_heavy_figure(plan))
+    deployment = deploy_variables(configuration, platform_commit())
     peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
     address = peer.address
     record_tailscale_device(run.run_id, host_name, peer.device_id)
-    run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]))
+    require_current_inputs(plan)
+    variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deployment
+    run_ansible(run.run_id, address, variables)
+    place_external_secrets(run.run_id, address, configuration)
+    run_ansible(run.run_id, address, variables, "stack.yml")
+    placement = place_aistor_licence(run.run_id, address)
+    storage_variables = variables | {"aistor_licence_placement": licence_fact(placement)} | {"aistor_repair_once": aistor_repair}
+    run_ansible(run.run_id, address, storage_variables, "storage.yml")
+    report_aistor_state(run.run_id, address, placement)
+    place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
+    run_ansible(run.run_id, address, variables, "connection.yml")
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host {host_name} is up and its inventory is written\n")
     return 0
@@ -350,15 +768,22 @@ def host_check(host_name: str, instance: str) -> int:
 
 def main() -> int:
     """Run one host command and return a non-zero code on a refusal, an expired deadline or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["up", "stop", "start", "check"])
     parser.add_argument("--host-name", default="", help="check: the host's Tailscale name, for example platform-dev")
     parser.add_argument("--instance-id", default="", help="check: the EC2 instance ID that the host must answer with")
     parser.add_argument("--confirm", default="", help="up: the confirmation code of the reviewed plan")
+    parser.add_argument(
+        "--aistor-repair",
+        action="store_true",
+        help="up: let this one run repair AIStor's accounts with the root pair (python -m scripts.infra.host up --aistor-repair; make never passes it)",
+    )
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()
-    if arguments.command == "check" and not arguments.host_name:
-        parser.error("check needs --host-name")
+    if arguments.aistor_repair and arguments.command != "up":
+        parser.error("--aistor-repair belongs to up alone")
+    if arguments.command == "check" and HOST_NAME_FORM.fullmatch(arguments.host_name) is None:
+        parser.error("check needs --host-name, the host's Tailscale name: platform- and the environment")
     if arguments.command == "check" and INSTANCE_ID_FORM.fullmatch(arguments.instance_id) is None:
         parser.error("check needs --instance-id, an EC2 instance ID: the letters i- and 8 to 17 hexadecimal digits")
     try:
@@ -367,10 +792,10 @@ def main() -> int:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         if arguments.command == "up":
-            return host_up(aws, configuration, arguments.binding, arguments.confirm)
+            return host_up(aws, configuration, arguments.binding, arguments.confirm, aistor_repair=arguments.aistor_repair)
         return (host_stop if arguments.command == "stop" else host_start)(aws, configuration, arguments.binding)
-    except (ConfigurationError, WrapperError, HostError, AwsError) as error:
-        sys.stderr.write(f"{error}\n")
+    except (ConfigurationError, WrapperError, HostError, AwsError, WarehouseError) as error:
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

@@ -16,10 +16,6 @@ data "aws_subnets" "default" {
   }
 }
 
-data "aws_ssm_parameter" "ubuntu" {
-  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
-}
-
 locals {
   publisher_bucket_arn = "arn:aws:s3:::physionet-open"
   user_data            = templatefile("${path.module}/tailscale_join.sh.tftpl", var.tailscale)
@@ -58,7 +54,7 @@ resource "aws_iam_role_policy" "host_storage" {
         Effect    = "Allow"
         Action    = ["s3:ListBucket", "s3:ListBucketVersions"]
         Resource  = var.bucket_arn
-        Condition = { StringLike = { "s3:prefix" = [for prefix in sort(var.data_prefixes) : "${prefix}/*"] } }
+        Condition = { StringLike = { "s3:prefix" = [for prefix in sort(concat(var.data_prefixes, var.read_prefixes)) : "${prefix}/*"] } }
       },
       {
         Sid      = "ListPublisherBucket"
@@ -71,6 +67,12 @@ resource "aws_iam_role_policy" "host_storage" {
         Effect   = "Allow"
         Action   = ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]
         Resource = [for prefix in sort(var.data_prefixes) : "${var.bucket_arn}/${prefix}/*"]
+      },
+      {
+        Sid      = "ReadProjectReadOnlyObjects"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = [for prefix in sort(var.read_prefixes) : "${var.bucket_arn}/${prefix}/*"]
       },
       {
         Sid      = "ReadPublisherObjects"
@@ -141,7 +143,7 @@ resource "aws_security_group" "host" {
 }
 
 resource "aws_instance" "host" {
-  ami                         = data.aws_ssm_parameter.ubuntu.value
+  ami                         = var.ami
   instance_type               = var.instance_type
   subnet_id                   = sort(data.aws_subnets.default.ids)[0]
   vpc_security_group_ids      = [aws_security_group.host.id]

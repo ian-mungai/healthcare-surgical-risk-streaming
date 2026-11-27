@@ -36,8 +36,385 @@ metadata_guard_runtime_units:
 # The folder of the systemd units and their drop-ins.
 metadata_guard_unit_directory: /etc/systemd/system
 
-# The secret store's unlock key file on the host. Its owner is the user that deploys the stack.
+# Every secret file that a container reads is owned by the numeric user that container runs as, has mode 0400 and is read by nobody else. A file that no
+# container reads is owned by root the same way. The numeric user and group of root, and the user of the OpenBao container, are here. The user of a
+# PostgreSQL tool and of an OpenBao service is on its line in compose/openbao_services.txt. Each must equal the user in the service's Compose file (a fast test checks it).
+secret_files_root_owner: "0:0"
+openbao_user: "100:1000"
+# The user of the Grafana container, the owner of its administrator password file (the image runs as user 472 in group 0).
+grafana_user: "472:0"
+
+# The secret store's unlock key file on the host. It is owned by the user of the OpenBao container, so the deploy user does not read it. The folder is the deploy user's.
 unlock_key_directory: /opt/platform
 unlock_key_file: "{{ unlock_key_directory }}/.env"
 unlock_key_owner: ubuntu
 unlock_key_group: ubuntu
+
+# The Compose stack. The password files live outside the placed Compose files, in a folder that only root reads.
+compose_stack_directory: /opt/platform
+compose_stack_compose_directory: "{{ compose_stack_directory }}/compose"
+compose_stack_secrets_directory: "{{ compose_stack_directory }}/secrets"
+# One line for each tool that needs a PostgreSQL account and database.
+compose_stack_tools_file: "{{ compose_stack_compose_directory }}/postgres_tools.txt"
+# One line for each service that reads a secret. A numeric user and group at the end of a line name the owner of that service's files.
+compose_stack_services_file: "{{ compose_stack_compose_directory }}/openbao_services.txt"
+# One line for each secret that a third party issues: its consumer, OpenBao path and form check. The launcher's intake writes the values (scripts/infra/host.py).
+compose_stack_external_secrets_file: "{{ compose_stack_compose_directory }}/external_secrets.txt"
+compose_stack_owner: root
+# The AIStor licence key file, a plain file that compose_stack_owner alone reads (mode 0400), which the owner places by hand. The Compose file mounts it read-only
+# as a Compose secret (render_environment.yml writes it as AISTOR_LICENCE_FILE), and aistor_licence.yml refuses the deploy of AIStor, and of nothing else, while it
+# is missing or empty. The services that start apart from the rest, after their own step: AIStor starts after the check of its licence file.
+compose_stack_aistor_licence_file: "{{ compose_stack_secrets_directory }}/aistor/licence"
+compose_stack_storage_services: [aistor]
+# The licence is placed by the launcher, never by a task: it reads the key at secret/aistor_licence in the owner's OpenBao and pipes it, on standard input of one SSH
+# command, to the script below, which the host playbook installs with a sudoers drop-in that turns off sudo's recording for that one command line. The folder of the
+# platform's scripts is shared with the key script of the Airbyte role. The state file says whether the AIStor step started the server or skipped it for want of a
+# licence; make storage-up reads it, and the playbook of the AIStor step writes it.
+compose_stack_bin_directory: /opt/platform/bin
+compose_stack_aistor_licence_script: "{{ compose_stack_bin_directory }}/aistor_licence_install"
+compose_stack_aistor_licence_sudoers: /etc/sudoers.d/aistor_licence_install
+compose_stack_visudo: /usr/sbin/visudo
+compose_stack_aistor_state_file: "{{ compose_stack_compose_directory }}/aistor.state"
+# The AIStor step (aistor_project_user.yml) makes the project's one user and one policy and a read-only audit identity with AIStor's root pair on the FIRST
+# bootstrap of a host only, and ends it with a root-only marker file. Every other client (Terraform, the storage command, its checks) signs in as the project user.
+# A later deploy reads the live state as the audit identity and the project user, makes no root call and no write, and fails with a fixed message that names each
+# difference. The passwords are generated root-only files beside the root files; the step keeps each sign-in in OpenBao after that pair has signed in. The project
+# user's sign-in is read by that service's own role (compose_stack_aistor_openbao_path); the audit identity's is read by the deploy's admin role alone
+# (compose_stack_aistor_audit_openbao_path). The bucket is given by the launcher as aistor_bucket (the S3_BUCKET value of the project profile). A policy name must
+# not be one of AIStor's built-in policies.
+compose_stack_aistor_service: aistor
+compose_stack_aistor_project_user: project_user
+compose_stack_aistor_project_policy: project_bucket
+compose_stack_aistor_project_password_file: "{{ compose_stack_secrets_directory }}/aistor/project_password"
+compose_stack_aistor_audit_user: project_audit
+compose_stack_aistor_audit_policy: project_audit_read
+compose_stack_aistor_audit_password_file: "{{ compose_stack_secrets_directory }}/aistor/audit_password"
+# The marker that ends the first bootstrap of this host: a root-only plain file (mode 0400) beside the state file, written last. While it is absent the next deploy is
+# the first bootstrap again. Remove it only by hand, and only to make the next deploy a first bootstrap.
+compose_stack_aistor_bootstrap_marker: "{{ compose_stack_compose_directory }}/aistor.bootstrap"
+# The paths of the sign-ins in OpenBao (version 2 secret engine). The OpenBao step gives the service's own role a policy that reads the project path and nothing
+# else, so the audit path is read and written by the admin role of the deploy only, after the sign-in has been verified.
+compose_stack_aistor_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/aistor"
+compose_stack_aistor_audit_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/audit"
+# AIStor's use of the root pair for a repair is no inventory variable: the owner approves it for one run with `python -m scripts.infra.host up --aistor-repair`, and no later run keeps it.
+compose_stack_group: root
+compose_stack_postgres_port: 5432
+# The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.
+openbao_port: 8200
+# The Docker socket on the host. The code location reaches it through the socket's group, which the role reads from the socket at each deploy.
+compose_stack_docker_socket: /var/run/docker.sock
+# The images the project makes itself. The owner's computer builds and pushes them (make images-push, scripts/images/publish.py), which reads this list and nothing else:
+# the tag that holds the version (the repository and the folder's hash complete it), the name of the image (its pin in compose/image_pins.yml), the repository's folders
+# that the image's folder holds, the build context (a source, or "." for the whole folder; the first source when unset), the Dockerfile (in the context when unset) and
+# the named build contexts that the Dockerfile copies from. The pin file is the authority: the command pushes only a tag that the pin file lacks and never reads the registry.
+# The host builds nothing: it pulls the pinned digests (pull_images.yml, and for AIStor, whose image is not the project's, the AIStor step's start).
+compose_stack_built_images:
+  - tag: surgical-risk-dagster:1.13.31
+    name: dagster
+    sources: [orchestration, scripts, compose, spark, tests/fixtures/vitaldb]
+    build_contexts:
+      stack_scripts: scripts
+      stack_compose: compose
+      stack_spark: spark
+      stack_fixtures: tests/fixtures/vitaldb
+  - tag: surgical-risk-spark:4.1.4
+    name: spark
+    sources: [spark, scripts, replay, casefile, features, tests/fixtures/vitaldb]
+    context: "."
+    dockerfile: spark/Dockerfile
+  - tag: surgical-risk-replay:1.7.2
+    name: replay
+    sources: [replay, casefile, scripts, features, tests]
+    context: "."
+    dockerfile: replay/Dockerfile
+# The namespace of the first commit that the deploy gives Nessie's main branch.
+compose_stack_nessie_namespace: surgical_risk
+# The services that start last, in the connection playbook, after the Airbyte role and the launcher's key script made the files that the code location mounts as
+# Compose secrets (Airbyte writes the instance's client credentials only when it first starts, its release needs PostgreSQL, and the key arrives after the host
+# playbook): the code location and every service that waits for it.
+compose_stack_orchestration_services: [dagster_code_location, dagster_daemon, dagster_webserver]
+# An empty project name keeps the one fixed name in compose.yml.
+compose_stack_project: ""
+# Each deadline is in seconds. The start deadline covers starting the containers (and, for AIStor, the pull of its missing image) and the health deadline each
+# service's health check. The pull deadline covers the pull of every image but the storage services' after the login.
+compose_stack_start_deadline_seconds: 900
+compose_stack_health_deadline_seconds: 180
+compose_stack_pull_deadline_seconds: 1800
+compose_stack_provision_deadline_seconds: 120
+# The private Docker Hub repository's login for the pull: the account name. The read-only access token is kept in the host's OpenBao (compose/external_secrets.txt:
+# dockerhub_read); the pull step reads it from there into a hidden result and hands it to the pull's shell on standard input, so no file holds it. The account name is
+# set by the deploy; the role stops with a fixed message while it is missing.
+compose_stack_registry_user: ""
+# The parent of the pull's own Docker client configuration folders (mode 0700, owned by compose_stack_owner). The pull makes one fresh folder under it, holds the login in
+# that folder only and removes the folder; the parent is made when it is missing and is never removed or changed, and nothing else in it is read or changed.
+compose_stack_registry_config_directory: "{{ compose_stack_directory }}/registry_docker"
+# The project's image settings come from the rendered host settings file and from nothing else, so every Compose command runs with these three names removed from the
+# environment that it inherits (env -u, because Ansible's environment setting cannot remove a name). The three names are those of scripts.stack.groups.PROJECT_IMAGE_SETTINGS.
+compose_stack_environment_unset:
+  - env
+  - -u
+  - IMAGE_DAGSTER
+  - -u
+  - IMAGE_REPLAY
+  - -u
+  - IMAGE_SPARK
+# The Docker command itself, for the calls that are not Compose commands (docker inspect).
+compose_stack_docker_command: docker
+compose_stack_command:
+  - docker
+  - compose
+  - --project-directory
+  - "{{ compose_stack_compose_directory }}"
+  - --file
+  - "{{ compose_stack_compose_directory }}/compose.yml"
+  - --env-file
+  - "{{ compose_stack_compose_directory }}/limits.env"
+  - --env-file
+  - "{{ compose_stack_compose_directory }}/host.env"
+compose_stack_docker: "{{ compose_stack_environment_unset + compose_stack_command + (['--project-name', compose_stack_project] if compose_stack_project else []) }}"
+
+# Helm and Airbyte's chart. Each download is checked against its pinned SHA-256. Helm 3 is the line that Airbyte's installation guide uses.
+helm_version: v3.22.1
+helm_archive_sha256: 896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+helm_install_directory: /usr/local/lib/helm
+airbyte_chart_version: 2.5.0
+airbyte_chart_sha256: 7524c22b2338399516025de1d903176c7302170315d4ff88e9dfd11192abb029
+
+# Airbyte on k3s. The tracked values file is placed beside two rendered files: the memory limits from the limits file and the host settings below.
+airbyte_directory: /opt/platform/airbyte
+airbyte_secrets_directory: "{{ compose_stack_secrets_directory }}"
+airbyte_owner: root
+airbyte_group: root
+airbyte_namespace: airbyte
+airbyte_release: airbyte
+# The Airbyte deployments that hold database connections and that the chart leaves to a rolling update, which starts the new pod while the old one still holds its
+# connections (Temporal alone holds 24, compose/postgres_connections.yml). The upgrade passes the chart's manifests through the role's post-renderer, which gives each
+# one the Recreate strategy, and a rollback first scales each to zero and waits (up to the deadline below) until its pods are gone. The name is the part after the
+# release name. The chart already gives the server and the workload launcher the Recreate strategy; a test renders the release and compares the two lists.
+airbyte_recreate_deployments: [temporal, cron, worker, workload-api-server]
+airbyte_scale_down_deadline_seconds: 180
+airbyte_kubeconfig: /etc/rancher/k3s/k3s.yaml
+# The web service listens on the host's local address only. The forwarder maps this local port to the server service's port.
+airbyte_web_port: 8000
+airbyte_server_service_port: 8001
+airbyte_web_unit: /etc/systemd/system/airbyte-web.service
+# The pods reach the shared PostgreSQL server at the k3s bridge's address on the host, which the role reads from k3s's flannel file when it deploys. A socket on
+# that address forwards to the server's local address, where PostgreSQL's published port stays. The deadline is in seconds.
+airbyte_flannel_subnet_file: /run/flannel/subnet.env
+airbyte_bridge_deadline_seconds: 120
+airbyte_postgres_unit_directory: /etc/systemd/system
+airbyte_postgres_unit: airbyte-postgres
+airbyte_database_port: "{{ compose_stack_postgres_port }}"
+airbyte_database_name: airbyte
+airbyte_database_user: airbyte
+# Temporal keeps its own two databases, owned by the same account, because the chart's database account cannot create a database.
+airbyte_temporal_database: airbyte_temporal
+airbyte_temporal_visibility_database: airbyte_temporal_visibility
+# The size limit of the staging volume of a copy job, which holds each file on the host's disk during the copy. The job's pod is evicted when its volume passes the limit, so a
+# copy stops with Kubernetes's message before the disk fills. It holds the largest file the connector may copy (1.5 GB) and is a small part of the 200 GiB disk. An estimate
+# until the ingestion phase measures the peak staging use and the free space during a copy and a retry.
+airbyte_staging_size: 5G
+# The connectors of the raw connection, each at the newest stable version of the OSS connector registry on Nov 22 2026 that has the delivery method "Copy raw files" (source
+# 4.10.1 and later), a file of up to 1.5 GB (source 4.11.0) and the sub-folders kept (source 4.12.0) and, for the destination, file transfer (1.4.0 and later).
+# The digests are the linux/amd64 image digests on Docker Hub (read Nov 22 2026). Airbyte pulls a connector by its tag, so a digest is a record for the reader of
+# the pin and not an input. Every connection that reads S3 takes the one definition that Airbyte holds for ``airbyte/source-s3`` and requires its tag to equal this pin
+# (scripts.ingestion.connection.source_definition; the module creates no definition), so all of them run this version. The destination is taken the same way.
+# Change a pin only after reading the connector's changelog.
+airbyte_source_s3_version: 4.17.1
+airbyte_source_s3_digest: sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b
+airbyte_destination_s3_version: 1.9.11
+airbyte_destination_s3_digest: sha256:877e299d77182c7cb2c833c9e4fe7ccc6849487fb1b667bc61e53d8cadb22d6f
+# The project's bucket that the raw connection lands in. The deployment's variables give it, as for the workload access region; an empty value is refused.
+airbyte_landing_bucket: ""
+# What the connection selects: full_release (the two tables and the 6,388 case files of the pin) or fixed_sample (the development candidate cases and the two tables, a part of the
+# release). Changing it repairs the source's selection and nothing else, and the files already copied stay copied. The launcher (scripts.infra.host) overrides this default
+# from the project's environment: the dev host takes fixed_sample and the prod host takes full_release.
+airbyte_connection_scope: full_release
+# The folder of the platform's scripts on the host, and the script that places the project profile's access key. The launcher pipes the key to it on standard input (the
+# owner's exception to the short-lived rule); the key never passes through Ansible.
+airbyte_bin_directory: /opt/platform/bin
+airbyte_key_script: "{{ airbyte_bin_directory }}/airbyte_key_install"
+# The sudoers drop-in that turns off sudo's input and output recording for the command line that runs that script, and the program that checks it before it is placed.
+airbyte_key_sudoers: /etc/sudoers.d/airbyte_key_install
+airbyte_visudo: /usr/sbin/visudo
+# The deadline of one exchange with Airbyte's API, in seconds. Creating the connection makes Airbyte read the source's schema, which takes the longest.
+airbyte_connection_deadline_seconds: 600
+# The deadline of the whole connection step, in seconds: no exchange and no kubectl call runs past it.
+airbyte_connection_run_seconds: 1800
+# The address that the owner's browser uses, set when Caddy's Tailscale name is known. An empty value leaves the chart's setting alone.
+airbyte_public_url: ""
+# Each deadline is in seconds. The release deadline covers pulling the images and running the chart's database migration.
+airbyte_release_deadline_seconds: 1200
+airbyte_ready_deadline_seconds: 300
+airbyte_health_deadline_seconds: 120
+
+# The runner checkout: the deployed commit's code and a pinned Python environment for the native host-mode runners, in one folder that only the deploy user and its group
+# read (mode 0750, no secret in it). The folder is /opt/platform/runner/<commit>. It holds the commit's tracked files from git archive (no Git history), a .venv built from the
+# hash-pinned requirements and, once the launcher places them, the Git-ignored runner files. The next deploy of another commit removes the old folder; a second deploy of the
+# same commit changes nothing and keeps the placed runners. A stopped host keeps the folder with its disk; destroying the host removes the disk and the folder with it.
+# The commit is the one the stack is deployed from (the launcher gives it as runner_checkout_commit).
+runner_checkout_directory: /opt/platform/runner
+runner_checkout_owner: ubuntu
+runner_checkout_group: ubuntu
+# The folder and the runner folder for the owner and its group only; every entry below them keeps its owner's bits and loses every bit of others.
+runner_checkout_mode: "0750"
+runner_checkout_file_mode: "u=rwX,g=rX,o="
+# The interpreter. Ubuntu 24.04 ships Python 3.12 and the project is pinned to Python 3.14 (the pyproject, the Dockerfiles' python:3.14.10 and the Ruff and MyPy targets), so the
+# host gets the python-build-standalone build for x86-64 glibc, in a folder named for its version beside the other tools. The archive's SHA-256 is the one in the release's own
+# SHA256SUMS (read Nov 25 2026, and equal to the hash of the downloaded file). Change the pin only with its hash, after reading the release notes.
+runner_checkout_python_version: 3.14.10
+runner_checkout_python_build: "20261110"
+runner_checkout_python_archive_sha256: c2ff2e97422f5d3896a16e0317fd212ba977bbf2688d93a6f7a03d817506bd30
+runner_checkout_python_directory: /opt/platform/python
+runner_checkout_python_download_directory: /usr/local/src
+runner_checkout_python_url: >-
+  https://github.com/astral-sh/python-build-standalone/releases/download/{{ runner_checkout_python_build }}/cpython-{{ runner_checkout_python_version }}%2B{{ runner_checkout_python_build }}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+runner_checkout_python_archive: "{{ runner_checkout_python_download_directory }}/cpython-{{ runner_checkout_python_version }}-{{ runner_checkout_python_build }}-x86_64-linux-gnu.tar.gz"
+# The published name of the interpreter: a link that the role makes to a folder of its own beside it and replaces in one atomic rename, so that an interrupted or failed
+# install leaves the interpreter that was there.
+runner_checkout_python_home: "{{ runner_checkout_python_directory }}/{{ runner_checkout_python_version }}"
+# A folder that the role made for an interpreter is known by two things together: a name that only the role gives (the version, "-runner_checkout-" and the eight characters
+# that tempfile adds) and a marker in it (runner_checkout_python_marker's name: a plain file of one line, the SHA-256 of an archive), written before anything is unpacked
+# into it. After a new interpreter is published, runner_checkout_python_prune_script removes the other folders of this version that have both, so that an install that never
+# finished goes too. It removes nothing else: a folder with another name, with no marker or with a marker of another form, and a link, stay.
+runner_checkout_python_folder_prefix: "{{ runner_checkout_python_version }}-runner_checkout-"
+runner_checkout_python_folder_form: "^{{ runner_checkout_python_folder_prefix | regex_escape }}[a-z0-9_]{8}$"
+runner_checkout_python_prune_script: |
+  import os, re, shutil, stat, sys
+  directory, form, marker, keep = sys.argv[1:]
+  for entry in os.scandir(directory):
+      if entry.name == keep or re.fullmatch(form, entry.name) is None or not entry.is_dir(follow_symlinks=False):
+          continue
+      try:
+          descriptor = os.open(os.path.join(entry.path, marker), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+      except OSError:
+          continue
+      try:
+          content = os.read(descriptor, 66) if stat.S_ISREG(os.fstat(descriptor).st_mode) else b""
+      finally:
+          os.close(descriptor)
+      if re.fullmatch(rb"[0-9a-f]{64}\n", content):
+          shutil.rmtree(entry.path)
+runner_checkout_python: "{{ runner_checkout_python_home }}/bin/python{{ runner_checkout_python_version.split('.')[:2] | join('.') }}"
+# The files, relative to the folder, that the environment's packages come from: every one is installed with --require-hashes, so every requirement in it must carry a hash.
+# The host process of the runners imports only PyYAML and ansible-core, both in the root lock (tests/fast/test_runner_requirements.py reads every import); the locks of spark/,
+# replay/ and orchestration/ are for the containers' code and are not installed here.
+runner_checkout_requirements:
+  - requirements.txt
+runner_checkout_folder: "{{ runner_checkout_directory }}/{{ runner_checkout_commit }}"
+# The archive on its way to the host, beside the folder, removed once it is unpacked (and by the next deploy if a failure left it).
+runner_checkout_archive_file: "{{ runner_checkout_folder }}.tar"
+# The marker that is written last. Its text is the JSON of what the folder was built from, so another commit's folder, another interpreter pin or other requirements files
+# make the folder unfinished. The launcher's placement reads the same name.
+runner_checkout_marker: "{{ runner_checkout_folder }}/.runner_checkout.json"
+runner_checkout_expected:
+  commit: "{{ runner_checkout_commit }}"
+  python: "{{ runner_checkout_python_version }}"
+  python_archive_sha256: "{{ runner_checkout_python_archive_sha256 }}"
+  requirements: "{{ runner_checkout_requirements }}"
+runner_checkout_marker_text: "{{ runner_checkout_expected | to_json(sort_keys=True) }}\n"
+# The source manifest, written in the folder's root before the marker: {"commit": "<40 hex>", "files": {"<path relative to the folder>": "<SHA-256>"}} for every file that
+# git archive placed (not .venv, the marker, the manifest or a runner that the launcher places later). Only its owner reads it (0400). The streaming host runner checks its
+# provenance with it, and a deploy of a finished folder checks the files against it and builds the folder again when one changed, is gone or the manifest is not there.
+runner_checkout_manifest: "{{ runner_checkout_folder }}/runner_manifest.json"
+runner_checkout_manifest_mode: "0400"
+# The hashes of the runner files that the launcher places (make host-runners-place), written on the host by the launcher so that a runner can check its own file. It is
+# not in the manifest, which is written before any placement, and the deploy never touches it: a finished folder keeps it, a new folder starts without it.
+runner_checkout_placed_runners: "{{ runner_checkout_folder }}/placed_runners.json"
+# The marker in the interpreter's folder (read through the published link) that names the SHA-256 of the archive it was unpacked from: an installed interpreter is reused only
+# when it names the pinned archive, and it is published (one atomic replacement of the link) only after it ran in a folder of its own and said its version, so another archive of
+# the same version replaces it and a failed install changes nothing. The marker is written into each new folder before the unpack; its name also tells the prune a folder of the role.
+runner_checkout_python_marker: "{{ runner_checkout_python_home }}/.archive_sha256"
+# Each deadline is in seconds. The install deadline covers every package of the lock file. Every command of the role runs under timeout with a kill-after of
+# runner_checkout_kill_after_seconds, so that it is stopped, with every process it started, where it runs, and the task's own deadline is the command's deadline plus
+# runner_checkout_stop_grace_seconds, so that timeout always ends the command first. The removals (rm -rf), the permission changes (chown and chmod -R), the listings and
+# the checks have a deadline of their own. The environment check starts two programs, each with the check deadline, so its task deadline is longer than two of them.
+runner_checkout_download_deadline_seconds: 120
+runner_checkout_unpack_deadline_seconds: 120
+runner_checkout_archive_deadline_seconds: 120
+runner_checkout_environment_deadline_seconds: 120
+runner_checkout_install_deadline_seconds: 900
+runner_checkout_check_deadline_seconds: 60
+runner_checkout_manifest_deadline_seconds: 120
+runner_checkout_environment_check_deadline_seconds: 180
+runner_checkout_remove_deadline_seconds: 60
+runner_checkout_close_deadline_seconds: 120
+runner_checkout_scan_deadline_seconds: 60
+runner_checkout_kill_after_seconds: 5
+runner_checkout_stop_grace_seconds: 15
+# The processes of a build. Each command that can leave a process behind (the unpack, the environment and the install) starts through a program that makes its process group
+# and writes the group's number as one line in the record, runner_checkout_build_record (beside the runner folder, so that no prune takes it). Before a build removes anything,
+# after a failed build before any cleanup, and before older interpreter folders are removed, runner_checkout_process_script looks at every group of the record (os.killpg with
+# signal 0: no such process means that the group is gone, and no permission means that it lives; the shell's kill is not used, because dash reads "--" there as a process
+# number), at every process whose working folder or executable is the runner folder or below it (the links cwd and exe of each process in runner_checkout_proc_directory) and
+# at every process whose command line names the runner folder. It removes the record when none is left, and it exits 2 when it cannot look. A group number that the system gave
+# to another process after a restart looks live: the deploy then names the record, and its owner removes it once it is clear that nothing of the build works.
+runner_checkout_build_record: "{{ runner_checkout_directory }}.build_processes"
+runner_checkout_track:
+  - python3
+  - -I
+  - -c
+  - |
+    import os, sys
+    try:
+        os.setpgid(0, 0)
+    except PermissionError:
+        pass
+    descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.write(descriptor, (str(os.getpgrp()) + "\n").encode())
+    os.close(descriptor)
+    os.execvp(sys.argv[2], sys.argv[2:])
+  - "{{ runner_checkout_build_record }}"
+runner_checkout_proc_directory: /proc
+runner_checkout_process_script: |
+  import os, subprocess, sys
+  record, directory, processes, pattern = sys.argv[1:]
+
+  def a_group_lives():
+      try:
+          with open(record, encoding="ascii", errors="replace") as handle:
+              lines = handle.read().split()
+      except FileNotFoundError:
+          return False
+      for line in lines:
+          if line.isdigit() and int(line) > 1:
+              try:
+                  os.killpg(int(line), 0)
+              except ProcessLookupError:
+                  continue
+              except PermissionError:
+                  pass
+              return True
+      return False
+
+  def a_process_is_in_the_folder():
+      folder = os.path.realpath(directory)
+      for number in os.listdir(processes):
+          for name in ("cwd", "exe") if number.isdigit() else ():
+              try:
+                  target = os.readlink(os.path.join(processes, number, name)).removesuffix(" (deleted)")
+              except (FileNotFoundError, ProcessLookupError):
+                  continue
+              if target == folder or target.startswith(folder + "/"):
+                  return True
+      return False
+
+  def a_command_line_names_the_folder():
+      code = subprocess.run(["pgrep", "-f", "--", pattern], stdout=subprocess.DEVNULL, check=False).returncode
+      if code not in (0, 1):
+          raise OSError(code)
+      return code == 0
+
+  try:
+      if a_group_lives() or a_process_is_in_the_folder() or a_command_line_names_the_folder():
+          sys.exit(1)
+      if os.path.exists(record):
+          os.unlink(record)
+  except (OSError, ValueError, OverflowError) as error:
+      sys.stderr.write("the look for processes failed: " + type(error).__name__ + "\n")
+      sys.exit(2)
+# After a failed build, and before a retry removes anything, nothing is cleaned up until no process of the build works: the script, with its own deadline, tried again this many
+# times, this many seconds apart.
+runner_checkout_stop_check_deadline_seconds: 10
+runner_checkout_stop_check_retries: 3
+runner_checkout_stop_check_delay_seconds: 5

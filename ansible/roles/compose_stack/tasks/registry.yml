@@ -1,0 +1,6 @@
+# Reads compose_stack_compose_directory and compose_stack_provision_deadline_seconds. The registry's port on the host's local address is compose_stack_registry_port (8081 when unset).
+- name: Make the registry's compatibility rules match the rule list
+  registry_rules:
+    rules_file: "{{ compose_stack_rules_file | default(compose_stack_compose_directory + '/registry/rules.txt') }}"
+    port: "{{ compose_stack_registry_port | default(8081) | int }}"
+  timeout: "{{ compose_stack_provision_deadline_seconds | int }}"

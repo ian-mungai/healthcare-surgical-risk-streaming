@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nessie-bridge
+  namespace: {{ airbyte_namespace }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: {{ airbyte_bridge_address }}/32
+      ports:
+        - protocol: TCP
+          port: {{ airbyte_nessie_route_port | default(19120) | int }}

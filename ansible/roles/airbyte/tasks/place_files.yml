@@ -1,0 +1,56 @@
+# Reads airbyte_directory, airbyte_owner, airbyte_group, the database, staging and public address settings and airbyte_server_service_port. The three values
+# files hold no secret: the tracked file, the memory limits from the limits file and the host settings. The helm command reads them in that order.
+- name: Create Airbyte's folder
+  ansible.builtin.file:
+    path: "{{ airbyte_directory }}"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0755"
+
+- name: Place the tracked values file
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/values.yaml"
+    dest: "{{ airbyte_directory }}/values.yaml"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+
+- name: Render the memory limits from the limits file
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - scripts.stack.k3s_limits
+      - values
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: airbyte_limits_values
+  timeout: 60
+
+- name: Write the memory limits file
+  ansible.builtin.copy:
+    dest: "{{ airbyte_directory }}/limits.values.yaml"
+    content: "{{ airbyte_limits_values.stdout }}\n"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+
+- name: Place the post-renderer that gives the deployments holding database connections the Recreate strategy
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/recreate_post_renderer.py"
+    dest: "{{ airbyte_directory }}/recreate_post_renderer.py"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0755"
+
+- name: Write the host settings file
+  ansible.builtin.template:
+    src: host.values.yaml.j2
+    dest: "{{ airbyte_directory }}/host.values.yaml"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"

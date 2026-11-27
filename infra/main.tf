@@ -12,6 +12,11 @@ provider "aws" {
 
 locals {
   data_prefixes = ["landing", "warehouse"]
+  read_prefixes = ["manifests"]
+
+  deploy_role_name = var.test_run_id == "" ? "${var.project_name}_deploy_${var.environment}" : "${var.project_name}_deploy_t${var.test_run_id}"
+  ubuntu_build     = jsondecode(file("${path.module}/ubuntu_build.json"))
+  ubuntu_ami       = lookup(local.ubuntu_build.amis, var.aws_region, "")
 }
 
 module "host" {
@@ -19,16 +24,18 @@ module "host" {
   count  = var.provision_host ? 1 : 0
 
   name          = "${var.project_name}_host_${var.environment}"
+  ami           = local.ubuntu_ami
   boundary_name = "${var.project_name}_role_boundary"
   instance_type = var.host_instance_type
   disk_gib      = var.host_disk_gib
   bucket_arn    = "arn:aws:s3:::${var.data_bucket_name}"
   data_prefixes = local.data_prefixes
+  read_prefixes = local.read_prefixes
 
   workload_role_pattern = "${var.project_name}_workload_*"
 
   tailscale = {
-    client_id = var.tailscale_client_id
+    client_id = nonsensitive(var.tailscale_client_id)
     audience  = var.tailscale_audience
     tag       = var.tailscale_host_tag
     host_name = "platform-${var.environment}"
@@ -39,7 +46,7 @@ module "host" {
 module "deploy" {
   source = "./modules/deploy"
 
-  name                 = "${var.project_name}_deploy_${var.environment}"
+  name                 = local.deploy_role_name
   boundary_name        = "${var.project_name}_role_boundary"
   github_repository    = var.github_repository
   github_owner_id      = var.github_owner_id
@@ -55,5 +62,6 @@ module "workload_roles" {
   environment   = var.environment
   boundary_name = "${var.project_name}_role_boundary"
   host_role_arn = module.host[0].role_arn
+  bucket_name   = var.data_bucket_name
   workloads     = var.workloads
 }

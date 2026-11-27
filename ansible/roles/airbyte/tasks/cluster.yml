@@ -1,0 +1,27 @@
+# Reads airbyte_namespace. The namespace is the boundary of Airbyte's credentials: the chart's role and role binding are namespaced, so no other namespace's
+# service account can read them. The default container limit gives the one chart pod that has no resources setting, the bucket hook, its memory limit.
+- name: Render the namespace's default container memory limit from the limits file
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - scripts.stack.k3s_limits
+      - limit-range
+      - "{{ airbyte_namespace }}"
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: airbyte_limit_range
+  timeout: 60
+
+- name: Create the namespace and its default container memory limit
+  ansible.builtin.command:
+    argv: [k3s, kubectl, apply, --filename, "-"]
+    stdin: |
+      {{ {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': airbyte_namespace}} | to_nice_yaml }}---
+      {{ airbyte_limit_range.stdout }}
+  register: airbyte_cluster_objects
+  changed_when: "'created' in airbyte_cluster_objects.stdout or 'configured' in airbyte_cluster_objects.stdout"
+  timeout: 60

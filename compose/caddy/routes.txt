@@ -1,0 +1,13 @@
+# One line for each web interface that Caddy serves on the host's Tailscale name. A later phase adds its interface with one line.
+# The Caddy port is from 9441 to 9459 (9440 is the gateway's own). The upstream is the host port that the service's Compose file publishes: a fast test holds
+# each route whose service file exists to it. A route for a service with no file yet is a placeholder, with the usual port and health path of the tool.
+# name        caddy port  upstream (local address and port)  health path
+openbao       9441        127.0.0.1:8200                     /v1/sys/health
+grafana       9442        127.0.0.1:3000                     /api/health
+prometheus    9443        127.0.0.1:9090                     /-/healthy
+trino         9444        127.0.0.1:8080                     /v1/info
+nessie        9445        127.0.0.1:19120                    /api/v2/config
+airbyte       9446        127.0.0.1:8000                     /api/v1/health
+dagster       9447        127.0.0.1:3001                     /server_info
+apicurio      9448        127.0.0.1:8081                     /apis/registry/v3/system/info
+aistor        9449        127.0.0.1:9000                     /minio/health/live

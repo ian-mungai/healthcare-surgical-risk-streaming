@@ -1,0 +1,150 @@
+# The one source of every memory limit. Every figure is an estimate until live testing measures it and replaces it.
+host_reserve_mib: 4096
+services:
+  nessie:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  postgres:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  openbao:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 512
+  caddy:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 256
+  dagster_code_location:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  dagster_daemon:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 512
+  dagster_webserver:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768
+  prometheus:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  grafana:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  loki:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768
+  alloy:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768
+  # One service for each Spark workload, each in its own group: one job runs at a time, so a group holds one job. The heavy figure takes the largest.
+  spark_bronze:
+    runtime: compose
+    group: batch_bronze
+    memory_limit_mib: 4096
+  spark_silver:
+    runtime: compose
+    group: batch_silver
+    memory_limit_mib: 4096
+  spark_gold:
+    runtime: compose
+    group: batch_gold
+    memory_limit_mib: 4096
+  spark_maintenance:
+    runtime: compose
+    group: batch_maintenance
+    memory_limit_mib: 4096
+  trino:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 2048
+  airbyte_server:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_worker:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_workload_launcher:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_workload_api_server:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_cron:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_manifest_server:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_bootloader:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_temporal:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_temporal_admin:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 256
+  airbyte_minio:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_minio_create_bucket:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 128
+  airbyte_job_connector:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_job_check:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_job_discover:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_job_replication:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  # The connector sidecar of a check, discover or sync pod was OOMKilled at 256 MiB during the source-s3 discover on the live host (Nov 24 2026); 512 MiB
+  # matches the check and discover containers and is to be measured on the host's next connection step.
+  airbyte_job_sidecar:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  kafka:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  apicurio:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768
+  aistor:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  replay:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024

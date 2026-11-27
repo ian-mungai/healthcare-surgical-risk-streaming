@@ -1,4 +1,4 @@
-# The secret store's unlock key lives in the host's .env file, readable by its owner only. Phase 1 writes a random harmless marker
+# The secret store's unlock key lives in the host's .env file, owned by the user of the OpenBao container and read by that user only. Phase 1 writes a random harmless marker
 # in its place, so the file's protection is proven before any real key exists. The file is never replaced: the key must stay stable.
 - name: Create the unlock key file
   ansible.builtin.include_tasks: create_file.yml

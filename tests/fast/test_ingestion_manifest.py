@@ -1,0 +1,439 @@
+"""The manifest of passed files: published only from a complete passed check, for the versions that were checked and once for each content.
+
+Each refusal has the publishing of a passed check as its control. The stand-in store is described in ``memory_store.py``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import unittest
+from dataclasses import replace
+from typing import Any
+from unittest import mock
+
+from scripts.ingestion.check import CheckedFile, CheckResult, Finding, canonical, result_digest
+from scripts.ingestion.gate import GateRefused, verify_before_read
+from scripts.ingestion.manifest import (
+    MANIFEST_PREFIX,
+    ManifestError,
+    ManifestRef,
+    PublishRefused,
+    build_document,
+    manifest_key,
+    publish_manifest,
+    read_manifest,
+)
+from scripts.ingestion.notice import Cause
+from scripts.ingestion.selection import SelectionError
+from scripts.ingestion.store import ObjectVersion, StoreError
+from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set, pin_the_synthetic_list
+
+
+def checked(landed: Landed) -> CheckResult:
+    return landed.check()
+
+
+def manifest_objects(landed: Landed) -> list[str]:
+    return [version.key for version in landed.store.list_versions(MANIFEST_PREFIX)]
+
+
+def setUpModule() -> None:
+    pin_the_synthetic_list()
+
+
+class PublishTest(unittest.TestCase):
+    def test_control_a_passed_check_publishes_a_manifest_outside_the_payload_prefix(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        reference = publish_manifest(landed.store, landed.selection, result)
+        self.assertTrue(reference.key.startswith(f"{MANIFEST_PREFIX}probe_set/"))
+        self.assertFalse(reference.key.startswith("landing/"))
+        self.assertNotIn(reference.version_id, ("", "null"))
+        self.assertEqual([reference.key], manifest_objects(landed))
+        stored = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        self.assertEqual(hashlib.sha256(stored).hexdigest(), reference.sha256)
+        self.assertTrue(reference.key.endswith(f"{reference.sha256}.json"))
+
+    def test_each_entry_binds_the_landed_version_and_the_set_records_the_rest_once(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        reference = publish_manifest(landed.store, landed.selection, result)
+        document = json.loads(landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7))
+        self.assertEqual("2016-08 to 2017-06", document["measurement_period"])
+        self.assertEqual(
+            {
+                "name": "probe_set",
+                "source_bucket": "physionet-open",
+                "source_prefix": SOURCE_PREFIX,
+                "file_count": len(SOURCE),
+                "keys_sha256": landed.selection.keys_sha256,
+                "selection_sha256": landed.selection.selection_sha256,
+            },
+            document["selection"],
+        )
+        self.assertEqual({"key": f"{SOURCE_PREFIX}SHA256SUMS.txt", "sha256": landed.selection.checksum_list_sha256}, document["checksum_list"])
+        self.assertEqual(result.result_sha256, document["check_result_sha256"])
+        entries = {entry["source_key"]: entry for entry in document["entries"]}
+        self.assertEqual({SOURCE_PREFIX + path for path in SOURCE}, set(entries))
+        for path, data in SOURCE.items():
+            source_key = SOURCE_PREFIX + path
+            version = landed.versions[path]
+            self.assertEqual(
+                {
+                    "bucket": landed.store.bucket,
+                    "key": landed.key_for(source_key),
+                    "version_id": version.version_id,
+                    "sha256": digest(data),
+                    "source_key": source_key,
+                    "size": len(data),
+                    "release": "1.0.0",
+                    "retrieved_utc": version.last_modified,
+                },
+                entries[source_key],
+            )
+        self.assertNotIn("measurement_period", entries[SOURCE_PREFIX + "clinical_data.csv"])
+        self.assertNotIn("selection", entries[SOURCE_PREFIX + "clinical_data.csv"])
+
+    def test_a_reader_confirms_the_manifest_is_the_checks_by_recomputing_the_check_digest(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        reference = publish_manifest(landed.store, landed.selection, result)
+        manifest = read_manifest(landed.store, reference)
+        self.assertEqual(result.result_sha256, manifest.check_result_sha256)
+        self.assertEqual(result.result_sha256, manifest.recomputed_check_result_sha256())
+
+    def test_a_failed_check_publishes_nothing(self) -> None:
+        landed = landed_set(landed={"vital_files/0001.vital": b"changed"})
+        result = checked(landed)
+        with self.assertRaisesRegex(PublishRefused, "did not pass"):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_missing_file_publishes_nothing(self) -> None:
+        landed = landed_set(skip=("clinical_data.csv",))
+        with self.assertRaisesRegex(PublishRefused, "did not pass"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_partial_result_publishes_nothing(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        partial = replace(result, files=result.files[:-1], file_count=len(result.files) - 1)
+        partial = replace(partial, claimed_sha256=partial.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "every selected file"):
+            publish_manifest(landed.store, landed.selection, partial)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_for_another_selection_publishes_nothing(self) -> None:
+        landed = landed_set()
+        result = replace(checked(landed), selection_sha256="0" * 64)
+        with self.assertRaisesRegex(PublishRefused, "selection"):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_selection_that_differs_from_the_checked_one_in_any_field_publishes_nothing(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        for field, other in (("measurement_period", "2020-01 to 2020-02"), ("name", "other_set")):
+            changed: dict[str, Any] = {field: other}
+            with self.subTest(field=field), self.assertRaisesRegex(PublishRefused, "not for this selection"):
+                publish_manifest(landed.store, replace(landed.selection, **changed), result)
+            self.assertEqual([], manifest_objects(landed))
+        for field, other in (
+            ("source_bucket", "another-publisher"),
+            ("checksum_list_key", f"{SOURCE_PREFIX}OTHER_SUMS.txt"),
+            ("release", "2.0.0"),
+            ("source_prefix", "vitaldb/2.0.0/"),
+        ):
+            changes: dict[str, Any] = {field: other}
+            with self.subTest(field=field), self.assertRaisesRegex(SelectionError, f"{field} is not the tracked pin's"):
+                replace(landed.selection, **changes)
+        self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
+
+    def test_a_selection_whose_prefix_moved_into_its_paths_is_refused_before_it_can_publish(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        with self.assertRaisesRegex(SelectionError, "source_prefix is not the tracked pin's"):
+            replace(landed.selection, source_prefix="vitaldb/", files=tuple(f"1.0.0/{path}" for path in landed.selection.files))
+        self.assertEqual([], manifest_objects(landed))
+        self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
+
+    def test_a_result_whose_files_are_not_the_selected_ones_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        other_key = replace(result.files[0], source_key=SOURCE_PREFIX + "vital_files/0009.vital")
+        for name, files in (("another key", (other_key, *result.files[1:])), ("a file twice", (*result.files, result.files[0]))):
+            forged = replace(result, files=files, file_count=len(files))
+            forged = replace(forged, claimed_sha256=forged.result_sha256)
+            with self.subTest(name), self.assertRaisesRegex(PublishRefused, "every selected file once"):
+                publish_manifest(landed.store, landed.selection, forged)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_for_another_bucket_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        forged = replace(result, files=tuple(replace(file, bucket="another-bucket") for file in result.files))
+        forged = replace(forged, claimed_sha256=forged.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "another bucket"):
+            publish_manifest(landed.store, landed.selection, forged)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_that_did_not_pass_publishes_nothing_whatever_else_in_it_holds(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        for name, changed in (
+            ("a file count of zero", replace(result, file_count=0)),
+            ("a file count above the files", replace(result, file_count=len(result.files) + 1)),
+            ("a finding", replace(result, findings=(Finding(1, Cause.MISSING),), claimed_sha256=result.claimed_sha256)),
+        ):
+            with self.subTest(name), self.assertRaisesRegex(PublishRefused, "did not pass"):
+                publish_manifest(landed.store, landed.selection, changed)
+            self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_that_names_another_selection_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        with self.assertRaisesRegex(PublishRefused, "not for this selection"):
+            publish_manifest(landed.store, landed.selection, replace(checked(landed), selection_name="another_set"))
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_of_another_checksum_list_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        other = replace(result, list_sha256="1" * 64)
+        other = replace(other, claimed_sha256=other.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "pinned checksum list"):
+            publish_manifest(landed.store, landed.selection, other)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_file_edited_after_the_check_publishes_nothing(self) -> None:
+        landed = landed_set()
+        text = checked(landed).to_json()
+        edited = json.loads(text)
+        edited["files"][0]["version_id"] = "version9999"
+        with self.assertRaisesRegex(PublishRefused, "edited"):
+            publish_manifest(landed.store, landed.selection, CheckResult.from_json(json.dumps(edited)))
+        self.assertEqual([], manifest_objects(landed))
+        self.assertTrue(publish_manifest(landed.store, landed.selection, CheckResult.from_json(text)).key)
+
+    def test_a_version_landed_after_the_check_publishes_nothing_for_the_versions_that_were_checked(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        landed.land("vital_files/0001.vital", SOURCE["vital_files/0001.vital"])
+        with self.assertRaisesRegex(PublishRefused, "checked file 2: a new version landed after the check"):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+        self.assertTrue(publish_manifest(landed.store, landed.selection, checked(landed)).key)
+
+    def test_a_version_removed_after_the_check_publishes_nothing(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        landed.store.put_delete_marker(landed.key_for(SOURCE_PREFIX + "clinical_data.csv"))
+        with self.assertRaisesRegex(PublishRefused, "checked file 1: no longer present after the check"):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+
+class ReferenceTest(unittest.TestCase):
+    def test_a_reference_outside_the_manifest_prefix_is_refused_and_no_payload_is_read(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        data = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        key = f"landing/probe_set/{reference.sha256}.json"
+        planted = ManifestRef(landed.store.bucket, key, landed.store.put_object(key, data).version_id, reference.sha256)
+        landed.store.reads.clear()
+        with self.assertRaisesRegex(ManifestError, "does not hold"):
+            read_manifest(landed.store, planted)
+        self.assertEqual([], landed.store.payload_reads("landing/"))
+
+    def test_a_reference_key_that_is_not_a_manifest_key_is_refused_before_the_store_is_asked(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        landed.store.list_versions = mock.Mock(side_effect=AssertionError("the store was asked"))  # type: ignore[method-assign]
+        for key in (f"manifests/private value/{reference.sha256}.json", f"manifests/a/b/{reference.sha256}.json", f"manifests//{reference.sha256}.json"):
+            with self.subTest(key=key), self.assertRaisesRegex(ManifestError, "does not hold") as raised:
+                read_manifest(landed.store, replace(reference, key=key))
+            self.assertNotIn("private", str(raised.exception))
+        with self.assertRaisesRegex(ManifestError, "does not hold"):
+            read_manifest(landed.store, replace(reference, sha256=reference.sha256.upper(), key=reference.key.upper()))
+
+    def test_a_reference_to_a_delete_marker_is_refused_as_a_version_that_does_not_exist(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        marker = landed.store.put_delete_marker(reference.key)
+        with self.assertRaisesRegex(ManifestError, "the manifest version of the reference does not exist"):
+            read_manifest(landed.store, replace(reference, version_id=marker.version_id))
+
+
+class RepeatedFieldTest(unittest.TestCase):
+    def test_a_stored_manifest_that_names_a_field_twice_is_refused_although_its_reference_matches(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        data = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        self.assertEqual(1, data.count(b'"status":"passed"'))
+        repeated = data.replace(b'"status":"passed"', b'"status":"failed","status":"passed"')
+        key = manifest_key(landed.selection.name, digest(repeated))
+        forged = ManifestRef(landed.store.bucket, key, landed.store.put_object(key, repeated).version_id, digest(repeated))
+        with self.assertRaisesRegex(ManifestError, "more than once"):
+            read_manifest(landed.store, forged)
+        with self.assertRaisesRegex(GateRefused, "more than once"):
+            verify_before_read(landed.store, forged)
+        self.assertEqual(len(SOURCE), len(read_manifest(landed.store, reference).entries))
+
+
+class WriteTest(unittest.TestCase):
+    def test_a_manifest_that_reads_back_with_other_content_is_refused(self) -> None:
+        landed = landed_set()
+        create = landed.store.create_object
+        landed.store.create_object = lambda key, data: create(key, data + b" ")  # type: ignore[method-assign]
+        with self.assertRaisesRegex(PublishRefused, "reads back with other content"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
+
+
+class NullVersionTest(unittest.TestCase):
+    def test_a_bucket_whose_versioning_is_off_is_refused_before_the_manifest_is_written(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        landed.store.versioned = False
+        with self.assertRaises(StoreError):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def null_manifest(self, landed: Landed) -> ManifestRef:
+        """A manifest written while versioning was off: its only version is the null version. Versioning is then on again."""
+        result = checked(landed)
+        data = canonical(build_document(landed.selection, result))
+        key = manifest_key(landed.selection.name, digest(data))
+        landed.store.versioned = False
+        version = landed.store.put_object(key, data)
+        landed.store.versioned = True
+        self.assertEqual("null", version.version_id)
+        return ManifestRef(landed.store.bucket, key, version.version_id, digest(data))
+
+    def test_a_manifest_that_exists_only_as_a_null_version_is_not_reused(self) -> None:
+        landed = landed_set()
+        self.null_manifest(landed)
+        with self.assertRaisesRegex(PublishRefused, "null version"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
+
+    def test_a_reference_to_a_null_version_is_not_read(self) -> None:
+        landed = landed_set()
+        reference = self.null_manifest(landed)
+        with self.assertRaisesRegex(ManifestError, "null version"):
+            read_manifest(landed.store, reference)
+        with self.assertRaisesRegex(GateRefused, "null version"):
+            verify_before_read(landed.store, reference)
+
+    def test_a_result_that_binds_a_null_version_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        landed.store.versioned = False
+        landed.store.history.clear()
+        for path, data in SOURCE.items():
+            landed.land(path, data)
+        landed.store.versioned = True
+        files = tuple(
+            CheckedFile(landed.store.bucket, version.key, version.version_id, digest(SOURCE[path]), SOURCE_PREFIX + path, version.size, "1.0.0", "t")
+            for path, version in landed.versions.items()
+        )
+        self.assertEqual({"null"}, {file.version_id for file in files})
+        result = CheckResult(landed.selection.name, landed.selection.selection_sha256, landed.selection.checksum_list_sha256, len(files), files, ())
+        result = replace(result, claimed_sha256=result.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "null version"):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_write_that_returns_a_null_version_publishes_no_reference(self) -> None:
+        landed = landed_set()
+
+        def null_create(key: str, data: bytes) -> ObjectVersion:
+            landed.store.versioned = False
+            version = landed.store.put_object(key, data)
+            landed.store.versioned = True
+            return version
+
+        landed.store.create_object = null_create  # type: ignore[method-assign]
+        with self.assertRaisesRegex(PublishRefused, "null version"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
+
+    def test_control_the_same_manifest_written_with_versioning_on_is_read(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        self.assertEqual(len(SOURCE), len(read_manifest(landed.store, reference).entries))
+        self.assertEqual(len(SOURCE), len(verify_before_read(landed.store, reference)))
+
+
+class RerunTest(unittest.TestCase):
+    def test_a_rerun_with_the_same_landed_versions_gives_the_same_manifest_and_adds_nothing(self) -> None:
+        landed = landed_set()
+        first = publish_manifest(landed.store, landed.selection, checked(landed))
+        writes = list(landed.store.writes)
+        second = publish_manifest(landed.store, landed.selection, checked(landed))
+        self.assertEqual(first, second)
+        self.assertEqual(writes, landed.store.writes)
+        self.assertEqual(1, len(landed.store.list_versions(first.key)))
+
+    def test_a_new_landed_version_gives_a_new_manifest_and_leaves_the_first_in_place(self) -> None:
+        landed = landed_set()
+        first = publish_manifest(landed.store, landed.selection, checked(landed))
+        landed.land("vital_files/0001.vital", SOURCE["vital_files/0001.vital"])
+        second = publish_manifest(landed.store, landed.selection, checked(landed))
+        self.assertNotEqual(first.key, second.key)
+        self.assertEqual(sorted([first.key, second.key]), manifest_objects(landed))
+
+    def test_a_manifest_key_that_holds_other_content_is_refused_and_left_alone(self) -> None:
+        landed = landed_set()
+        first = publish_manifest(landed.store, landed.selection, checked(landed))
+        landed.store.put_object(first.key, b'{"substituted": true}')
+        with self.assertRaisesRegex(PublishRefused, "holds other content"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
+        self.assertEqual(2, len(landed.store.list_versions(first.key)))
+
+
+class FormatTest(unittest.TestCase):
+    """The manifest names its format. A manifest of the earlier format, or of this shape under the earlier tag, is refused with the step that replaces it."""
+
+    def stored(self, landed: Landed, document: dict[str, Any]) -> ManifestRef:
+        data = canonical(document)
+        key = manifest_key(landed.selection.name, digest(data))
+        return ManifestRef(landed.store.bucket, key, landed.store.put_object(key, data).version_id, digest(data))
+
+    def earlier(self, landed: Landed) -> dict[str, Any]:
+        """A manifest as the earlier format wrote it: no selection digest, and a check digest over the digest of the keys."""
+        document = build_document(landed.selection, checked(landed))
+        del document["selection"]["selection_sha256"]
+        document["format"] = "landing_manifest_1"
+        document["check_result_sha256"] = result_digest(landed.selection.keys_sha256, landed.selection.checksum_list_sha256, document["entries"])
+        return document
+
+    def test_control_a_published_manifest_names_the_current_format_and_is_read(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        document = json.loads(landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7))
+        self.assertEqual("landing_manifest_2", document["format"])
+        self.assertEqual(len(SOURCE), len(read_manifest(landed.store, reference).entries))
+
+    def test_a_manifest_of_the_earlier_format_is_refused_with_the_advice_to_rerun_check_and_publish(self) -> None:
+        landed = landed_set()
+        reference = self.stored(landed, self.earlier(landed))
+        with self.assertRaisesRegex(ManifestError, "earlier format.*rerun check and publish"):
+            read_manifest(landed.store, reference)
+        with self.assertRaisesRegex(GateRefused, "rerun check and publish"):
+            verify_before_read(landed.store, reference)
+
+    def test_a_manifest_of_this_shape_under_the_earlier_tag_is_refused(self) -> None:
+        landed = landed_set()
+        document = build_document(landed.selection, checked(landed))
+        document["format"] = "landing_manifest_1"
+        with self.assertRaisesRegex(ManifestError, "rerun check and publish"):
+            read_manifest(landed.store, self.stored(landed, document))
+
+    def test_a_manifest_of_an_unknown_format_is_refused(self) -> None:
+        landed = landed_set()
+        document = build_document(landed.selection, checked(landed))
+        document["format"] = "landing_manifest_9"
+        with self.assertRaisesRegex(ManifestError, "not a passed manifest of this format"):
+            read_manifest(landed.store, self.stored(landed, document))
+
+
+if __name__ == "__main__":
+    unittest.main()

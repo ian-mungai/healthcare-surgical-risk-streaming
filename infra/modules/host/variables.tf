@@ -3,6 +3,11 @@ variable "name" {
   type        = string
 }
 
+variable "ami" {
+  description = "AMI of the host: the pinned Canonical Ubuntu 24.04 build for the run's region, from infra/ubuntu_build.json. A running host ignores a later change of it."
+  type        = string
+}
+
 variable "boundary_name" {
   description = "Name of the permissions boundary policy that caps the host's role."
   type        = string
@@ -42,4 +47,14 @@ variable "bucket_arn" {
 variable "data_prefixes" {
   description = "Prefixes of the bucket the host may list, read and write. The Terraform state lives under another prefix."
   type        = list(string)
+}
+
+variable "read_prefixes" {
+  description = "Prefixes of the bucket the host may list and read and never write. At least one: an empty list would make an empty resource list."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.read_prefixes) > 0
+    error_message = "Give at least one read-only prefix."
+  }
 }

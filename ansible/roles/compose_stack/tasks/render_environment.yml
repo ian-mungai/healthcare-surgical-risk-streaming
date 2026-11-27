@@ -1,0 +1,83 @@
+# Reads compose_stack_compose_directory, compose_stack_secrets_directory, compose_stack_postgres_port, openbao_port, unlock_key_file, compose_stack_owner,
+# compose_stack_group, compose_stack_docker_socket (or compose_stack_docker_socket_gid, the group that containers see on the socket, which wins when it is
+# set), airbyte_namespace, airbyte_release, compose_stack_platform_commit, compose_stack_warehouse_location, compose_stack_heavy_memory_mib, workload_access_region and compose_stack_aistor_licence_file.
+# The images' digests come from the tracked pin file (or compose_stack_pin_file, when set) through its renderer (scripts/images/pins.py), which stops with a fixed message when an image has no pin.
+# The limits come from the limits file through its loader on the computer that runs Ansible, so no limit is typed in a Compose file or here.
+- name: Render the memory limits from the limits file
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - scripts.stack.limits
+      - render
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: compose_stack_limits
+  timeout: 60
+
+- name: Render the digests of the project's images from the pin file
+  ansible.builtin.command:
+    argv: "{{ [ansible_playbook_python, '-m', 'scripts.images.pins', 'render'] + (['--pins', compose_stack_pin_file] if compose_stack_pin_file is defined else []) }}"
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: compose_stack_image_pins
+  timeout: 60
+
+- name: Write the memory limits Compose reads
+  ansible.builtin.copy:
+    dest: "{{ compose_stack_compose_directory }}/limits.env"
+    content: |
+      {{ compose_stack_limits.stdout }}
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0644"
+
+- name: Read the group of the Docker socket
+  ansible.builtin.stat:
+    path: "{{ compose_stack_docker_socket }}"
+  register: compose_stack_socket
+  when: compose_stack_docker_socket_gid is not defined
+
+- name: Stop when the Docker socket is missing
+  ansible.builtin.fail:
+    msg: "the Docker socket {{ compose_stack_docker_socket }} does not exist, so the code location cannot be given its group"
+  when: compose_stack_docker_socket_gid is not defined and not compose_stack_socket.stat.exists
+
+# The heavy-job figure is the one that Terraform calculated, which the host command reads from the run's state. It has a file of its own, which the code
+# location loads with env_file: a value in Compose's interpolation can be overridden by a shell variable of the caller, and a file loaded this way cannot.
+# It is written first, so a deploy with no figure stops before it writes any host setting.
+- name: Write the heavy-job figure the code location loads
+  ansible.builtin.copy:
+    dest: "{{ compose_stack_compose_directory }}/heavy.env"
+    content: |
+      HEAVY_MEMORY_MIB={{ compose_stack_heavy_memory_mib }}
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0644"
+
+# The commit and the warehouse location come from the host command (scripts/infra/host.py), which reads them from the checkout and the project configuration.
+- name: Write the host settings Compose reads
+  ansible.builtin.copy:
+    dest: "{{ compose_stack_compose_directory }}/host.env"
+    content: |
+      SECRETS_DIR={{ compose_stack_secrets_directory }}
+      POSTGRES_HOST_PORT={{ compose_stack_postgres_port }}
+      OPENBAO_HOST_PORT={{ openbao_port }}
+      OPENBAO_UNLOCK_KEY_FILE={{ unlock_key_file }}
+      DOCKER_SOCKET_GID={{ compose_stack_docker_socket_gid | default(compose_stack_socket.stat.gid) }}
+      STACK_K3S_NAMESPACE={{ airbyte_namespace }}
+      STACK_K3S_RELEASE={{ airbyte_release }}
+      PLATFORM_COMMIT={{ compose_stack_platform_commit }}
+      WAREHOUSE_LOCATION={{ compose_stack_warehouse_location }}
+      AWS_REGION={{ workload_access_region }}
+      AISTOR_LICENCE_FILE={{ compose_stack_aistor_licence_file }}
+      {{ compose_stack_image_pins.stdout | trim }}
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0644"

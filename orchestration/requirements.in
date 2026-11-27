@@ -1,0 +1,4 @@
+# Dagster's own packages, for the image in orchestration/Dockerfile. `make lock-orchestration` writes requirements.txt with hashes.
+dagster==1.13.31
+dagster-webserver==1.13.31
+dagster-postgres==0.29.31

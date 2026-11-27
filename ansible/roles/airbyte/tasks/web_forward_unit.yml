@@ -1,0 +1,25 @@
+# Reads airbyte_web_unit, airbyte_owner, airbyte_group, airbyte_namespace, airbyte_release, airbyte_web_port and airbyte_server_service_port. The unit forwards the server service, which
+# serves the interface, to the host's local address only. A cluster-internal service stays the only exposure that Kubernetes has. The restart has no start limit,
+# so the forwarder reconnects after the server pod is replaced, however many times that takes.
+- name: Install the unit that forwards the web service to the local address
+  ansible.builtin.copy:
+    dest: "{{ airbyte_web_unit }}"
+    content: |
+      [Unit]
+      Description=Forward Airbyte's web service to the host's local address
+      After=k3s.service
+      Wants=k3s.service
+      StartLimitIntervalSec=0
+
+      [Service]
+      Environment=KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      ExecStart=/usr/local/bin/k3s kubectl port-forward --namespace {{ airbyte_namespace }} --address 127.0.0.1 service/{{ airbyte_release }}-airbyte-server-svc {{ airbyte_web_port }}:{{ airbyte_server_service_port }}
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+  register: airbyte_web_unit_file

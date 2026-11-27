@@ -91,6 +91,25 @@
         "arn:aws:s3:::${S3_BUCKET}/*",
         "arn:aws:s3:::${S3_BUCKET}-test-*/*"
       ]
+    },
+    {
+      "Sid": "ListPublisherDataset",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::physionet-open",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "vitaldb/1.0.0/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadPublisherDataset",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::physionet-open/vitaldb/1.0.0/*"
     }
   ]
 }

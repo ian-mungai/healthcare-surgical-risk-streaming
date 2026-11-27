@@ -1,0 +1,16 @@
+# Reads airbyte_web_unit and what web_forward_unit.yml reads.
+- name: Install the forwarder's unit
+  ansible.builtin.include_tasks: web_forward_unit.yml
+
+- name: Start the forwarder now and at boot
+  ansible.builtin.systemd_service:
+    name: "{{ airbyte_web_unit | basename }}"
+    state: started
+    enabled: true
+    daemon_reload: "{{ airbyte_web_unit_file is changed }}"
+
+- name: Restart the forwarder when its unit changed
+  ansible.builtin.systemd_service:
+    name: "{{ airbyte_web_unit | basename }}"
+    state: restarted
+  when: airbyte_web_unit_file is changed

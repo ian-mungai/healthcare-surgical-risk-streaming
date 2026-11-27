@@ -4,7 +4,7 @@
     state: directory
     mode: "0755"
 
-- name: Turn off the bundled ingress controller and service load balancer
+- name: Set the k3s configuration, with the bundled ingress controller and load balancer off and secrets encrypted at rest
   ansible.builtin.copy:
     dest: /etc/rancher/k3s/config.yaml
     content: |
@@ -12,6 +12,7 @@
         - traefik
         - servicelb
       write-kubeconfig-mode: "0600"
+      secrets-encryption: true
     mode: "0600"
   register: k3s_configuration
 
@@ -53,13 +54,10 @@
     enabled: true
 
 - name: Wait for the k3s node to be ready
-  ansible.builtin.command:
-    cmd: k3s kubectl wait --for=condition=Ready node --all --timeout=20s
-  register: k3s_node_ready
-  changed_when: false
-  retries: "{{ (k3s_ready_deadline_seconds / 25) | int }}"
-  delay: 5
-  until: k3s_node_ready.rc == 0
+  ansible.builtin.include_tasks: wait_ready.yml
+
+- name: Turn on secret encryption at rest where the cluster started without it, then confirm it is on
+  ansible.builtin.include_tasks: secrets_encryption.yml
 
 - name: Read the running k3s configuration
   ansible.builtin.command:

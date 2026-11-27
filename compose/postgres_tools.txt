@@ -1,0 +1,7 @@
+# One PostgreSQL account for each tool. A bare name owns one database named for the tool. "tool: database database" owns the databases it lists.
+# No account may create a database, so every database a tool needs is listed here. Airbyte's Temporal keeps two of its own.
+nessie
+airbyte: airbyte airbyte_temporal airbyte_temporal_visibility
+dagster
+alloy
+apicurio

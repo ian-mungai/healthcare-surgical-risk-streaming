@@ -12,7 +12,6 @@ Resources without tags are listed like any other, because the list comes from th
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
@@ -20,6 +19,9 @@ from pathlib import Path
 from scripts.infra.created import DEVICE_FILE, device_entries, run_inventory
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 
@@ -43,18 +45,18 @@ def write_inventory(binding: Path) -> Path:
         "authorized_retained": retained,
     }
     target = folder / "inventory.json"
-    target.write_text(json.dumps(inventory, indent=2) + "\n")
+    replace_owned_file(target, json.dumps(inventory, indent=2) + "\n", state_root=folder, mode=0o644)
     return target
 
 
 def main() -> int:
     """Write the inventory, print its size and return a non-zero code on a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         target = write_inventory(parser.parse_args().binding)
     except (ConfigurationError, WrapperError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     inventory = json.loads(target.read_text())
     counts = f"{len(inventory['created'])} created resources and {len(inventory['authorized_retained'])} retained items"

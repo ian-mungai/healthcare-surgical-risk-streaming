@@ -1,0 +1,42 @@
+services:
+  openbao:
+    image: openbao/openbao:2.7.3@sha256:ba4b133eb9586630024e71a617e66f37f29cc3534cdd46a6233e098ceded8dc9
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_OPENBAO:?render the limits first}
+    restart: unless-stopped
+    init: true
+    user: "100:1000"
+    entrypoint: [/bin/sh, /openbao/start.sh]
+    configs:
+      - source: openbao_config
+        target: /openbao/config/openbao.hcl
+      - source: openbao_start
+        target: /openbao/start.sh
+    secrets:
+      - openbao_unlock_key_file
+      - openbao_bootstrap_secret_id
+    volumes:
+      - openbao_data:/openbao/file
+    ports:
+      - 127.0.0.1:${OPENBAO_HOST_PORT:-8200}:8200
+    healthcheck:
+      test: [CMD-SHELL, BAO_ADDR=http://127.0.0.1:8200 bao status]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+configs:
+  openbao_config:
+    file: ../openbao/openbao.hcl
+  openbao_start:
+    file: ../openbao/start.sh
+
+secrets:
+  openbao_unlock_key_file:
+    file: ${OPENBAO_UNLOCK_KEY_FILE:-/opt/platform/.env}
+  openbao_bootstrap_secret_id:
+    file: ${SECRETS_DIR:?render the host settings first}/openbao/bootstrap.secret_id
+
+volumes:
+  openbao_data:

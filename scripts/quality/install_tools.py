@@ -1,4 +1,4 @@
-"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint, the tflint AWS ruleset and Trivy, and the working-tree privacy hook.
+"""Install the pinned command-line tools into ``.tools``: gitleaks, Terraform, tflint, its AWS ruleset and Trivy, and the privacy and push hooks.
 
 Run from the repository root: ``.venv/bin/python -m scripts.quality.install_tools``. ``--check`` verifies each installed
 binary against its pinned archive without downloading or writing anything. Each archive is checked against its pinned
@@ -9,7 +9,6 @@ published checksum file.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import io
 import platform
@@ -17,10 +16,13 @@ import sys
 import tarfile
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
-from scripts.quality import worktree_scan_hook
+from scripts.quality import push_hook, worktree_scan_hook
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / ".tools"
@@ -39,6 +41,15 @@ class Tool:
     target: str
     assets: dict[Platform, tuple[str, str]]
 
+    @property
+    def folder(self) -> Path:
+        """The folder of the installed file: the tools folder constant plus the folder part of the pinned target."""
+        return TOOLS / PurePosixPath(self.target).parent
+
+    @property
+    def path(self) -> Path:
+        return self.folder / PurePosixPath(self.target).name
+
 
 GITLEAKS = Tool(
     name="gitleaks",
@@ -49,6 +60,17 @@ GITLEAKS = Tool(
     assets={
         ("Darwin", "arm64"): ("gitleaks_8.30.1_darwin_arm64.tar.gz", "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"),
         ("Linux", "x86_64"): ("gitleaks_8.30.1_linux_x64.tar.gz", "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"),
+    },
+)
+TERRAFORM = Tool(
+    name="terraform",
+    version="1.16.4",
+    url="https://releases.hashicorp.com/terraform/1.16.4",
+    member="terraform",
+    target="bin/terraform",
+    assets={
+        ("Darwin", "arm64"): ("terraform_1.16.4_darwin_arm64.zip", "42cfdf97ad722f79085fe2279b06d4b8680172de3534b22eeddd9a0fbbe7b8f1"),
+        ("Linux", "x86_64"): ("terraform_1.16.4_linux_amd64.zip", "dc94af0eef1147718ad7c8daea792ed199e3e0492eec180d0adafa2a65a879df"),
     },
 )
 TFLINT = Tool(
@@ -84,7 +106,7 @@ TRIVY = Tool(
         ("Linux", "x86_64"): ("trivy_0.76.2_Linux-64bit.tar.gz", "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"),
     },
 )
-TOOL_LIST = (GITLEAKS, TFLINT, TFLINT_AWS, TRIVY)
+TOOL_LIST = (GITLEAKS, TERRAFORM, TFLINT, TFLINT_AWS, TRIVY)
 
 
 def pinned_asset(tool: Tool) -> tuple[str, str]:
@@ -131,16 +153,15 @@ def settle(tool: Tool, *, check: bool) -> bool:
         sys.stderr.write(f"{label}: no verified archive in .tools/downloads; run the installer without --check\n")
         return False
     binary = pinned_binary(tool, archive)
-    target = TOOLS / tool.target
+    target = tool.path
     if target.is_file() and target.read_bytes() == binary and (target.stat().st_mode & 0o777) == BINARY_MODE:
         sys.stdout.write(f"{label}: installed and verified\n")
         return True
     if check:
         sys.stderr.write(f"{label}: the installed binary is missing or differs from the pinned archive\n")
         return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(binary)
-    target.chmod(BINARY_MODE)
+    tool.folder.mkdir(parents=True, exist_ok=True)
+    replace_owned_file(target, binary, state_root=tool.folder, mode=BINARY_MODE)
     sys.stdout.write(f"{label}: installed from the verified archive\n")
     return True
 
@@ -155,19 +176,37 @@ def settle_hook(*, check: bool) -> bool:
     try:
         worktree_scan_hook.install(ROOT)
     except worktree_scan_hook.KeptHookError as error:
-        sys.stderr.write(f"working-tree privacy hook: {error}\n")
+        sys.stderr.write(f"working-tree privacy hook: {describe_error(error)}\n")
         return False
     sys.stdout.write("working-tree privacy hook: installed\n")
     return True
 
 
+def settle_push_guard(*, check: bool) -> bool:
+    """Settle the plain ``pre-push`` hook that runs the push gate, and remove what earlier versions left in the hooks folder."""
+    if push_hook.installed(ROOT):
+        sys.stdout.write("push hook: installed and verified\n")
+        return True
+    if check:
+        sys.stderr.write("push hook: missing, changed or an earlier version's file is left; run the installer without --check\n")
+        return False
+    try:
+        push_hook.install(ROOT)
+    except worktree_scan_hook.KeptHookError:
+        sys.stderr.write(f"push hook: {push_hook.KEPT_REFUSAL}\n")
+        return False
+    sys.stdout.write("push hook: installed\n")
+    return True
+
+
 def main() -> int:
     """Install or check every pinned tool and return 1 when one is missing or differs."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--check", action="store_true", help="verify the installed binaries without downloading or writing")
     check = parser.parse_args().check
     results = [settle(tool, check=check) for tool in TOOL_LIST]
     results.append(settle_hook(check=check))
+    results.append(settle_push_guard(check=check))
     return 0 if all(results) else 1
 
 

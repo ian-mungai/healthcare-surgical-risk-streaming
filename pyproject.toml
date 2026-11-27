@@ -2,9 +2,11 @@
 line-length = 160
 target-version = "py314"
 
-# Files that Ansible copies to the host run on the host's Python, which is 3.12 on Ubuntu 24.04.
+# Files that Ansible copies to the host, and the modules and helpers it runs there, use the host's Python, which is 3.12 on Ubuntu 24.04.
 [tool.ruff.per-file-target-version]
 "ansible/roles/*/files/*.py" = "py312"
+"ansible/roles/*/library/*.py" = "py312"
+"ansible/roles/*/module_utils/*.py" = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S", "SIM", "T20"]
@@ -12,4 +14,9 @@ select = ["E", "F", "I", "B", "UP", "S", "SIM", "T20"]
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["infra", "scripts", "tests"]
+files = ["infra", "scripts", "tests", "replay/events", "replay/service", "casefile", "features", "spark/streaming"]
+
+# The replay image's decoding and Avro libraries are not in the development environment (owner, Nov 22 2026: only the boto3 stubs and confluent-kafka are installed), so they are read as untyped.
+[[tool.mypy.overrides]]
+module = ["fastavro", "fastavro.*", "vitaldb", "vitaldb.*"]
+ignore_missing_imports = true

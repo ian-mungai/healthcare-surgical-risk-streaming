@@ -1,0 +1,112 @@
+# Reads runner_checkout_commit, runner_checkout_scratch (the controller's folder with runner.tar), runner_checkout_directory, runner_checkout_folder, runner_checkout_archive_file,
+# the owner, group and mode, and the deadlines. Runs only for a folder that is not finished. Before anything is removed, no process of an earlier build (the process groups in
+# the record that every command of a build writes) and none that works in the runner folder may still work (processes.yml), so a retry prunes nothing under a live process. Then
+# every folder or file under the runner folder except this commit's is removed, and this commit's own unfinished folder too, each by one command with a deadline (rm under
+# timeout), and a link among them is removed and never followed. The commit's new folder is made, checked to be a real folder of the deploy user, and filled from the archive.
+# When a command of the build fails or passes its deadline, no cleanup runs until no process of the build works any more (processes.yml again), and then only the archive file
+# is removed: the unfinished folder has no marker, so the next run removes it.
+- name: Confirm that no process of an earlier build still works before anything is removed
+  ansible.builtin.include_tasks: processes.yml
+
+- name: Place the commit's code, build the environment and remove the old folders
+  block:
+    - name: Remove every folder or file under the runner folder except this commit's
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+          - "{{ runner_checkout_remove_deadline_seconds }}"
+          - find
+          - "{{ runner_checkout_directory }}"
+          - -mindepth
+          - "1"
+          - -maxdepth
+          - "1"
+          - "!"
+          - -name
+          - "{{ runner_checkout_commit }}"
+          - -exec
+          - rm
+          - -rf
+          - --
+          - "{}"
+          - +
+      changed_when: true
+      timeout: "{{ runner_checkout_remove_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+
+    - name: Remove this commit's own folder that has no finished marker
+      ansible.builtin.command:
+        argv: [timeout, "--kill-after={{ runner_checkout_kill_after_seconds }}", "{{ runner_checkout_remove_deadline_seconds }}", rm, -rf, --, "{{ runner_checkout_folder }}"]
+      changed_when: true
+      timeout: "{{ runner_checkout_remove_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+
+    - name: Create this commit's folder for its owner and group only
+      ansible.builtin.file:
+        path: "{{ runner_checkout_folder }}"
+        state: directory
+        owner: "{{ runner_checkout_owner }}"
+        group: "{{ runner_checkout_group }}"
+        mode: "{{ runner_checkout_mode }}"
+
+    - name: Look at the new folder without following a link
+      ansible.builtin.stat:
+        path: "{{ runner_checkout_folder }}"
+        follow: false
+      register: runner_checkout_new_folder
+
+    - name: Refuse a commit folder that is a link, is not a folder or that another user owns
+      ansible.builtin.assert:
+        that:
+          - runner_checkout_new_folder.stat.isdir
+          - not runner_checkout_new_folder.stat.islnk
+          - runner_checkout_new_folder.stat.pw_name == runner_checkout_owner
+        quiet: true
+        fail_msg: "{{ runner_checkout_folder }} is not a real folder of {{ runner_checkout_owner }}"
+
+    - name: Copy the archive to the runner folder's parent
+      ansible.builtin.copy:
+        src: "{{ runner_checkout_scratch.path }}/runner.tar"
+        dest: "{{ runner_checkout_archive_file }}"
+        owner: "{{ runner_checkout_owner }}"
+        group: "{{ runner_checkout_group }}"
+        mode: "0600"
+      timeout: "{{ runner_checkout_unpack_deadline_seconds }}"
+
+    - name: Unpack the archive
+      ansible.builtin.command:
+        argv: "{{ runner_checkout_track + unpack }}"
+      vars:
+        unpack:
+          - timeout
+          - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+          - "{{ runner_checkout_unpack_deadline_seconds }}"
+          - tar
+          - -xf
+          - "{{ runner_checkout_archive_file }}"
+          - -C
+          - "{{ runner_checkout_folder }}"
+          - --no-same-owner
+      changed_when: true
+      timeout: "{{ runner_checkout_unpack_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+
+    - name: Build the environment from the hash-pinned requirements
+      ansible.builtin.include_tasks: environment.yml
+
+    - name: Remove the archive from the host
+      ansible.builtin.command:
+        argv: [timeout, "--kill-after={{ runner_checkout_kill_after_seconds }}", "{{ runner_checkout_remove_deadline_seconds }}", rm, -f, --, "{{ runner_checkout_archive_file }}"]
+      changed_when: true
+      timeout: "{{ runner_checkout_remove_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+  rescue:
+    - name: Confirm that no process of the failed build still works
+      ansible.builtin.include_tasks: processes.yml
+
+    - name: Remove the archive from the host after the failed build
+      ansible.builtin.command:
+        argv: [timeout, "--kill-after={{ runner_checkout_kill_after_seconds }}", "{{ runner_checkout_remove_deadline_seconds }}", rm, -f, --, "{{ runner_checkout_archive_file }}"]
+      changed_when: true
+      timeout: "{{ runner_checkout_remove_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+
+    - name: Fail the deploy with the step that failed
+      ansible.builtin.fail:
+        msg: "The runner folder was not finished: the step '{{ ansible_failed_task.name | default('') }}' failed (a return code of 124 or 137 means that its deadline ended and it was stopped). The folder has no marker, so the next deploy removes it."

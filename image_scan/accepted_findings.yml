@@ -1,0 +1,271 @@
+# The fixable findings that the publisher's scan gate (scripts/images/publish.py) accepts. The list named findings is the active one, the only one the gate reads.
+# Each entry names the image, the artifact that holds the package (the path that the scan report gives, where a library inside a jar is located at the jar), the
+# vulnerability's ID, the package URL with its version, the reason that no release can fix it in this image and the date. A finding of Docker Scout or of Trivy
+# passes only when each of its artifacts has an entry for its image (scripts/images/trivy_scan.py says how a Trivy finding names its artifact and package).
+# Add an entry only for such a finding, and remove it when a release that this image can use holds the fix (for the two Iceberg-compatibility
+# exceptions below: once an Iceberg release supports Spark 4.2 or later and the image moves to it).
+# Accepted by the owner on Nov 26 2026 ("A"): every entry below is a library shaded inside the newest Hadoop or Iceberg jar or inside Spark 4.1.4's jars,
+# with no upstream release that holds the fixed library, except two: CVE-2024-6763 and CVE-2026-2332 in spark-core_2.13-4.1.4.jar, which Spark 4.2.1 and later
+# fix, accepted by the owner on Nov 26 2026 as an Iceberg-compatibility exception (Iceberg 1.12.0 supports Spark only up to 4.1). Each date is the day the entry
+# was written; acceptance is Nov 26 2026.
+findings:
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-68494
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-core@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.8."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-89407
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-core@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.11."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-89425
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-core@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.11."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-89407
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-core@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.7."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-89425
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-core@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.7."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-19032
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.10."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-54512
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.8."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-54513
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.8."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-54514
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.8."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-54515
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.9."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-59888
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.8."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-59889
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.9."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-68497
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.10."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-77310
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.9."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-83557
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.10."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-91776
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.11."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-91777
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.11."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: GHSA-mhm7-754m-9p8w
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.18.6
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.18.9."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-19032
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.6."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-54515
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.5."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-59889
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.5."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-68497
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.6."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-77310
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.5."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-83557
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.6."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-91776
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.7."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-91777
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.7."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: GHSA-mhm7-754m-9p8w
+    package: pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.21.4
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1. Fixed version of the library: 2.21.5."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-102554
+    package: pkg:maven/com.google.guava/guava@33.4.8-jre
+    reason: "Shaded inside hadoop-client-runtime-3.5.0.jar and spark-network-common_2.13-4.1.4.jar. No Hadoop or Spark release holds 33.7.2 (Hadoop 3.5.0 has 33.4.8, Spark 4.3.0 has 33.6.0). The image's own Guava jar is 33.7.2. Fixed version of the library: 33.7.2."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/spark-network-common_2.13-4.1.4.jar
+    cve: CVE-2026-102554
+    package: pkg:maven/com.google.guava/guava@33.4.8-jre
+    reason: "Shaded inside spark-network-common_2.13-4.1.4.jar. The image stays on Spark 4.1.4 because Iceberg 1.12.0 supports Spark only up to 4.1. A later Spark would not fix it: 4.2.1 and 4.3.0 use Guava 33.6.0, which is affected. The image's own Guava jar is 33.7.2. Sources read Nov 26 2026. Fixed version of the library: 33.7.2."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/iceberg-spark-runtime-4.1_2.13-1.12.0.jar
+    cve: CVE-2026-102554
+    package: pkg:maven/com.google.guava/guava@33.7.1-jre
+    reason: "Shaded inside iceberg-spark-runtime-4.1_2.13-1.12.0.jar, and 1.12.0 is the newest release of Iceberg's runtime for Spark 4.1 (Maven Central, read Nov 26 2026). Only Trivy reports this copy; Docker Scout does not. Fixed version of the library: 33.7.2."
+    date: "2026-11-26"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-45205
+    package: pkg:maven/org.apache.commons/commons-configuration2@2.10.1
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.15.0."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-57914
+    package: pkg:maven/org.apache.kerby/kerby-asn1@2.0.3
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 2.1.2."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/spark-core_2.13-4.1.4.jar
+    cve: CVE-2024-6763
+    package: pkg:maven/org.eclipse.jetty/jetty-http@11.0.26
+    reason: "Shaded inside spark-core_2.13-4.1.4.jar. Spark 4.2.1 and later fix it (they shade Jetty 12.1.8), but Iceberg 1.12.0 supports Spark only up to 4.1, so the image stays on Spark 4.1.4. Accepted by the owner on Nov 26 2026 as an Iceberg-compatibility exception until an Iceberg release supports Spark 4.2 or later (board card \"Move Spark to 4.2+ when Iceberg supports it\"). Fixed version of the library: 12.0.12."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/spark-core_2.13-4.1.4.jar
+    cve: CVE-2026-2332
+    package: pkg:maven/org.eclipse.jetty/jetty-http@11.0.26
+    reason: "Shaded inside spark-core_2.13-4.1.4.jar. Spark 4.2.1 and later fix it (they shade Jetty 12.1.8), but Iceberg 1.12.0 supports Spark only up to 4.1, so the image stays on Spark 4.1.4. Accepted by the owner on Nov 26 2026 as an Iceberg-compatibility exception until an Iceberg release supports Spark 4.2 or later (board card \"Move Spark to 4.2+ when Iceberg supports it\"). Fixed version of the library: 11.0.29."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2024-6763
+    package: pkg:maven/org.eclipse.jetty/jetty-http@9.4.58.v20250814
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 12.0.12."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-2332
+    package: pkg:maven/org.eclipse.jetty/jetty-http@9.4.58.v20250814
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 9.4.60."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/spark-core_2.13-4.1.4.jar
+    cve: CVE-2026-10050
+    package: pkg:maven/org.eclipse.jetty/jetty-security@11.0.26
+    reason: "Shaded inside spark-core_2.13-4.1.4.jar. The image stays on Spark 4.1.4 because Iceberg 1.12.0 supports Spark only up to 4.1. A later Spark would not fix it: 4.2.1 and 4.3.0 shade Jetty 12.1.8, which is affected (12.1.10 fixes it). The fixed 11.0.31 is not on Maven Central, whose newest 11.0 release is 11.0.26. Sources read Nov 26 2026. Fixed version of the library: 11.0.31."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-77421
+    package: pkg:maven/org.jline/jline-builtins@3.9.0
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 3.30.15."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-77422
+    package: pkg:maven/org.jline/jline-builtins@3.9.0
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 3.30.15."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-77423
+    package: pkg:maven/org.jline/jline-builtins@3.9.0
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 3.30.15."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-77420
+    package: pkg:maven/org.jline/jline-reader@3.9.0
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 3.30.15."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-56740
+    package: pkg:maven/org.jline/jline-remote-telnet@3.9.0
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 4.2.1."
+    date: "2026-11-25"
+  - image: spark
+    artifact: /opt/spark/jars/hadoop-client-runtime-3.5.0.jar
+    cve: CVE-2026-56741
+    package: pkg:maven/org.jline/jline-remote-telnet@3.9.0
+    reason: "Shaded inside Apache Hadoop's hadoop-client-runtime-3.5.0.jar. 3.5.0 is the newest Hadoop release on Maven Central (read Nov 25 2026), so only a later release or a rebuild of Hadoop's shaded jar can change this copy. With the release before it, 3.4.3, the image scanned with one finding fewer. Fixed version of the library: 4.2.1."
+    date: "2026-11-25"
+# PENDING the owner's decision: the gate never reads this list, so none of its entries lets a push through. Move an entry to findings only when the owner accepts it.
+pending: []

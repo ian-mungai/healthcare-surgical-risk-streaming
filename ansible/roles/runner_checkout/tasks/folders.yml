@@ -1,0 +1,108 @@
+# Reads runner_checkout_directory, runner_checkout_folder, runner_checkout_marker, runner_checkout_marker_text, runner_checkout_commit, runner_checkout_owner,
+# runner_checkout_group and runner_checkout_archive_files. Sets runner_checkout_complete. The runner folder and the commit's folder must be real folders owned by the deploy
+# user: a link is never followed, written through or made the place of a finished folder, and an existing runner folder that another user owns is refused before the role
+# changes its owner, group or mode (so that a rebuild never prunes a folder that is not the deploy user's). A folder is finished when its marker (a plain file) holds exactly what this deploy
+# expects, the manifest and every file of it are exactly the files and hashes of the controller's archive, and the environment runs, says the pinned version and holds exactly
+# what the lock files pin (a missing manifest, a missing file or a broken environment is a folder that is not finished). Nothing here removes anything when the folder is
+# finished: a runner that the launcher placed in it stays, because the manifest does not list it.
+- name: Look at the runner folder without following a link
+  ansible.builtin.stat:
+    path: "{{ runner_checkout_directory }}"
+    follow: false
+  register: runner_checkout_directory_before
+
+- name: Refuse a runner folder that is a link or is not a folder
+  ansible.builtin.assert:
+    that:
+      - not runner_checkout_directory_before.stat.exists or (runner_checkout_directory_before.stat.isdir and not runner_checkout_directory_before.stat.islnk)
+    quiet: true
+    fail_msg: "{{ runner_checkout_directory }} is a link or is not a folder: the role does not follow a link, so remove it on the host first"
+
+- name: Refuse a runner folder that another user owns before anything is changed in it
+  ansible.builtin.assert:
+    that:
+      - not runner_checkout_directory_before.stat.exists or runner_checkout_directory_before.stat.pw_name == runner_checkout_owner
+    quiet: true
+    fail_msg: "{{ runner_checkout_directory }} is owned by another user than {{ runner_checkout_owner }}: the role does not take it over and prunes nothing in it, so check it on the host first"
+
+- name: Create the runner folder for its owner and group only
+  ansible.builtin.file:
+    path: "{{ runner_checkout_directory }}"
+    state: directory
+    owner: "{{ runner_checkout_owner }}"
+    group: "{{ runner_checkout_group }}"
+    mode: "{{ runner_checkout_mode }}"
+
+- name: Look at the runner folder and the commit's folder without following a link
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ runner_checkout_directory }}"
+    - "{{ runner_checkout_folder }}"
+  register: runner_checkout_folders
+
+- name: Refuse a runner folder that is a link, is not a folder or that another user owns
+  ansible.builtin.assert:
+    that:
+      - runner_checkout_folders.results[0].stat.isdir
+      - not runner_checkout_folders.results[0].stat.islnk
+      - runner_checkout_folders.results[0].stat.pw_name == runner_checkout_owner
+    quiet: true
+    fail_msg: "{{ runner_checkout_directory }} is not a real folder of {{ runner_checkout_owner }}"
+
+- name: Find out whether the commit's folder is a real folder of the deploy user
+  ansible.builtin.set_fact:
+    runner_checkout_folder_real: >-
+      {{ (runner_checkout_folders.results[1].stat.exists)
+      and (runner_checkout_folders.results[1].stat.isdir | default(false))
+      and not (runner_checkout_folders.results[1].stat.islnk | default(false))
+      and (runner_checkout_folders.results[1].stat.pw_name | default('') == runner_checkout_owner) }}
+
+- name: Look for the finished marker of this commit's folder
+  ansible.builtin.stat:
+    path: "{{ runner_checkout_marker }}"
+    follow: false
+  register: runner_checkout_marker_stat
+  when: runner_checkout_folder_real
+
+- name: Read the marker
+  ansible.builtin.slurp:
+    src: "{{ runner_checkout_marker }}"
+  register: runner_checkout_marker_content
+  when: runner_checkout_folder_real and (runner_checkout_marker_stat.stat.isreg | default(false))
+
+- name: Find out whether the marker is the one of this commit, interpreter and requirements
+  ansible.builtin.set_fact:
+    runner_checkout_marker_matches: >-
+      {{ runner_checkout_folder_real
+      and (runner_checkout_marker_stat.stat.isreg | default(false))
+      and (runner_checkout_marker_content.content | default('') | b64decode) == runner_checkout_marker_text }}
+
+- name: Check the files of a folder with this marker against the files of the controller's archive
+  runner_manifest:
+    state: verify
+    folder: "{{ runner_checkout_folder }}"
+    commit: "{{ runner_checkout_commit }}"
+    files: "{{ runner_checkout_archive_files }}"
+  register: runner_checkout_manifest_check
+  when: runner_checkout_marker_matches
+  timeout: "{{ runner_checkout_manifest_deadline_seconds }}"
+
+- name: Check the environment of a folder whose files are the archive's against the lock files
+  runner_environment:
+    state: check
+    folder: "{{ runner_checkout_folder }}"
+    version: "{{ runner_checkout_python_version }}"
+    requirements: "{{ runner_checkout_requirements }}"
+    deadline: "{{ runner_checkout_check_deadline_seconds }}"
+  register: runner_checkout_environment_check
+  when: runner_checkout_marker_matches and (runner_checkout_manifest_check.intact | default(false))
+  timeout: "{{ runner_checkout_environment_check_deadline_seconds }}"
+
+- name: Find out whether the folder is finished
+  ansible.builtin.set_fact:
+    runner_checkout_complete: >-
+      {{ runner_checkout_marker_matches
+      and (runner_checkout_manifest_check.intact | default(false))
+      and (runner_checkout_environment_check.intact | default(false)) }}

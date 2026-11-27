@@ -6,15 +6,15 @@ its file and line, the rule and the fix. The privacy scan reports the type of a 
 
 from __future__ import annotations
 
-import argparse
 import fnmatch
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 
 GIT_TIMEOUT_SECONDS = 60
@@ -68,9 +68,13 @@ class Finding:
     fix: str
 
 
-def git(*args: str, cwd: Path | None = None, keep_newlines: bool = False) -> str:
-    """Run Git. A call that names a repository by ``cwd`` ignores the caller's Git environment, such as ``GIT_DIR`` inside a hook."""
-    env = None if cwd is None else {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+def git(*args: str, cwd: Path | None = None, keep_newlines: bool = False, env: Mapping[str, str] | None = None) -> str:
+    """Run Git. A call that names a repository by ``cwd`` ignores the caller's Git environment, such as ``GIT_DIR`` inside a hook.
+
+    A call with ``env`` runs in exactly that environment, for a repository that must not read the caller's global Git settings.
+    """
+    if env is None and cwd is not None:
+        env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     return run_command("git", args, cwd=cwd, env=env, timeout=GIT_TIMEOUT_SECONDS, check=True, keep_newlines=keep_newlines).stdout
 
 
@@ -110,13 +114,15 @@ def data_files(paths: list[str]) -> list[Finding]:
     return findings
 
 
-def message_findings(location: str, message: str, *, comments: bool = False) -> list[Finding]:
+def message_findings(location: str, message: str, *, comments: bool = False, reveal_subject: bool = False) -> list[Finding]:
+    """Findings for one message. The subject text is shown only to the person writing it: a history check names the commit and the rule."""
     lines = [line for line in message.splitlines() if not (comments and line.startswith("#"))]
     subject = lines[0] if lines else ""
     findings = []
     if CONVENTIONAL_SUBJECT.fullmatch(subject) is None:
         fix = "reword as <type>(<scope>): <description>, for example ci: pin the hook versions"
-        findings.append(Finding(location, f"not a Conventional Commit: {subject!r}", MESSAGE_RULE, fix))
+        shown = f": {subject!r}" if reveal_subject else ""
+        findings.append(Finding(location, f"not a Conventional Commit{shown}", MESSAGE_RULE, fix))
     for number, line in enumerate(lines, 1):
         credit = CREDIT_TRAILER.match(line) or GENERATED_LINE.match(line)
         if SESSION_TRAILER.match(line) or (credit and ASSISTANT_NAMES.search(credit.group(1))):
@@ -127,25 +133,49 @@ def message_findings(location: str, message: str, *, comments: bool = False) -> 
 
 
 def commit_message(path: str) -> list[Finding]:
-    return message_findings(path, Path(path).read_text(), comments=True)
+    return message_findings(path, Path(path).read_text(encoding="utf-8"), comments=True, reveal_subject=True)
+
+
+SHORT_SHA = 12
+GITLEAKS = Path(__file__).resolve().parents[2] / ".tools" / "bin" / "gitleaks"
+BODY_RULE = "no credential value is in a commit message"
+
+
+def message_secret_findings(messages: str) -> list[Finding]:
+    """Scan whole commit messages with the pinned gitleaks, which the scan of the diffs does not read. A finding does not print the value."""
+    if not GITLEAKS.is_file():
+        return [Finding("commit messages", f"the secret scanner {GITLEAKS.name} is missing", BODY_RULE, "run: make setup")]
+    run = run_command(str(GITLEAKS), ["stdin", "--redact", "--no-banner", "--no-color"], timeout=GIT_TIMEOUT_SECONDS, input_text=messages)
+    if run.returncode == 0:
+        return []
+    return [Finding("commit messages", "a secret is in a commit message body (the value is not shown)", BODY_RULE, "rewrite the commit message without it")]
 
 
 def commit_range(revisions: str) -> list[Finding]:
+    """Check every commit that ``git rev-list`` names: ``base..head`` the new commits, and one revision every commit reachable from it."""
     if revisions.startswith("-"):
         raise SystemExit(f"commit-range takes a revision or a range, not an option: {revisions!r}")
     findings = []
+    messages = []
     for commit in git("rev-list", revisions, "--").splitlines():
-        findings.extend(message_findings(f"commit {commit}", git("show", "-s", "--format=%B", commit)))
-    return findings
+        message = git("show", "-s", "--format=%B", commit)
+        messages.append(message)
+        findings.extend(message_findings(f"commit {commit[:SHORT_SHA]}", message))
+    return [*findings, *message_secret_findings("\n\n".join(messages))] if messages else findings
 
 
-def read_allowlist() -> tuple[list[tuple[str, str]], list[Finding]]:
+def read_allowlist(committed: list[tuple[str, bytes]] | None = None) -> tuple[list[tuple[str, str]], list[Finding]]:
+    """The reasoned allowlist of the working tree, or, given the blobs of a commit that ``committed_files`` has read, the one that the commit holds."""
     entries: list[tuple[str, str]] = []
     findings: list[Finding] = []
     kinds = [*PRIVACY_PATTERNS, "env-value"]
-    if not Path(ALLOWLIST).exists():
+    if committed is None:
+        source = Path(ALLOWLIST).read_text(encoding="utf-8") if Path(ALLOWLIST).exists() else None
+    else:
+        source = next((data.decode("utf-8", "replace") for path, data in committed if path == ALLOWLIST), None)
+    if source is None:
         return entries, findings
-    for number, line in enumerate(Path(ALLOWLIST).read_text().splitlines(), 1):
+    for number, line in enumerate(source.splitlines(), 1):
         text = "" if line.lstrip().startswith("#") else line.strip()
         if not text:
             continue
@@ -164,7 +194,7 @@ def env_values() -> list[str]:
     if not Path(".env").is_file():
         return []
     values = []
-    for line in Path(".env").read_text().splitlines():
+    for line in Path(".env").read_text(encoding="utf-8").splitlines():
         key, _, value = line.partition("=")
         value = value.strip().strip("\"'")
         if ENV_VALUE_KEYS.search(key.strip().upper()) and len(value) >= ENV_VALUE_MINIMUM and not line.lstrip().startswith("#"):
@@ -185,15 +215,48 @@ def line_privacy(line: str, values: list[str]) -> list[str]:
     return kinds
 
 
-def privacy_scan() -> tuple[list[Finding], list[str]]:
-    allowed, findings = read_allowlist()
+def committed_files(commit: str, only: list[str] | None = None) -> list[tuple[str, bytes]]:
+    """The tracked blobs of ``commit`` with their contents, read from Git's objects: a symbolic link, a submodule and a file that a sparse checkout left out
+    of the working tree are all judged by what the commit holds. ``only`` names the paths to read."""
+    listed = git("ls-tree", "-r", "-z", "--full-tree", commit, keep_newlines=True)
+    wanted: list[tuple[str, str]] = []
+    for entry in filter(None, listed.split("\0")):
+        meta, _, path = entry.partition("\t")
+        mode, kind, sha = meta.split()
+        if kind == "blob" and mode != "120000" and (only is None or path in only):
+            wanted.append((path, sha))
+    if not wanted:
+        return []
+    answer = run_command(
+        "git", ["cat-file", "--batch"], input_text="".join(f"{sha}\n" for _, sha in wanted), timeout=GIT_TIMEOUT_SECONDS, check=True, keep_newlines=True
+    ).stdout
+    raw = os.fsencode(answer)
+    files: list[tuple[str, bytes]] = []
+    position = 0
+    for path, sha in wanted:
+        end = raw.index(b"\n", position)
+        header = raw[position:end].split()
+        if len(header) != 3 or header[0].decode() != sha or header[1] != b"blob":
+            raise SystemExit(f"cannot read the blob {sha} of {path!r} in {commit}")
+        size = int(header[2])
+        files.append((path, raw[end + 1 : end + 1 + size]))
+        position = end + 1 + size + 1
+    return files
+
+
+def privacy_scan(commit: str | None = None) -> tuple[list[Finding], list[str]]:
+    """Scan every file that Git does not ignore, or, with ``commit``, every tracked blob of that commit and its own allowlist: what a push publishes."""
+    committed = committed_files(commit) if commit is not None else None
+    allowed, findings = read_allowlist(committed)
     values = env_values()
     unreviewed = []
     descriptions = {kind: description for kind, (description, _) in PRIVACY_PATTERNS.items()} | {"env-value": "value declared in .env"}
-    for path in visible_files():
-        if os.path.islink(path) or not os.path.isfile(path):
-            continue
-        data = Path(path).read_bytes()
+    sources: Iterable[tuple[str, bytes]]
+    if commit is None:
+        sources = [(path, Path(path).read_bytes()) for path in visible_files() if not os.path.islink(path) and os.path.isfile(path)]
+    else:
+        sources = committed or []
+    for path, data in sources:
         if b"\0" in data[:8192]:
             unreviewed.append(f"{on_one_line(path)}: unreviewed: cannot be read as text; inspect it before publishing")
             continue
@@ -211,13 +274,14 @@ def privacy_scan() -> tuple[list[Finding], list[str]]:
 
 def main() -> int:
     """Run the named check and return 1 when it has findings."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("check", choices=["credential-files", "data-files", "commit-msg", "commit-range", "privacy-scan"])
     parser.add_argument("paths", nargs="*")
-    parser.add_argument("--all", action="store_true", help="privacy-scan: every file Git does not ignore, which is the only scope")
+    parser.add_argument("--all", action="store_true", help="privacy-scan: every file Git does not ignore")
+    parser.add_argument("--commit", help="privacy-scan: the tracked blobs of this commit instead of the working tree (what a push publishes)")
     args = parser.parse_args()
     if args.check == "privacy-scan":
-        findings, unreviewed = privacy_scan()
+        findings, unreviewed = privacy_scan(args.commit)
         for line in unreviewed:
             sys.stderr.write(f"{line}\n")
         return report(findings)

@@ -1,0 +1,29 @@
+services:
+  loki:
+    image: grafana/loki:3.7.10@sha256:6d789ab9a603ee4429d0fdc4d11512bf2423e8a8c5fc898a9e5aa2d8471ce459
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_LOKI:?render the limits first}
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/config.yml
+    configs:
+      - source: loki_config
+        target: /etc/loki/config.yml
+    volumes:
+      - loki_data:/loki
+    ports:
+      - 127.0.0.1:${LOKI_HOST_PORT:-3100}:3100
+    # The image holds only the loki binary: no shell and no HTTP client. This proves that the binary runs. Readiness is Prometheus's up{job="loki"}.
+    healthcheck:
+      test: [CMD, /usr/bin/loki, -version]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+configs:
+  loki_config:
+    file: ../monitoring/loki.yml
+
+volumes:
+  loki_data:

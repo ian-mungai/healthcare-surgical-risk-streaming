@@ -1,0 +1,6 @@
+# Both steps in order, for a run on a host whose stack is already up, for example after a service is added to the list.
+- name: Prepare the admin secret ID file
+  ansible.builtin.include_tasks: prepare.yml
+
+- name: Make OpenBao match the service list
+  ansible.builtin.include_tasks: bootstrap.yml

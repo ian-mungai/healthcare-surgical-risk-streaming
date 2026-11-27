@@ -1,0 +1,45 @@
+# Reads runner_checkout_commit, runner_checkout_source_root (default: the repository's root) and the deadlines. The code is git archive of the commit: the commit's tracked
+# files and nothing else (no .git folder, no history, no ignored or uncommitted file), made on the controller before this role changes anything on the host, so a commit
+# that the repository does not hold, or a link, a device or a path of another form in it, fails the deploy with the previous folder in place. The controller reads the
+# archive and sets runner_checkout_archive_files: the SHA-256 of every file in it. The host never gives the expected files: they are these, sent with the deploy. Nothing
+# here changes the host, so a run of a finished folder changes nothing.
+- name: Make a private folder for the archive on the controller
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: runner_checkout_
+  register: runner_checkout_scratch
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Make the archive of the commit's tracked files
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+      - "{{ runner_checkout_archive_deadline_seconds }}"
+      - git
+      - -C
+      - "{{ runner_checkout_source_root | default(role_path ~ '/../../..') }}"
+      - archive
+      - --format=tar
+      - --output
+      - "{{ runner_checkout_scratch.path }}/runner.tar"
+      - "{{ runner_checkout_commit }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  timeout: "{{ runner_checkout_archive_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+
+- name: Read the files and hashes of the archive
+  runner_manifest:
+    state: archive
+    archive: "{{ runner_checkout_scratch.path }}/runner.tar"
+  register: runner_checkout_archive_read
+  delegate_to: localhost
+  become: false
+  timeout: "{{ runner_checkout_manifest_deadline_seconds }}"
+
+- name: Keep the files that the host must hold
+  ansible.builtin.set_fact:
+    runner_checkout_archive_files: "{{ runner_checkout_archive_read.files }}"

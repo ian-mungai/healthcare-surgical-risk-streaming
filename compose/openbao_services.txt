@@ -1,0 +1,14 @@
+# One service for each line. Each gets one OpenBao policy and one AppRole. A service named in postgres_tools.txt also gets its PostgreSQL password at its own path.
+# A numeric user and group at the end of a line (uid:gid) name the user its container runs as. That user owns the service's secret ID file and, for a PostgreSQL
+# tool, its password file: mode 0400, read by nobody else. A line with no owner is for a service that runs outside Compose, and root owns its files.
+nessie 10000:10001
+airbyte
+dagster 10001:10001
+alloy
+apicurio 10002:10002
+# The deploy consumer: the stack playbook's login to Docker Hub reads the read token (compose/external_secrets.txt) through this AppRole. It runs outside Compose, so root owns its secret ID file.
+deploy
+# The intake role: the script that the launcher runs on the host to store each external secret (compose/external_secrets.txt) logs in as this service. Its policy writes
+# the declared external paths and nothing else, and every deploy writes it, so a host whose OpenBao was made before external secrets existed has it too. It runs outside Compose, so root owns its secret ID file.
+external_intake
+aistor

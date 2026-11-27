@@ -1,0 +1,12 @@
+# Written by make images-push: each project image by the tag that was pushed and the digest that Docker Hub gave it. Do not edit by hand.
+# An empty list means that nothing was pushed yet. The host's Compose settings (IMAGE_<NAME>) are rendered from this file.
+images:
+  dagster:
+    tag: ianmungai/healthcare_surgical_risk_streaming:dagster-1.13.31-6ef9d47fb847
+    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:de943f023622895d2834fe884bc3c74d6bb0e5ddd4c0cb455386f821478f3a4c
+  replay:
+    tag: ianmungai/healthcare_surgical_risk_streaming:replay-1.7.2-7b4e145d7381
+    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:fa10cc6070e3031b920c85e09a1798dc5914ef0388478f1ab0d220d5621d185b
+  spark:
+    tag: ianmungai/healthcare_surgical_risk_streaming:spark-4.1.4-23b3d881cc32
+    digest: ianmungai/healthcare_surgical_risk_streaming@sha256:91597b73d6ad0d697c9934d766e094f8abbae49f731069c3769caeef005419c8

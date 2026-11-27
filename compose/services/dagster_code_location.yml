@@ -1,0 +1,101 @@
+services:
+  dagster_code_location:
+    image: ${IMAGE_DAGSTER:?render the image pins first}
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_DAGSTER_CODE_LOCATION:?render the limits first}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    group_add:
+      - ${DOCKER_SOCKET_GID:?write the host settings first}
+      - "20105"
+    env_file:
+      - path: ../host.env
+        required: false
+      - path: ../heavy.env
+        required: true
+    command: [dagster, api, grpc, --module-name, surgical_risk.definitions, --host, 0.0.0.0, --port, "4266"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PLATFORM_COMMIT: ${PLATFORM_COMMIT:-unknown}
+      NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      AIRBYTE_API_URL_FILE: /run/secrets/airbyte_api_url
+      AIRBYTE_NESSIE_URL_FILE: /run/secrets/airbyte_nessie_url
+      AIRBYTE_CLIENT_ID_FILE: /run/secrets/airbyte_client_id
+      AIRBYTE_CLIENT_SECRET_FILE: /run/secrets/airbyte_client_secret
+      AIRBYTE_AWS_ACCESS_KEY_ID_FILE: /run/secrets/airbyte_aws_access_key_id
+      AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/airbyte_aws_secret_access_key
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
+    configs:
+      - source: dagster_limits
+        target: /opt/dagster/limits.yml
+      - source: dagster_aws_client_config
+        target: /etc/workload_access/client_config
+    extra_hosts:
+      - k3s_api:host-gateway
+    secrets:
+      - dagster_postgres_password
+      - k3s_token
+      - k3s_ca
+      - airbyte_api_url
+      - airbyte_nessie_url
+      - airbyte_client_id
+      - airbyte_client_secret
+      - airbyte_aws_access_key_id
+      - airbyte_aws_secret_access_key
+    tmpfs:
+      - /run/dagster:uid=10001,gid=10001,mode=0700
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - dagster_data:/opt/dagster/data
+      - dagster_runs:/opt/dagster/runs
+      - workload_access_orchestrator:/run/workload_access:ro
+      - dagster_storage:/opt/dagster/instance/storage
+      - table_check_staging:/opt/dagster/staging
+    healthcheck:
+      test: [CMD, dagster, api, grpc-health-check, --port, "4266"]
+      interval: 10s
+      timeout: 30s
+      retries: 12
+      start_period: 60s
+
+configs:
+  dagster_limits:
+    file: ../limits.yml
+  dagster_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
+
+secrets:
+  dagster_postgres_password:
+    file: ${SECRETS_DIR:?render the host settings first}/postgres/dagster.password
+  k3s_token:
+    file: ${SECRETS_DIR:?render the host settings first}/k3s/dagster.token
+  k3s_ca:
+    file: ${SECRETS_DIR:?render the host settings first}/k3s/ca.crt
+  airbyte_api_url:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/api_url
+  airbyte_nessie_url:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/nessie_url
+  airbyte_client_id:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/client_id
+  airbyte_client_secret:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/client_secret
+  airbyte_aws_access_key_id:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/aws_access_key_id
+  airbyte_aws_secret_access_key:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/aws_secret_access_key
+
+volumes:
+  dagster_data:
+  dagster_runs:
+  dagster_storage:
+  table_check_staging:
+  workload_access_orchestrator:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${ORCHESTRATOR_ACCESS_DIR:-/run/workload_access/orchestrator}

@@ -1,6 +1,22 @@
+# Check-first checks: each check runs at the cheapest layer that can do its job, and hosted CI runs every check in full.
+# 1. Commit hooks, about 90 seconds (measured 83 s on Nov 23 2026, the quick tests 75 s of it): the commit and commit-msg stages below (secrets in the staged
+#    changes, credential and data files, privacy, Ruff, MyPy, the quick tests and the commit message). `make check` runs the manual stage on every file; the
+#    hosted hooks job runs it, and so it also scans every lock file (Trivy) and the secrets and format of every commit message of the history.
+# 2. Push gate, before every push to any branch: a plain Git pre-push hook, not a pre-commit hook, because pre-commit gives its hooks no standard input and stashes
+#    unstaged changes. `make setup` installs it (scripts/quality/push_hook.py). It reads Git's input and, for the commits that the push sends (read
+#    conservatively: whatever the remote ref in the input does not hold), refuses a push while tracked files have uncommitted changes and runs the secret scan of
+#    diffs (merge diffs included) and whole messages, the commit messages, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and
+#    the quick test modules that cover them) and the dependency scan when a lock file changes (scripts/quality/push_gate.py). About 40 seconds for one commit
+#    (measured 39 s on Nov 23 2026, 37 s of it the quick tests of 12 changed files); 2 minutes at most.
+#    One hook is shared by every worktree: it records the gate version that `make setup` installed it for (GATE_VERSION in scripts/quality/push_gate.py) and refuses a
+#    push from a worktree whose gate is missing or older, naming the fix: `make setup` or a rebase. A gate file that sed cannot read stops the push as a sed failure.
+# 3. Hosted CI (.github/workflows/ci.yml): every check in full on each push of a work branch, each pull request, the squash-merge commit on main, every Monday and
+#    on demand.
+# Terraform providers are pinned by hash in infra/.terraform.lock.hcl and are not vulnerability-scanned: Trivy 0.76.2 detects no package in a Terraform lock file.
 # Every hook is local and pinned: pre-commit, Ruff and MyPy come from requirements.txt in .venv, and gitleaks from scripts/quality/install_tools.py in .tools.
-# Run `make setup` once. The commit stage holds the fast checks. CI runs the manual stage on every file with `make check`.
-# Do not use SKIP= or `git commit --no-verify`.
+# Run `make setup` once: it installs the commit and commit-msg hooks, the privacy hook and the pre-push hook. The slow tests (tests/slow: Ansible playbook runs,
+# local servers, stand-in programs and the planted workflow faults) are no hook: they run in their own hosted job, and `make test-slow` runs them on demand.
+# Do not use SKIP=, `git commit --no-verify` or `git push --no-verify`.
 default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit, manual]
 fail_fast: false
@@ -17,7 +33,21 @@ repos:
         stages: [pre-commit]
       - id: gitleaks-history
         name: Scan every commit for secrets
-        entry: .tools/bin/gitleaks git --redact --no-banner
+        entry: .tools/bin/gitleaks git --redact --no-banner "--log-opts=-m --all"
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+      - id: dependency-scan
+        name: No HIGH or CRITICAL vulnerability in any tracked lock file (Trivy)
+        entry: .venv/bin/python -m scripts.quality.push_gate --all-locks
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+      - id: commit-message-history
+        name: Every commit message of the history follows Conventional Commits and holds no secret
+        entry: .venv/bin/python -m scripts.quality.repo_checks commit-range HEAD
         language: system
         pass_filenames: false
         always_run: true

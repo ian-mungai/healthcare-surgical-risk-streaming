@@ -1,0 +1,19 @@
+# Reads airbyte_web_port, airbyte_namespace, airbyte_directory, airbyte_secrets_directory, airbyte_connection_deadline_seconds and airbyte_connection_run_seconds, and what
+# connection_document.yml reads. The raw connection (the publisher's S3 source, the project's landing prefix as the destination, delivery "Copy raw files", no schedule) is made
+# in Airbyte from code, with each connector at its pinned version. The module takes each connector's built-in definition by its dockerRepository at the pinned tag and writes no definition. It finds the source,
+# the destination and the connection by their names: a first run creates them, a second run changes nothing and a drifted object is repaired. It prints each change it made and no token, no secret and no body. The project profile's access key, which both connectors take, was placed on the
+# host by the launcher (airbyte_key_install); the module reads its two files and adds the key at apply time, so the document and every value rendered on the owner's computer
+# hold none. The module keeps a fingerprint of the key's ID in connection_key.json. Every exchange has a deadline, the whole run has one, and a failure names the call and its status.
+- name: Render the document of the raw connection
+  ansible.builtin.include_tasks: connection_document.yml
+
+- name: Make the raw connection in Airbyte match the document
+  airbyte_connection:
+    document: "{{ airbyte_connection_document }}"
+    base_url: "http://127.0.0.1:{{ airbyte_web_port }}/api/public/v1"
+    namespace: "{{ airbyte_namespace }}"
+    timeout_seconds: "{{ airbyte_connection_deadline_seconds }}"
+    run_seconds: "{{ airbyte_connection_run_seconds }}"
+    secrets_directory: "{{ airbyte_secrets_directory }}"
+    record_file: "{{ airbyte_directory }}/connection_key.json"
+  timeout: "{{ airbyte_connection_run_seconds | int + 60 }}"

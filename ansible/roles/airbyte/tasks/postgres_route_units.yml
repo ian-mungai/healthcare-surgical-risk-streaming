@@ -1,0 +1,40 @@
+# Reads airbyte_postgres_unit_directory, airbyte_postgres_unit, airbyte_owner, airbyte_group, airbyte_bridge_address, airbyte_database_port and compose_stack_postgres_port.
+# The socket listens on the k3s bridge address only, and may bind before the bridge exists. The service is the proxy that ships in Ubuntu's systemd package: it
+# inherits the socket and connects each client to the server's local address, where PostgreSQL's published port stays.
+- name: Install the socket that listens on the bridge address
+  ansible.builtin.copy:
+    dest: "{{ airbyte_postgres_unit_directory }}/{{ airbyte_postgres_unit }}.socket"
+    content: |
+      [Unit]
+      Description=Listen on the k3s bridge address for the pods' connections to PostgreSQL
+
+      [Socket]
+      ListenStream={{ airbyte_bridge_address }}:{{ airbyte_database_port }}
+      FreeBind=true
+
+      [Install]
+      WantedBy=sockets.target
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+  register: airbyte_postgres_socket_file
+
+- name: Install the service that forwards those connections to PostgreSQL's local address
+  ansible.builtin.copy:
+    dest: "{{ airbyte_postgres_unit_directory }}/{{ airbyte_postgres_unit }}.service"
+    content: |
+      [Unit]
+      Description=Forward the pods' connections on the bridge address to PostgreSQL on the local address
+      Requires={{ airbyte_postgres_unit }}.socket
+      After={{ airbyte_postgres_unit }}.socket
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:{{ compose_stack_postgres_port }}
+      DynamicUser=yes
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+  register: airbyte_postgres_service_file

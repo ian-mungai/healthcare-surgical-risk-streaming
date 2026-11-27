@@ -1,0 +1,20 @@
+# The role reads the variables of the compose_stack role for the folders and the lists. The user of the OpenBao container, openbao_user, the owner of
+# root-only files, secret_files_root_owner, and the port, openbao_port, are in the group variables. Each deadline is in seconds.
+openbao_secrets_directory: "{{ compose_stack_secrets_directory }}"
+openbao_services_file: "{{ compose_stack_services_file }}"
+openbao_tools_file: "{{ compose_stack_tools_file }}"
+openbao_external_secrets_file: "{{ compose_stack_external_secrets_file }}"
+openbao_unlock_key_file: "{{ unlock_key_file }}"
+openbao_address: "http://127.0.0.1:{{ openbao_port }}"
+# The service whose role reads exactly one path, the AIStor project user's sign-in (see openbao_bootstrap.py). The AIStor step writes that path, not this step.
+openbao_client_service: "{{ compose_stack_aistor_service }}"
+openbao_ready_deadline_seconds: 120
+openbao_token_ttl_seconds: 3600
+openbao_token_max_ttl_seconds: 86400
+# The intake script of the external secrets, its sudoers drop-in and the program that checks it. The launcher pipes each value to the script on standard input.
+openbao_bin_directory: "{{ airbyte_bin_directory }}"
+openbao_intake_script: "{{ openbao_bin_directory }}/external_secret_intake"
+openbao_intake_sudoers: /etc/sudoers.d/external_secret_intake
+openbao_visudo: "{{ airbyte_visudo }}"
+openbao_owner_user: root
+openbao_owner_group: root

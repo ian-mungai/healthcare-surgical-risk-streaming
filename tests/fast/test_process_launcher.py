@@ -17,14 +17,15 @@ Each case runs a real shell that starts a ``sleep`` of its own and records both 
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import signal
 import subprocess
 import tempfile
 import threading
 import time
-import traceback
 import unittest
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from subprocess import CalledProcessError
@@ -32,6 +33,7 @@ from unittest import mock
 
 from scripts import process
 from scripts.process import run_command
+from tests.fast.traceback_support import raised_text
 
 BUCKET = "example-private-bucket"
 ROLE = "private_role_name"
@@ -44,7 +46,18 @@ class LauncherTest(unittest.TestCase):
         folder = tempfile.TemporaryDirectory(prefix="process_launcher_")
         self.addCleanup(folder.cleanup)
         self.pids = Path(folder.name) / "pids"
+        # Cleanups run last in, first out: the leftovers are killed first, then the unreaped process objects of the launcher are collected here. A case
+        # that makes the launcher report a surviving group leaves its process object unreaped, and Python warns when it collects that object. Left to a
+        # later collection, the warning would land in whichever test runs then and fail one that reads standard error.
+        self.addCleanup(self.collect_unreaped)
         self.addCleanup(self.kill_leftovers)
+        # A program that the launcher never reaped warns when it is collected: collect here, not inside a later test's captured error output.
+        self.addCleanup(gc.collect)
+
+    def collect_unreaped(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            gc.collect()
 
     def kill_leftovers(self) -> None:
         for pid in self.started():
@@ -114,15 +127,14 @@ class LauncherTest(unittest.TestCase):
             self.run_program("echo done")
         self.kill_leftovers()
 
-    def run_with_private_arguments(self) -> BaseException:
+    def run_with_private_arguments(self) -> tuple[BaseException, str]:
         arguments = ["-c", START_SCRIPT.format(tail="wait"), "sh", str(self.pids), BUCKET, ROLE]
-        with self.assertRaises(process.ProcessGroupSurvived) as caught:
-            run_command("sh", arguments, timeout=1)
-        self.kill_leftovers()
-        return caught.exception
+        try:
+            return raised_text(lambda: run_command("sh", arguments, timeout=1), process.ProcessGroupSurvived, "stop_group", "run_command")
+        finally:
+            self.kill_leftovers()
 
-    def assert_chain_holds_no_private_argument(self, error: BaseException) -> None:
-        text = "".join(traceback.format_exception(error))
+    def assert_chain_holds_no_private_argument(self, error: BaseException, text: str) -> None:
         chain: list[BaseException] = []
         link: BaseException | None = error
         while link is not None and link not in chain:
@@ -146,14 +158,14 @@ class LauncherTest(unittest.TestCase):
                 real_killpg(pgid, signum)
 
         with mock.patch.object(os, "killpg", side_effect=kill_but_report_alive), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
-            error = self.run_with_private_arguments()
+            error, text = self.run_with_private_arguments()
         self.assertIsInstance(error.__context__, process.TimeoutExpired)
-        self.assert_chain_holds_no_private_argument(error)
+        self.assert_chain_holds_no_private_argument(error, text)
 
     def test_a_program_that_is_not_reaped_after_a_deadline_shows_no_argument_of_the_timed_out_command(self) -> None:
         with mock.patch.object(os, "killpg", side_effect=ProcessLookupError), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
-            error = self.run_with_private_arguments()
-        self.assert_chain_holds_no_private_argument(error)
+            error, text = self.run_with_private_arguments()
+        self.assert_chain_holds_no_private_argument(error, text)
 
     def test_an_interrupt_while_a_deadline_is_handled_shows_no_argument_of_the_timed_out_command(self) -> None:
         def interrupted(started: subprocess.Popen[str], *arguments: object, **options: object) -> None:
@@ -162,10 +174,11 @@ class LauncherTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 raise KeyboardInterrupt from None
 
-        with mock.patch.object(subprocess.Popen, "communicate", autospec=True, side_effect=interrupted), self.assertRaises(KeyboardInterrupt) as caught:
-            run_command("sh", ["-c", "sleep 300", "sh", BUCKET, ROLE], timeout=1)
-        text = "".join(traceback.format_exception(caught.exception))
-        context = caught.exception.__context__
+        with mock.patch.object(subprocess.Popen, "communicate", autospec=True, side_effect=interrupted):
+            caught, text = raised_text(
+                lambda: run_command("sh", ["-c", "sleep 300", "sh", BUCKET, ROLE], timeout=1), KeyboardInterrupt, "run_command", "interrupted"
+            )
+        context = caught.__context__
         for private in (BUCKET, ROLE):
             self.assertNotIn(private, f"{text} {context!s} {context!r}")
         self.assertIsInstance(context, subprocess.TimeoutExpired)

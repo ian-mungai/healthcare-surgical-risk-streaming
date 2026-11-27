@@ -1,0 +1,3 @@
+# The shared secret file module_utils are found through this dependency.
+dependencies:
+  - role: secret_files

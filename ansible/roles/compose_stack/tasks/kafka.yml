@@ -1,0 +1,6 @@
+# Reads compose_stack_docker, compose_stack_compose_directory and compose_stack_provision_deadline_seconds. The topic list is the tracked file that the role places with the Compose files.
+- name: Make the Kafka topics match the topic list
+  kafka_topics:
+    topics_file: "{{ compose_stack_topics_file | default(compose_stack_compose_directory + '/kafka/topics.txt') }}"
+    compose_command: "{{ compose_stack_docker }}"
+  timeout: "{{ compose_stack_provision_deadline_seconds | int }}"

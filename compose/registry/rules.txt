@@ -1,0 +1,4 @@
+# The compatibility rules of Apicurio Registry, one line for each. The step that applies this file sets each rule, and a second run changes nothing.
+# A global rule covers every group, so a format group made later is covered too. A group line sets the rule on that group and creates the group when it is missing.
+# scope    group (group lines only)   rule            setting
+global                                COMPATIBILITY   BACKWARD

@@ -1,7 +1,10 @@
-# Reads unlock_key_file and unlock_key_owner. The content is read for its shape only and never shown.
+# Reads unlock_key_file and openbao_user. The owner is compared by number. The content is read for its shape only and never shown, and the stat makes no checksum
+# or content type: a checksum is a value of the secret, and a verbose run prints the result of a stat.
 - name: Read the unlock key file's status
   ansible.builtin.stat:
     path: "{{ unlock_key_file }}"
+    get_checksum: false
+    get_mime: false
   register: unlock_key_status
 
 - name: Read the unlock key file's content
@@ -20,7 +23,8 @@
     that:
       - unlock_key_status.stat.exists
       - unlock_key_status.stat.isreg
-      - unlock_key_status.stat.mode == '0600'
-      - unlock_key_status.stat.pw_name == unlock_key_owner
+      - unlock_key_status.stat.mode == '0400'
+      - unlock_key_status.stat.uid == (openbao_user.split(':')[0] | int)
+      - unlock_key_status.stat.gid == (openbao_user.split(':')[1] | int)
       - unlock_key_shape_ok
-    fail_msg: "The unlock key file is missing, is readable by anyone but its owner, belongs to another user or does not hold exactly one key line."
+    fail_msg: "The unlock key file is missing, is readable by anyone but its owner, can be written, belongs to another user than the OpenBao container or does not hold exactly one key line."

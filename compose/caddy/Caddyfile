@@ -1,0 +1,85 @@
+# Generated from routes.txt by `python -m scripts.stack.caddy write`. Edit the list, not this file.
+{
+	admin off
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$TS_HOST_NAME}:9440 {
+	bind {$TS_ADDRESS}
+	respond "gateway ok"
+}
+
+{$TS_HOST_NAME}:9441 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:8200
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind openbao is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9442 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:3000
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind grafana is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9443 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:9090
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind prometheus is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9444 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:8080
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind trino is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9445 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:19120
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind nessie is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9446 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:8000
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind airbyte is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9447 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:3001
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind dagster is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9448 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:8081
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind apicurio is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9449 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:9000
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind aistor is not running or does not answer." {err.status_code}
+	}
+}

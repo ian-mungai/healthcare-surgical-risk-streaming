@@ -1,0 +1,7 @@
+# The packages of the replay image, in replay/Dockerfile. `make lock-replay` writes requirements.txt with hashes.
+# vitaldb decodes the publisher's case files. confluent-kafka writes to and reads from Kafka. fastavro encodes and decodes the Avro bodies.
+# boto3 reads the landed object versions from S3 on the host.
+vitaldb==1.7.2
+confluent-kafka==2.16.1
+fastavro==1.13.1
+boto3==1.43.126

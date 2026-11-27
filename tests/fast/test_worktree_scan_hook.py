@@ -7,16 +7,21 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` proves the hook through 
 - The check reports a missing or changed hook as installed.
 - The hook is written to the wrong repository, when run from a linked worktree or from inside another Git command's hook
   environment (``GIT_DIR`` is set).
+- A repository with its own Git environment (``env``) writes its hook where that environment says, not where the caller's global ``core.hooksPath`` says.
 - A write that stops before the hook is complete leaves the earlier hook in place, and the next setup succeeds. It never treats the
   half-written file as the owner's own hook.
+- The hooks folder is a link (to a folder, to nothing or to a file). A link to a folder is followed, so the owner's hook is kept beside the
+  scanner in the real folder. A link that leads to no folder is refused before the owner's hook moves, and nothing changes.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from scripts.quality import worktree_scan_hook
@@ -33,6 +38,30 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue(worktree_scan_hook.installed(self.repo))
         self.assertTrue(self.hook().stat().st_mode & stat.S_IXUSR)
         self.assertIn("-m scripts.quality.repo_checks privacy-scan --all", self.hook().read_text())
+
+    def global_hooks_path(self) -> Path:
+        """Point the caller's global Git config at a shared hook folder, as a developer's does, and return the folder."""
+        shared = self.repo.parent / "shared_hooks"
+        shared.mkdir()
+        home = self.repo.parent / "caller_home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(f"[core]\n\thooksPath = {shared}\n")
+        patcher = mock.patch.dict(os.environ, {"HOME": str(home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return shared
+
+    def test_a_repository_with_its_own_environment_ignores_the_callers_global_hooks_path(self) -> None:
+        shared = self.global_hooks_path()
+        self.assertTrue(worktree_scan_hook.install(self.repo, env=self.env))
+        self.assertTrue(self.hook().is_file())
+        self.assertTrue(worktree_scan_hook.installed(self.repo, env=self.env))
+        self.assertEqual(self.hook().resolve(), worktree_scan_hook.hook_path(self.repo, env=self.env))  # the hooks folder is taken by its real path
+        self.assertEqual([], list(shared.iterdir()))
+
+    def test_without_an_environment_the_callers_global_hooks_path_is_followed(self) -> None:
+        shared = self.global_hooks_path()
+        self.assertEqual(shared.resolve() / "pre-commit.legacy", worktree_scan_hook.hook_path(self.repo))
 
     def test_a_rerun_changes_nothing(self) -> None:
         worktree_scan_hook.install(self.repo)
@@ -67,15 +96,37 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue((self.hook().parent / "pre-commit.legacy.previous").is_symlink())
         self.assertTrue(worktree_scan_hook.installed(self.repo))
 
-    def stop_half_way(self, path: Path, data: str, *arguments: object, **keywords: object) -> int:
-        with open(path, "w") as handle:
-            handle.write(data[:25])
-        raise OSError("the write stopped")
+    def stop_half_way(self) -> Any:
+        """Patch ``os.fdopen`` so the handle of the helper's temporary file takes the first 25 characters and then stops."""
+        real = os.fdopen
+
+        class HalfWay:
+            def __init__(self, descriptor: int, mode: str) -> None:
+                self.handle = real(descriptor, mode)
+
+            def __enter__(self) -> HalfWay:
+                return self
+
+            def __exit__(self, *details: object) -> None:
+                self.handle.close()
+
+            def fileno(self) -> int:
+                return self.handle.fileno()
+
+            def write(self, data: bytes) -> int:
+                self.handle.write(data[:25])
+                self.handle.flush()
+                raise OSError("the write stopped")
+
+            def flush(self) -> None:
+                self.handle.flush()
+
+        return mock.patch("scripts.ingestion.output_file.os.fdopen", HalfWay)
 
     def test_a_write_that_stops_half_way_never_reaches_the_hook_path_and_the_next_setup_succeeds(self) -> None:
         self.hook().parent.mkdir(parents=True, exist_ok=True)
         self.hook().write_text("#!/bin/sh\nexit 0\n")
-        with mock.patch.object(Path, "write_text", autospec=True, side_effect=self.stop_half_way), self.assertRaises(OSError):
+        with self.stop_half_way(), self.assertRaises(OSError):
             worktree_scan_hook.install(self.repo)
         self.assertFalse(self.hook().exists())
         self.assertEqual("#!/bin/sh\nexit 0\n", (self.hook().parent / "pre-commit.legacy.previous").read_text())
@@ -87,7 +138,7 @@ class WorktreeScanHookTest(TemporaryRepository):
         earlier = worktree_scan_hook.EARLIER_HOOK_TEXTS[0]
         self.hook().parent.mkdir(parents=True, exist_ok=True)
         self.hook().write_text(earlier)
-        with mock.patch.object(Path, "write_text", autospec=True, side_effect=self.stop_half_way), self.assertRaises(OSError):
+        with self.stop_half_way(), self.assertRaises(OSError):
             worktree_scan_hook.install(self.repo)
         self.assertEqual(earlier, self.hook().read_text())
         self.assertTrue(worktree_scan_hook.install(self.repo))
@@ -158,6 +209,42 @@ class WorktreeScanHookTest(TemporaryRepository):
         worktree_scan_hook.install(linked)
         self.assertTrue(self.hook().is_file())
         self.assertFalse((linked / ".git" / "hooks").exists())
+
+    def link_hooks_folder_to(self, target: Path) -> Path:
+        """Replace the repository's hooks folder with a link to ``target`` and return the link."""
+        link = self.hook().parent
+        shutil.rmtree(link)
+        link.symlink_to(target)
+        return link
+
+    def test_a_hooks_folder_that_is_a_link_to_a_folder_keeps_the_owners_hook_and_writes_the_scanner_in_the_real_folder(self) -> None:
+        real = self.repo.parent / "shared_hooks"
+        real.mkdir()
+        (real / "pre-commit.legacy").write_text("#!/bin/sh\nexit 0\n")
+        link = self.link_hooks_folder_to(real)
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertTrue(link.is_symlink())
+        self.assertEqual("#!/bin/sh\nexit 0\n", (real / "pre-commit.legacy.previous").read_text())
+        self.assertEqual(worktree_scan_hook.HOOK_TEXT, (real / "pre-commit.legacy").read_text())
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+        self.assertEqual(["pre-commit.legacy", "pre-commit.legacy.previous"], sorted(path.name for path in real.iterdir()))
+        self.assertFalse(worktree_scan_hook.install(self.repo))
+
+    def test_a_hooks_folder_that_leads_to_no_folder_is_refused_before_anything_moves(self) -> None:
+        for name, is_file in (("gone", False), ("a_file", True)):
+            with self.subTest(target=name):
+                target = self.repo.parent / name
+                if is_file:
+                    target.write_text("not a folder")
+                link = self.link_hooks_folder_to(target)
+                with self.assertRaises(OSError):
+                    worktree_scan_hook.install(self.repo)
+                self.assertEqual(str(target), os.readlink(link))
+                self.assertEqual(is_file, target.exists())
+                if is_file:
+                    self.assertEqual("not a folder", target.read_text())
+                link.unlink()
+                link.mkdir()
 
 
 if __name__ == "__main__":

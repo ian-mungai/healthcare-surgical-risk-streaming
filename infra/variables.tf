@@ -33,6 +33,17 @@ variable "environment" {
   }
 }
 
+variable "test_run_id" {
+  description = "Set only by a short-lived test run: the run's ID without its year and separators. The deploy role then gets a name of its own, so the apply never meets the permanent role."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^([0-9a-f]{1,20})?$", var.test_run_id))
+    error_message = "Use up to 20 lower-case hexadecimal characters, or leave it empty."
+  }
+}
+
 variable "data_bucket_name" {
   description = "Name of the project's one bucket, from the run binding. The state bootstrap step creates it; this configuration creates no bucket."
   type        = string
@@ -80,8 +91,9 @@ variable "github_environment" {
 }
 
 variable "tailscale_client_id" {
-  description = "Client ID of the Tailscale federated identity for the host. It is not a secret."
+  description = "Client ID of the Tailscale federated identity for the host. It is not a secret. The variable is sensitive only so that a refused value is never printed."
   type        = string
+  sensitive   = true
 
   validation {
     condition     = length(var.tailscale_client_id) > 0 && !startswith(var.tailscale_client_id, "tskey")
@@ -118,13 +130,10 @@ variable "provision_host" {
 }
 
 variable "workloads" {
-  description = "Workloads that get their own role, each with the statements of its permissions policy."
+  description = "Workloads that get their own role. Each names the prefixes of the run's bound bucket it reaches, with the modes read, write and delete for each (delete only on records_input and on the warehouse layer prefixes, never on the whole warehouse prefix), and whether it reads the publisher's dataset. Terraform builds the resource patterns from the bound bucket."
   type = map(object({
-    statements = list(object({
-      sid       = string
-      actions   = list(string)
-      resources = list(string)
-    }))
+    access         = map(list(string))
+    publisher_read = optional(bool, false)
   }))
   default = {}
 }
@@ -143,5 +152,35 @@ variable "host_disk_gib" {
   validation {
     condition     = var.host_disk_gib >= 200
     error_message = "The host disk is at least 200 GiB."
+  }
+}
+
+variable "host_reserve_mib" {
+  description = "Memory in MiB that the host keeps free for the system: the host_reserve_mib of compose/limits.yml. The Terraform wrapper stages it from the limits loader in heavy_inputs.tfvars.json, so it has no default."
+  type        = number
+
+  validation {
+    condition     = var.host_reserve_mib > 0 && floor(var.host_reserve_mib) == var.host_reserve_mib
+    error_message = "host_reserve_mib is a whole number of MiB above 0."
+  }
+}
+
+variable "always_on_limits_mib" {
+  description = "Sum in MiB of the memory limits of the always-on services in compose/limits.yml. The Terraform wrapper stages it from the limits loader in heavy_inputs.tfvars.json, so it has no default."
+  type        = number
+
+  validation {
+    condition     = var.always_on_limits_mib > 0 && floor(var.always_on_limits_mib) == var.always_on_limits_mib
+    error_message = "always_on_limits_mib is a whole number of MiB above 0."
+  }
+}
+
+variable "spark_limit_mib" {
+  description = "Memory limit in MiB of the Spark job's service in compose/limits.yml. The Terraform wrapper stages it from the limits loader in heavy_inputs.tfvars.json, so it has no default."
+  type        = number
+
+  validation {
+    condition     = var.spark_limit_mib > 0 && floor(var.spark_limit_mib) == var.spark_limit_mib
+    error_message = "spark_limit_mib is a whole number of MiB above 0."
   }
 }
