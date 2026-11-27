@@ -33,8 +33,9 @@ Measured margin, on a local server that sends a body of 200 bytes at one byte ev
 most. A chunked reply with ``Connection: close`` and a trickled chunk extension ended at 0.503 to 0.510 s (five runs). A loaded host adds the wake-up delay of
 one read, and the tests allow 0.25 s. The earlier limit, a ``Connection: close`` reply that was still being read after 12 s against a 1.0 s budget, is gone.
 
-The destination's AWS access key is sent only in the body of a create or update of the destination, and no message holds a request body, a response body or a
-secret.
+The AWS access key is sent only in the body of a create or update of the destination or of the S3 source of a CSV table, which both sign in with it, and no
+message holds a request body, a response body or a secret. Airbyte masks a stored key in its answers, so a key is not compared: a rotated key reaches an
+object with its next update, which each new run makes (the sources' read keys and the destination's branch change).
 
 ``.venv/bin/python -m scripts.ingestion.airbyte_api check --address http://10.42.0.1:8001`` says whether an address may receive the credentials (exit 0 or 1);
 the deploy runs it, so that the client, the settings and the deploy share one definition of the allowed ranges.
@@ -69,7 +70,7 @@ REDIRECT_FIRST = 300
 REDIRECT_END = 400
 PAGE_SIZE = 100
 MAX_PAGES = 1000
-SECRET_FIELDS = ("access_key_id", "secret_access_key")
+SECRET_FIELDS = ("access_key_id", "secret_access_key", "aws_access_key_id", "aws_secret_access_key")
 JOB_STATUSES = ("pending", "queued", "running", "incomplete", "failed", "succeeded", "cancelled")
 ACTIVE_STATUSES = ("pending", "queued", "running")
 TERMINAL_STATUSES = ("incomplete", "failed", "succeeded", "cancelled")
@@ -367,6 +368,8 @@ class HttpAirbyteApi:
         id_field = f"{kind}Id"
         what = f"GET {kind}s"
         wanted = {key: value for key, value in configuration.items() if key not in SECRET_FIELDS}
+        if "credentials" in wanted:
+            wanted["credentials"] = {key: value for key, value in wanted["credentials"].items() if key not in SECRET_FIELDS}
         current = named(self.actors(kind), name, kind)
         if current is None:
             body = {"name": name, "workspaceId": self.workspace_id(), "definitionId": definition, "configuration": dict(configuration)}
@@ -392,8 +395,13 @@ class HttpAirbyteApi:
         raise AirbyteError("the destination is not in the list")
 
     def ensure_source(self, table: str, configuration: Mapping[str, Any]) -> None:
+        """Make the table's source match its document. The S3 source of a CSV table is sent the access key beside its sign-in type; the File source of the
+        track list reads a public address and is sent none."""
         record = table_named(table)
         definition = self.definition_id("source", definitions.source_definition(record))
+        if record.source_key is not None:
+            signed_in = {"aws_access_key_id": self.aws["access_key_id"], "aws_secret_access_key": self.aws["secret_access_key"]}
+            configuration = {**configuration, "credentials": {**configuration["credentials"], **signed_in}}
         self.source_ids[table] = self.ensure_actor("source", definitions.source_name(record), definition, configuration)
 
     def ensure_connection(self, table: str, connection: Mapping[str, Any]) -> str:

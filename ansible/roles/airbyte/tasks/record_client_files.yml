@@ -2,7 +2,8 @@
 # (default 10001, the user and group of the code location container). It places four of the six files that the container reads: the address of Airbyte's API (the
 # forwarder on the bridge address, which the code takes from this file only and checks before it reads a credential; the deploy runs that same check,
 # ``python -m scripts.ingestion.airbyte_api check``, so the allowed ranges have one definition), the address of Nessie as the pods reach it (the other forwarder)
-# and the instance's client ID and secret. The other two, the access key that the destination needs for the Nessie catalog, are copies of the project profile's key
+# and the instance's client ID and secret. The other two, the access key of the destination (for the Nessie catalog) and of the two CSV tables' S3 sources,
+# are copies of the project profile's key
 # that the launcher's one key script writes beside the root-only ones (airbyte_key_install), so this role never reads, holds or copies the key. Every file of a
 # container's own is owned by that numeric user with mode 0400 (the secret-file rule), in a folder that only the role's owner (root on the host) enters, which this
 # role makes and the key script writes into. An empty client value stops the run before any file is placed. Nothing shows a value. A rotated value replaces the

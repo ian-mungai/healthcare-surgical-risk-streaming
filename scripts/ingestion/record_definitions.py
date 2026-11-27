@@ -15,8 +15,11 @@ publisher's two CSV tables, and ``track_list`` from the publisher's track list. 
 - Each connection has no schedule and syncs as a full refresh that overwrites, so only the orchestrator starts it and a second sync of a run leaves one
   state of the table.
 
-No document here holds a secret. The destination connector requires an AWS access key ID and secret access key for the Nessie catalog; the caller adds them
-from files when it applies the document (``record_connections.py``), and they are never a value here.
+No document here holds a secret. The destination connector requires an AWS access key ID and secret access key for the Nessie catalog, and the S3 source of
+a CSV table signs in with the same static key (``iam_user``): a pod of Airbyte has no sign-in of its own on the host, whose instance metadata answers one
+network hop only, so with the pods' default credentials the source cannot list the bucket and Airbyte's schema discovery fails when the connection is made.
+The raw connection's source signs in the same way (owner, Nov 22 2026: Airbyte's connectors use the project profile's key). The client adds the key from
+files when it applies a document (``airbyte_api.py``), and it is never a value here.
 
 Connector versions are pinned by full version. The sources and the date are in ``PINNED_ON`` and the comments of each pin.
 """
@@ -166,7 +169,7 @@ def source_configuration(table: Table, run_id: str, environment: Environment, sh
     return {
         "bucket": environment.bucket,
         "region_name": environment.region,
-        "credentials": {"auth_type": "default_credentials"},
+        "credentials": {"auth_type": "iam_user"},
         "delivery_method": {"delivery_type": "use_records_transfer"},
         "streams": [
             {
