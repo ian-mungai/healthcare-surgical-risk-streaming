@@ -4,7 +4,11 @@ Failure modes covered here, each against a stand-in of the host, of Airbyte, of 
 
 - The runner starts without ``INGESTION_HOST=1``, on an environment other than ``dev``, on a host that is not the run's instance or deployed commit, or goes on
   when the raw connection selects another set of files than the fixed sample or writes another bucket or prefix than the project's landing prefix.
-- A sync that is not interrupted passes for the interrupted copy: every payload landed before the cancel was asked, or by the time Airbyte confirmed it.
+- A sync that is not interrupted passes for the interrupted copy without saying so. The one exception is the owner-approved timing limit (Nov 26 2026): every
+  payload had landed by the confirmed end of the first sync, cancelled or succeeded, and nothing was written after it; that run does not fail and is labelled
+  as the limit. An unconfirmed end, another status, a part landed by a sync that succeeded, or a late write fails, and no failed case is labelled
+  interrupted. A first sync that succeeded is not taken as the copy (its syncs are misnamed, so the pairings refuse them), or the sync after it passes
+  though it copied or changed a version. A sync that copied nothing is named as one that copied.
   A sync that writes after that confirmation passes, whether the write shows between two listings or only in its stamp, or the quiet interval counts from the
   first listing instead of the confirmation. The cancel waits longer than it must after the first payload. The landed check of the resumed set excuses more
   than the object versions that the stopped sync left. The pairings are not told which syncs succeeded, or are told of one that did not. A failed check of
@@ -178,6 +182,7 @@ class World:
         self.sleeps_before_the_cancel: list[float] = []
         self.settle_sleeps: list[float] = []
         self.pairings_named: list[list[str]] = []
+        self.recorded: set[str] = set()
         listed = self.store.list_versions
 
         def list_versions(prefix: str) -> Any:
@@ -211,6 +216,7 @@ class World:
                 self.store.put_object(landed, data)
                 self.expected[key] = data
         if completed:
+            self.recorded.add(str(sync))
             self.store.put_object(f"{LANDING_PREFIX}sync_{sync}/meta.jsonl", b"{}")
             self.paired = {key: self.landed_key(sync, key) for key in SAMPLE[:count]}
         if count and "plant_prefix_taken" in self.faults and not self.store.list_versions(f"{PLANT_PREFIX}foreign"):
@@ -445,12 +451,18 @@ def build(module: ModuleType, world: World) -> type:
                     job = 2
                 world.open_jobs.add(job)
                 world.sent[job] = (700 if "resync_copies_bytes" in world.faults else 0) if world.syncs == 3 else 5000
+                first_is_whole = not world.interruptible or "stopped_sync_saved_its_checkpoint" in world.faults
+                if world.syncs == 2 and ((first_is_whole and "next_sync_copies_again" not in world.faults) or "next_sync_counts_no_byte" in world.faults):
+                    world.sent[job] = 0
                 if world.syncs == 1 and "first_payload_appears_late" in world.faults:
                     world.polls_before_a_payload = 2
                 elif world.syncs == 1:
-                    world.land(1, 3 if world.interruptible and "all_landed_when_asked" not in world.faults else 11, completed=False)
-                elif world.syncs == 2:
+                    whole = first_is_whole or "all_landed_when_asked" in world.faults
+                    world.land(1, 11 if whole else 3, completed=first_is_whole)
+                elif world.syncs == 2 and (not first_is_whole or "next_sync_copies_again" in world.faults):
                     world.land(2, 11, completed=True)
+                if world.syncs == 2 and "next_sync_adds_a_version" in world.faults:
+                    world.store.put_object(world.landed_key(2, "an_added_payload"), b"added by a sync that should copy nothing")
                 if world.syncs == 3 and "resync_adds_version" in world.faults:
                     world.store.put_object(world.landed_key(2, SAMPLE[0]), b"again")
                 if world.syncs == 3 and "warehouse_changes_on_resync" in world.faults:
@@ -482,7 +494,13 @@ def build(module: ModuleType, world: World) -> type:
                 world.slow_listing = 20.0 if "slow_first_listing" in world.faults else 0.0
                 world.stopped_payloads = {(item.key, item.version_id) for item in world.store.list_versions(f"{LANDING_PREFIX}sync_1/")}
                 world.cancelled = True
-                return 0, {"job": job, "status": "cancelled" if world.interruptible else "succeeded"}, ""
+                if "cancel_unconfirmed" in world.faults:
+                    return 1, {}, "raw_copy refused: job_still_active"
+                ended = "cancelled" if world.interruptible else "succeeded"
+                for fault, status in (("first_sync_ended_failed", "failed"), ("first_sync_succeeded_with_a_part", "succeeded")):
+                    if fault in world.faults:
+                        ended = status
+                return 0, {"job": job, "status": ended}, ""
             if arguments[0] == "wait":
                 if "retry_wait_fails" in world.faults and job == 2:
                     return 1, {"job": job, "status": "failed"}, ""
@@ -641,7 +659,10 @@ def build(module: ModuleType, world: World) -> type:
                 return 0, ""
             command = arguments[0]
             if command == "pairings":
-                world.pairings_named.append([arguments[position + 1] for position, name in enumerate(arguments) if name == "--succeeded-sync"])
+                named = [arguments[position + 1] for position, name in enumerate(arguments) if name == "--succeeded-sync"]
+                world.pairings_named.append(named)
+                if named and not world.recorded & set(named):
+                    return 1, "no metadata record is of a sync that --succeeded-sync names, so nothing was written"
                 if len(world.paired) < 11:
                     return 1, "no metadata"
                 prefix = SOURCE_PREFIX if "pairings_name_no_selected_file" in world.faults else ""
@@ -913,31 +934,87 @@ class WalkTest(unittest.TestCase):
                 self.assertEqual(["preflight (setup)"], self.failed(record))
                 self.assertNotIn("raw_copy start", self.world.calls)
 
-    def test_a_sync_that_cannot_be_interrupted_fails_the_interruption_assertion(self) -> None:
-        self.world.interruptible = False
-        record, _, _ = self.walk()
-        self.assertIn("copy interrupted once (fault)", self.failed(record))
-
     def observed(self, record: Record, case: str, step: str) -> str:
         return next(item.observed for item in record.observations if (item.case, item.step) == (case, step))
 
-    def test_a_sync_whose_every_payload_landed_by_the_confirmed_cancellation_is_not_interrupted_and_fails(self) -> None:
-        self.world.faults = {"rest_lands_during_the_cancel"}
-        record, _, _ = self.walk()
-        self.assertEqual(["copy interrupted once (fault)"], self.failed(record))
-        self.assertIn(
-            "status cancelled, not interrupted: payloads landed when asked 3, after the confirmed cancellation 11 of 11",
-            self.observed(record, "copy interrupted once", "fault"),
-        )
+    def fault_text(self, record: Record) -> str:
+        return self.observed(record, "copy interrupted once", "fault")
 
-    def test_a_sync_that_lands_more_during_the_cancel_but_not_every_payload_is_interrupted(self) -> None:
-        self.world.faults = {"more_lands_during_the_cancel"}
+    def walk_with(self, *faults: str, interruptible: bool = True) -> Record:
+        self.world = World()
+        self.world.faults, self.world.interruptible = set(faults), interruptible
         record, _, _ = self.walk()
+        return record
+
+    def test_every_payload_landed_by_a_confirmed_cancel_with_no_later_write_is_the_timing_limit_and_does_not_fail_the_run(self) -> None:
+        for fault, asked in (("rest_lands_during_the_cancel", 3), ("all_landed_when_asked", 11)):
+            with self.subTest(fault=fault):
+                record = self.walk_with(fault)
+                self.assertEqual([], self.failed(record))
+                self.assertIn(
+                    f"status cancelled, not interrupted: timing limit, proven offline only: payloads landed when asked {asked}, after the confirmed end "
+                    "11 of 11",
+                    self.fault_text(record),
+                )
+                self.assertEqual(1, len([line for line in record.limits if "not interrupted: timing limit, proven offline only" in line]))
+
+    def test_a_sync_that_lands_more_during_the_cancel_but_not_every_payload_is_interrupted_and_records_no_timing_limit(self) -> None:
+        record = self.walk_with("more_lands_during_the_cancel")
+        self.assertEqual([], self.failed(record))
+        self.assertIn("status cancelled, interrupted: payloads landed when asked 3, after the confirmed end 9 of 11", self.fault_text(record))
+        self.assertEqual([], [line for line in record.limits if "timing limit" in line])
+
+    def test_with_every_payload_landed_an_unconfirmed_end_another_status_or_a_late_write_still_fails(self) -> None:
+        for fault in ("cancel_unconfirmed", "first_sync_ended_failed", "writes_after_the_confirmed_end", "stamped_after_the_confirmation"):
+            with self.subTest(fault=fault):
+                record = self.walk_with("rest_lands_during_the_cancel", fault)
+                self.assertIn("copy interrupted once (fault)", self.failed(record))
+                self.assertIn(", interruption check failed: ", self.fault_text(record))
+                self.assertNotIn("timing limit", self.fault_text(record))
+                self.assertEqual([], [line for line in record.limits if "timing limit" in line])
+
+    def test_a_part_that_is_not_interrupted_in_full_is_never_labelled_interrupted_and_keeps_the_late_write_detail(self) -> None:
+        cases = {
+            "writes_after_the_confirmed_end": "the one 60 s after it: False",
+            "stamped_after_the_confirmation": "versions stamped after the confirmation: 1",
+            "cancel_unconfirmed": "cancel exit 1, status None",
+            "first_sync_ended_failed": "status failed",
+            "first_sync_succeeded_with_a_part": "status succeeded",
+        }
+        for fault, detail in cases.items():
+            with self.subTest(fault=fault):
+                record = self.walk_with(fault)
+                self.assertIn("copy interrupted once (fault)", self.failed(record))
+                self.assertIn(", interruption check failed: ", self.fault_text(record))
+                self.assertNotIn(", interrupted: ", self.fault_text(record))
+                self.assertIn(detail, self.fault_text(record))
+
+    def test_a_first_sync_that_succeeded_before_the_cancel_is_the_copy_and_the_next_sync_is_idempotent(self) -> None:
+        record = self.walk_with(interruptible=False)
         self.assertEqual([], self.failed(record))
         self.assertIn(
-            "status cancelled, interrupted: payloads landed when asked 3, after the confirmed cancellation 9 of 11",
-            self.observed(record, "copy interrupted once", "fault"),
+            "status succeeded, not interrupted: timing limit, proven offline only: payloads landed when asked 11, after the confirmed end 11 of 11",
+            self.fault_text(record),
         )
+        self.assertEqual([["1"], ["1"]], self.world.pairings_named[:2])
+        self.assertEqual({frozenset()}, set(self.world.left_over_seen))
+        self.assertIn("bytes 0, landing versions added 0, gone 0", self.observed(record, "copy resumed", "job record"))
+        self.assertIn("job 1,", self.observed(record, "complete verified set", "job record"))
+
+    def test_a_sync_after_a_succeeded_first_sync_that_copies_or_changes_a_version_fails(self) -> None:
+        for fault in ("next_sync_copies_again", "next_sync_adds_a_version"):
+            with self.subTest(fault=fault):
+                self.assertIn("copy resumed (job record)", self.failed(self.walk_with(fault, interruptible=False)))
+
+    def test_a_stopped_sync_that_saved_its_checkpoint_for_every_file_leaves_no_sync_to_name_and_the_next_one_copies_nothing(self) -> None:
+        record = self.walk_with("stopped_sync_saved_its_checkpoint")
+        self.assertEqual([], self.failed(record))
+        self.assertEqual([[], []], self.world.pairings_named[:2])
+        self.assertIn("job 2,", self.observed(record, "complete verified set", "job record"))
+        self.assertIn("copy resumed (job record)", self.failed(self.walk_with("stopped_sync_saved_its_checkpoint", "next_sync_adds_a_version")))
+
+    def test_the_sync_after_an_interrupted_one_must_copy_bytes(self) -> None:
+        self.assertIn("copy resumed (job record)", self.failed(self.walk_with("next_sync_counts_no_byte")))
 
     def test_the_quiet_interval_counts_from_the_cancels_confirmation_and_not_from_the_first_listing(self) -> None:
         self.world.faults = {"slow_first_listing"}
@@ -962,8 +1039,10 @@ class WalkTest(unittest.TestCase):
         self.assertEqual([], self.failed(record))
         self.assertEqual([0.5, 0.5], self.world.sleeps_before_the_cancel)
 
-    def test_the_pairings_are_told_the_syncs_of_the_run_that_succeeded_and_no_other(self) -> None:
+    def test_the_pairings_are_told_the_syncs_that_succeeded_and_copied_and_no_other(self) -> None:
         self.walk()
+        self.assertEqual([["2"], ["2"]], self.world.pairings_named[:2])
+        self.walk_with("resync_copies_bytes")
         self.assertEqual([["2"], ["2", "3"]], self.world.pairings_named[:2])
         self.world = World()
         self.world.faults = {"retry_wait_fails"}
@@ -972,9 +1051,6 @@ class WalkTest(unittest.TestCase):
 
     def test_a_sync_that_writes_after_airbyte_confirmed_its_end_fails_the_interruption(self) -> None:
         self.assertIn("copy interrupted once (fault)", self.with_faults("writes_after_the_confirmed_end"))
-
-    def test_a_cancel_asked_after_every_payload_landed_fails_the_interruption_even_when_the_job_ends_as_cancelled(self) -> None:
-        self.assertIn("copy interrupted once (fault)", self.with_faults("all_landed_when_asked"))
 
     def test_every_landed_check_is_given_exactly_the_object_versions_that_the_stopped_sync_left(self) -> None:
         for faults in (set(), {"more_lands_during_the_cancel"}):
